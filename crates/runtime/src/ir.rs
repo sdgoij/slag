@@ -510,6 +510,18 @@ pub enum Step {
         argc: u8,
         span: crux::Span,
     },
+    /// A plain call whose callee resolves through the environment
+    /// (`LoadIdent`'s read) — where a script global read from inside a function
+    /// body lands. The callee read and the argument loads fuse into one step;
+    /// the receiver is `undefined` (spec 13.4.3). Emission requires that no
+    /// argument can reassign the name or run code that could, so resolving the
+    /// callee after the arguments is unobservable, and a tail position keeps
+    /// the existing tail-call path. Stack: `[..., arg1..argN]`.
+    CallFastIdent {
+        name: crux::AtomId,
+        argc: u8,
+        span: crux::Span,
+    },
     /// Cut 35 slice 17: the fused `x = f(args)` for a slot callee with
     /// plain slot args — the arg loads, the slot-callee call, and the
     /// store in one step (the `n = f(n)` bench body drops from three
@@ -8565,6 +8577,50 @@ impl Vm {
         }
     }
 
+    /// The `LoadIdent` read (Cut 36 mirror): with a clean chain (the context
+    /// env IS the global env, and an env-constant body adds no envs mid-run)
+    /// the name resolves at the global env — serve the warmed global-value cell
+    /// directly, else fall back to the full resolve. The resolve warms the cell
+    /// when it lands on a global-object data property, so a hot loop's second
+    /// read hits the native load. Shared with the fused `CallFastIdent` callee
+    /// read so the two cannot drift.
+    fn load_ident_value(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        env_constant: bool,
+    ) -> Result<Value, JsError> {
+        if env_constant
+            && self.globals_unshadowed
+            && let Some(value) = self.try_global_cell_read(agent, name)
+        {
+            return Ok(value);
+        }
+        let reference = crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
+        let value = crate::context::get_value(agent, &reference)?;
+        if env_constant
+            && self.globals_unshadowed
+            && let crate::context::ReferenceBase::Environment(env) = &reference.base
+            && let EnvRecord::Global(global_env) = &**env
+        {
+            // The JIT's `load_ident` warm gate: a global-object binding
+            // (var/function/undeclared) records with its property slot; a
+            // declarative binding (a top-level `let`/`const`/`class`) records
+            // its binding-vector index, and the global env bumps the object's
+            // generation on every declarative mutation, which is what
+            // invalidates it.
+            let name_string = crux::lookup(name);
+            if env.has_lexical_declaration(&name_string) {
+                if let Some(index) = global_env.declarative.index_of(&name_string) {
+                    self.warm_global_cell(agent, name, value, Some(index));
+                }
+            } else {
+                self.warm_global_cell(agent, name, value, None);
+            }
+        }
+        Ok(value)
+    }
+
     fn run_inner_inner(
         &mut self,
         agent: &mut Agent,
@@ -8606,44 +8662,7 @@ impl Vm {
             }
             match step {
                 Step::LoadIdent { name } => {
-                    // Cut 36 mirror: with a clean chain (the context env IS
-                    // the global env, and this env-constant body adds no envs
-                    // mid-run) the name resolves at the global env — serve the
-                    // warmed global-value cell directly, else fall back to the
-                    // full resolve (which warms the cell when the binding is a
-                    // global-object data property, so a hot loop's second read
-                    // hits the native load).
-                    if body.env_constant
-                        && self.globals_unshadowed
-                        && let Some(value) = self.try_global_cell_read(agent, *name)
-                    {
-                        self.stack.push(value);
-                        continue;
-                    }
-                    let reference =
-                        crate::context::resolve_binding(agent, &crux::lookup(*name), self.strict)?;
-                    let value = crate::context::get_value(agent, &reference)?;
-                    if body.env_constant
-                        && self.globals_unshadowed
-                        && let crate::context::ReferenceBase::Environment(env) = &reference.base
-                        && let EnvRecord::Global(global_env) = &**env
-                    {
-                        // The JIT's `load_ident` warm gate: a global-object
-                        // binding (var/function/undeclared) records with its
-                        // property slot; a declarative binding (a top-level
-                        // `let`/`const`/`class`) records its binding-vector
-                        // index, and the global env bumps the object's
-                        // generation on every declarative mutation, which is
-                        // what invalidates it.
-                        let name_string = crux::lookup(*name);
-                        if env.has_lexical_declaration(&name_string) {
-                            if let Some(index) = global_env.declarative.index_of(&name_string) {
-                                self.warm_global_cell(agent, *name, value, Some(index));
-                            }
-                        } else {
-                            self.warm_global_cell(agent, *name, value, None);
-                        }
-                    }
+                    let value = self.load_ident_value(agent, *name, body.env_constant)?;
                     self.stack.push(value);
                 }
                 Step::LoadLocal { slot } => {
@@ -9711,6 +9730,13 @@ impl Vm {
                     let callee = *self.frame_get(*slot);
                     self.record_call_site(agent, body, &callee);
                     self.do_call_fast_slot(agent, *slot, None, *argc as usize)?;
+                    if let Some(outcome) = self.withdrawn_call_outcome() {
+                        return Ok(outcome);
+                    }
+                }
+                Step::CallFastIdent { name, argc, span } => {
+                    self.set_site(agent, *span);
+                    self.do_call_fast_ident(agent, *name, *argc as usize, body.env_constant)?;
                     if let Some(outcome) = self.withdrawn_call_outcome() {
                         return Ok(outcome);
                     }
@@ -15357,6 +15383,46 @@ impl Vm {
                 callee,
             },
         )
+    }
+
+    /// The `CallFastIdent` handler: the callee resolves through the environment
+    /// (landing in the global-value cell when the chain is clean) and the
+    /// arguments already sit on the value stack.
+    fn do_call_fast_ident(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        argc: usize,
+        env_constant: bool,
+    ) -> Result<(), JsError> {
+        let callee = self.load_ident_value(agent, name, env_constant)?;
+        if let Some(payload) = callee.heap_payload() {
+            let index = Self::value_leaf_index(payload);
+            let cached = {
+                let cells = agent.roots.slot_leaf_cells.borrow();
+                match cells[index].as_ref() {
+                    Some(cell) if cell.payload == payload => Some(cell.entry.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(entry) = cached
+                && self.can_inline_leaf()
+                && agent.realm_count.get() == 1
+                && !agent.is_terminating()
+            {
+                return self.run_leaf_entry(agent, argc, Value::Undefined, entry, 0);
+            }
+        }
+        // Anything else takes the general path, which is written for the
+        // canonical `[.., this, callee, a1..aN]` layout: build it around the
+        // arguments in place rather than growing a second call entry point.
+        let arg_start = self.stack.len() - argc;
+        self.stack.resize(self.stack.len() + 2, Value::Undefined);
+        self.stack
+            .copy_within(arg_start..arg_start + argc, arg_start + 2);
+        self.stack[arg_start] = Value::Undefined;
+        self.stack[arg_start + 1] = callee;
+        self.do_call_fast(agent, argc, false)
     }
 
     /// The shared leaf-inline run (Cut 25/34/35): bind `this`, run the
@@ -24375,6 +24441,25 @@ impl Compiler {
                             span: call.span,
                         })
                     }
+                    // A name the scope analysis left on the environment path —
+                    // where a script global read from inside a function body
+                    // lands. The callee read moves after the arguments, which
+                    // is unobservable only when no argument can reassign the
+                    // name or run code that could; a tail position keeps the
+                    // existing tail-call path.
+                    BindingLoc::Env
+                        if !tail
+                            && !call.args.iter().any(|a| {
+                                matches!(a, Argument::Expr(e)
+                                    if expr_assigns_name(e, *name) || expr_contains_call(e))
+                            }) =>
+                    {
+                        Some(Step::CallFastIdent {
+                            name: *name,
+                            argc: call.args.len() as u8,
+                            span: call.span,
+                        })
+                    }
                     _ => None,
                 };
             if let Some(step) = step {
@@ -25048,7 +25133,9 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             Step::NewTarget | Step::RegExpLiteral { .. } => depth += 1,
             // The fused slot call pops `argc` args (the callee is the
             // frame slot) and pushes the result.
-            Step::CallFastSlot { argc, .. } | Step::CallFastGlobal { argc, .. } => {
+            Step::CallFastSlot { argc, .. }
+            | Step::CallFastGlobal { argc, .. }
+            | Step::CallFastIdent { argc, .. } => {
                 depth = depth.saturating_sub(*argc as usize).saturating_add(1);
             }
             // The fused `x = f(args)` stores (Cut 65): the materialized arg
@@ -25902,7 +25989,8 @@ pub(crate) fn collect_ident_names(steps: &[Step]) -> Vec<crux::AtomId> {
     for step in steps {
         if let Step::LoadIdent { name }
         | Step::StoreIdent { name }
-        | Step::ResolveIdentStore { name } = step
+        | Step::ResolveIdentStore { name }
+        | Step::CallFastIdent { name, .. } = step
             && !names.contains(name)
         {
             names.push(*name);
@@ -25930,6 +26018,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::CallFast { .. }
                 | Step::CallIntrinsic { .. }
                 | Step::CallFastGlobal { .. }
+                | Step::CallFastIdent { .. }
                 | Step::CallFastSlot { .. }
                 | Step::CallFastSlotStore { .. }
                 | Step::CallFastGlobalStore { .. }

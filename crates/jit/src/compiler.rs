@@ -5036,6 +5036,114 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().band(ok, realm_ok_64)
     }
 
+    /// The `Step::LoadIdent` read: the inline global-value cell probe with the
+    /// full `load_ident` resolve as its cold path. Shared with the fused
+    /// `CallFastIdent` callee read so both agree on every binding kind.
+    fn emit_ident_read(&mut self, name: crux::AtomId) -> Result<ClifValue, Unsupported> {
+        // Cut 36: the certified body's global read (`BindingLoc::Env` — a name
+        // the scope analysis proved resolves at the global env). The compiled
+        // code probes the same direct-mapped global-value cell as `LoadGlobal`,
+        // gated on the ctx's `globals_unshadowed` (a hit returns the GLOBAL
+        // binding's value, and the cell table is shared by name across bodies,
+        // so the body's own reads must not be shadowed by its chain), and falls
+        // back to the full `load_ident` resolve on a miss. `load_ident` warms
+        // the cell when it lands on the global environment record, so the
+        // second read of a hot loop hits the native load.
+        let ctx = self.vm();
+        let clean = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
+        );
+        let global = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+        );
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
+        );
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let value_var = self.builder.declare_var(types::I64);
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
+        let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
+        let has_global_64 = self.bint(has_global);
+        let clean_ok_64 = self.bint(clean_ok);
+        let gate = self.builder.ins().band(has_global_64, clean_ok_64);
+        let probe = self.builder.create_block();
+        self.builder.ins().brif(gate, probe, &[], slow, &[]);
+        // The fast path: the cell's name and captured version must match the
+        // live global (a stale cell, another realm's global, or a mid-run
+        // mutation all miss).
+        self.builder.switch_to_block(probe);
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            global,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            global,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let cell = self.builder.ins().iadd_imm_s(
+            cells,
+            ((name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>()) as i64,
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
+        );
+        let cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
+        );
+        let cell_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
+        );
+        let cell_value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
+        );
+        let name_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+        let name_id_ok = self.builder.ins().band(name_ok, id_ok);
+        let ok = self.builder.ins().band(name_id_ok, gen_ok);
+        self.builder.def_var(value_var, cell_value);
+        self.builder.ins().brif(ok, merge, &[], slow, &[]);
+        // The slow path: the full resolve (which also warms the cell for the
+        // next read when the binding is a global data property).
+        self.builder.switch_to_block(slow);
+        let res = self.call_slow(self.sig_bool, Helper::LoadIdent, &[name_imm])?;
+        self.builder.def_var(value_var, res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(value_var))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_call(
         &mut self,
@@ -7326,6 +7434,23 @@ impl<'a> Lowerer<'a> {
                     true,
                 )?;
             }
+            Step::CallFastIdent {
+                name,
+                argc,
+                span: _,
+            } => {
+                // The fused environment-path call: `[..., a1..aN]`, the callee
+                // from the same inline read `LoadIdent` compiles to, and
+                // `undefined` as the receiver.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.emit_ident_read(*name)?;
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
+                self.emit_call(
+                    index, callee, this, args_ptr, argc_imm, args_ptr, false, true,
+                )?;
+            }
             Step::CallFastSlotStore {
                 arg_slots,
                 store_slot,
@@ -7824,112 +7949,7 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::LoadIdent { name } => {
-                // Cut 36: the certified body's global read (`BindingLoc::Env`
-                // — a name the scope analysis proved resolves at the global
-                // env). The compiled code probes the same direct-mapped
-                // global-value cell as `LoadGlobal`, gated on the ctx's
-                // `globals_unshadowed` (a hit returns the GLOBAL binding's
-                // value, and the cell table is shared by name across bodies, so
-                // the body's own reads must not be shadowed by its chain), and
-                // falls back to the full `load_ident` resolve on a miss.
-                // `load_ident` warms the cell when it lands on the global
-                // environment record, so the second read of a hot loop hits the
-                // native load.
-                let ctx = self.vm();
-                let clean = self.builder.ins().load(
-                    types::I8,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, globals_unshadowed) as i32),
-                );
-                let global = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
-                );
-                let cells = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
-                );
-                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                let value_var = self.builder.declare_var(types::I64);
-                let slow = self.builder.create_block();
-                let merge = self.builder.create_block();
-                let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
-                let clean_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, clean, 0);
-                let has_global_64 = self.bint(has_global);
-                let clean_ok_64 = self.bint(clean_ok);
-                let gate = self.builder.ins().band(has_global_64, clean_ok_64);
-                let probe = self.builder.create_block();
-                self.builder.ins().brif(gate, probe, &[], slow, &[]);
-                // The fast path: the cell's name and captured version must
-                // match the live global (a stale cell, another realm's
-                // global, or a mid-run mutation all miss).
-                self.builder.switch_to_block(probe);
-                let live_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    global,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
-                );
-                let live_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    global,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
-                );
-                let cell = self.builder.ins().iadd_imm_s(
-                    cells,
-                    ((*name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>())
-                        as i64,
-                );
-                let cell_name = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
-                );
-                let cell_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
-                );
-                let cell_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
-                );
-                let cell_value = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
-                );
-                let name_ok = self
-                    .builder
-                    .ins()
-                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
-                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
-                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
-                let name_id_ok = self.builder.ins().band(name_ok, id_ok);
-                let ok = self.builder.ins().band(name_id_ok, gen_ok);
-                self.builder.def_var(value_var, cell_value);
-                self.builder.ins().brif(ok, merge, &[], slow, &[]);
-                // The slow path: the full resolve (which also warms the cell
-                // for the next read when the binding is a global data
-                // property).
-                self.builder.switch_to_block(slow);
-                let res = self.call_slow(self.sig_bool, Helper::LoadIdent, &[name_imm])?;
-                self.builder.def_var(value_var, res);
-                self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(merge);
-                self.builder.switch_to_block(merge);
-                let value = self.builder.use_var(value_var);
+                let value = self.emit_ident_read(*name)?;
                 self.push(value);
                 self.fall_through(index);
             }
