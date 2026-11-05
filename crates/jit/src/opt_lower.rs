@@ -24,11 +24,11 @@ use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
     JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
     LeafCallRecord, LeafInlineInfo, SLOT_RUN_CURSOR_OFFSET, SLOT_RUN_KEY_OFFSET,
-    SLOT_RUN_LEN_OFFSET, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BODY_CONTEXT_OFFSET,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
+    SLOT_RUN_LEN_OFFSET, VM_ARRAY_INDEX_STACK_LEN_OFFSET, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
+    VM_BODY_CONTEXT_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
     VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
     VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
-    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_STACK_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
@@ -4796,6 +4796,181 @@ fn emit_leaf_room_check(
 /// The in-frame leaf tail: call `entry(frame_ptr, stack_ptr, ctx)` and land the
 /// result through [`emit_leaf_result_tail`]. Ports the per-step
 /// `emit_leaf_call_tail`.
+/// The env lane's machine-code fast path: the `body_context`/`lexical_env` swap
+/// `leaf_call_env` performs, emitted around a direct call to the leaf's entry.
+/// The machine code can only do this itself for an ALIASED frame (the frame IS
+/// the argument region, so there is nothing to fill); every other shape branches
+/// to `slow`, the helper path. The two interpreter stack lengths are restored
+/// shrink-only, matching the helper's truncates, and the swap is undone before
+/// the pending check so a throwing leaf leaves the caller's environment in
+/// place. The mirror of the per-step `emit_env_leaf_fast`.
+#[allow(clippy::too_many_arguments)]
+fn emit_env_leaf_fast(
+    builder: &mut FunctionBuilder,
+    abi: &Abi,
+    cache: ClifValue,
+    entry: ClifValue,
+    args_ptr: ClifValue,
+    argc: ClifValue,
+    value: Variable,
+    merge: Block,
+    slow: Block,
+) {
+    let vm_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+    );
+    let load = |builder: &mut FunctionBuilder, field: usize, ty: cranelift_codegen::ir::Type| {
+        builder.ins().load(
+            ty,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(leaf_inline_offset(field) as i32),
+        )
+    };
+    let env = load(
+        builder,
+        std::mem::offset_of!(LeafInlineInfo, environment),
+        types::I64,
+    );
+    let frame_size = load(
+        builder,
+        std::mem::offset_of!(LeafInlineInfo, frame_size),
+        types::I32,
+    );
+    let arity = load(
+        builder,
+        std::mem::offset_of!(LeafInlineInfo, arity),
+        types::I32,
+    );
+    let stack_usage = load(
+        builder,
+        std::mem::offset_of!(LeafInlineInfo, stack_usage),
+        types::I64,
+    );
+    let needs_env = load(
+        builder,
+        std::mem::offset_of!(LeafInlineInfo, needs_env),
+        types::I32,
+    );
+    let has_env = builder.ins().icmp_imm_u(IntCC::NotEqual, env, 0);
+    let has_vm = builder.ins().icmp_imm_u(IntCC::NotEqual, vm_ptr, 0);
+    let frame_size_64 = builder.ins().uextend(types::I64, frame_size);
+    let fs_eq_ar = builder.ins().icmp(IntCC::Equal, frame_size, arity);
+    let argc_ge = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
+    let aliased = builder.ins().band(fs_eq_ar, argc_ge);
+    let buf_end = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
+    );
+    let argc_bytes = builder.ins().imul_imm_s(argc, 8);
+    let args_top = builder.ins().iadd(args_ptr, argc_bytes);
+    let stack_bytes = builder.ins().imul_imm_s(stack_usage, 8);
+    let top_needed = builder.ins().iadd(args_top, stack_bytes);
+    let fits = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
+    let ok = builder.ins().band(has_env, has_vm);
+    let ok = builder.ins().band(ok, aliased);
+    let ok = builder.ins().band(ok, fits);
+    let fast = builder.create_block();
+    builder.ins().brif(ok, fast, &[], slow, &[]);
+    builder.switch_to_block(fast);
+    let saved_body = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm_ptr,
+        Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+    );
+    let saved_lex = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm_ptr,
+        Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+    );
+    let saved_stack = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm_ptr,
+        Offset32::new(VM_STACK_LEN_OFFSET as i32),
+    );
+    let saved_index = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm_ptr,
+        Offset32::new(VM_ARRAY_INDEX_STACK_LEN_OFFSET as i32),
+    );
+    let needs_env = builder.ins().icmp_imm_u(IntCC::NotEqual, needs_env, 0);
+    let new_lex = builder.ins().select(needs_env, env, saved_lex);
+    builder.ins().store(
+        MemFlagsData::new(),
+        env,
+        vm_ptr,
+        Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        new_lex,
+        vm_ptr,
+        Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+    );
+    let frame_bytes = builder.ins().imul_imm_s(frame_size_64, 8);
+    let stack_ptr = builder.ins().iadd(args_ptr, frame_bytes);
+    let inst = builder
+        .ins()
+        .call_indirect(abi.sig_entry, entry, &[args_ptr, stack_ptr, abi.vm]);
+    let result = builder.func.dfg.inst_results(inst)[0];
+    builder.ins().store(
+        MemFlagsData::new(),
+        saved_body,
+        vm_ptr,
+        Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+    );
+    builder.ins().store(
+        MemFlagsData::new(),
+        saved_lex,
+        vm_ptr,
+        Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+    );
+    restore_stack_len(builder, vm_ptr, VM_STACK_LEN_OFFSET, saved_stack);
+    restore_stack_len(
+        builder,
+        vm_ptr,
+        VM_ARRAY_INDEX_STACK_LEN_OFFSET,
+        saved_index,
+    );
+    emit_leaf_result_tail(builder, abi, result, value, merge);
+}
+
+/// Truncate one of the interpreter stacks back to `saved` (shrink-only).
+fn restore_stack_len(
+    builder: &mut FunctionBuilder,
+    vm_ptr: ClifValue,
+    offset: usize,
+    saved: ClifValue,
+) {
+    let current = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm_ptr,
+        Offset32::new(offset as i32),
+    );
+    let shrink = builder.ins().icmp(IntCC::UnsignedLessThan, saved, current);
+    let out = builder.ins().select(shrink, saved, current);
+    builder.ins().store(
+        MemFlagsData::new(),
+        out,
+        vm_ptr,
+        Offset32::new(offset as i32),
+    );
+}
+
 fn emit_leaf_call_tail(
     builder: &mut FunctionBuilder,
     abi: &Abi,
@@ -5070,10 +5245,23 @@ fn emit_leaf_call(
     let stack_ptr = builder.ins().iadd(frame_base, frame_bytes);
     emit_leaf_call_tail(builder, abi, filled, frame_base, stack_ptr, value, merge);
 
-    // The env lane: the helper rebuilds the frame and performs the whole
-    // call in one round trip (a separate fill would only add an FFI
-    // boundary; the non-aliased in-frame lane still uses it).
+    // The env lane: the machine-code swap around a direct call for an aliased
+    // frame (see `emit_env_leaf_fast`), else the helper, which rebuilds the
+    // frame and performs the whole call in one round trip.
     builder.switch_to_block(env_lane);
+    let env_slow = builder.create_block();
+    emit_env_leaf_fast(
+        builder,
+        abi,
+        cache,
+        cached_entry,
+        args_ptr,
+        argc,
+        value,
+        merge,
+        env_slow,
+    );
+    builder.switch_to_block(env_slow);
     let result = call_helper(
         builder,
         helpers,

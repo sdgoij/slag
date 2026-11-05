@@ -16788,3 +16788,45 @@ validate, the frame fill and the swap) as the only remaining lever of size, and
 it has the cleaner invariant: perform the swap in machine code around a direct
 entry call, which needs the same work in both tiers
 (`compiler.rs`'s `emit_call` and `opt_lower`'s `emit_leaf_call`).
+
+## LANDED (2026-11-05): the leaf env lane performs the swap in machine code
+
+Caching the callee's environment in the record took the env lane from ~17 to
+~12 ns/call; what remained was the FFI round trip and the helper's own
+bookkeeping (the record re-validate, the frame fill, the swap, the truncates).
+For the one frame shape the machine code can build itself — an ALIASED frame,
+where the frame IS the argument region and there is nothing to fill — the lane
+now does the whole call inline: load the record's `environment` and
+`needs_env`, store them over `vm.body_context`/`vm.lexical_env` (the second only
+when the leaf reads a per-iteration binding), `call_indirect` the leaf's entry
+with the caller's ctx and working buffer, store the saved env values back,
+restore the two interpreter stack lengths shrink-only (what the helper's
+`truncate`s do), and fall into the shared pending-check result tail. Everything
+else still takes `leaf_call_env`: a non-aliased frame (the TDZ fill is a loop),
+a record with no environment, the scaffold's null `vm`.
+
+The mirror in the optimizing tier is what made it pay. The per-step tier alone
+changed nothing measurable, because the callers of a capture-taking leaf are
+opt-lifted bodies: `LeafCallEnv` stayed at 13,999,989 calls. With both tiers
+doing the swap, that helper count is **0** on the same probe.
+
+Measured (release, min of 5 interleaved rounds, alternating order, both orders):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| one captured read per call, 5M calls | 137 | **114 (−17%)** |
+| eight captured reads per call | 266 | **235 (−12%)** |
+| corpus `calls/closure_capture`, isolated | 89 | 85 (−5%) |
+| `return 1` / 8 frame reads (controls) | 90 / 125 | 90 / 124 |
+
+Cumulatively, on the shape that started this arc: a call reading one captured
+variable 179 -> 114 ms (−36%), eight captured reads 292 -> 235 ms (−20% this
+slice). The corpus stays flat outside the call rows (an isolated `opcost` run
+shows ±5-10% in both directions, and `array_for_each` — the one row that looked
+worse — measures identical helper counts and identical time under
+`JIT_HELPER_STATS`).
+
+What is left in the lane: ~4 ns/call over a capture-free in-frame leaf (the
+record validate, the env loads and stores, the two stack-length restores) and
+~2.8 ns per read, which the hoist experiment says cannot be hoisted for step
+bodies. The lane is no longer the biggest non-arithmetic cost of a closure call.

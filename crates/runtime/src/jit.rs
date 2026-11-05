@@ -388,6 +388,12 @@ pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
 pub const VM_SWITCH_DISC_OFFSET: usize = std::mem::offset_of!(Vm, switch_disc);
 pub const VM_SWITCH_DISC_SET_OFFSET: usize = std::mem::offset_of!(Vm, switch_disc_set);
 pub const VM_PENDING_LEN_OFFSET: usize = std::mem::offset_of!(Vm, pending) + VEC_LEN_OFFSET;
+/// The value stack's and the array-index stack's length fields: a leaf call run
+/// from machine code restores both to their pre-call lengths (anything a helper
+/// inside the leaf appended is dropped), matching `leaf_call_env`'s truncates.
+pub const VM_STACK_LEN_OFFSET: usize = std::mem::offset_of!(Vm, stack) + VEC_LEN_OFFSET;
+pub const VM_ARRAY_INDEX_STACK_LEN_OFFSET: usize =
+    std::mem::offset_of!(Vm, array_index_stack) + VEC_LEN_OFFSET;
 pub const VM_FOR_OF_STACK_LEN_OFFSET: usize =
     std::mem::offset_of!(Vm, for_of_stack) + VEC_LEN_OFFSET;
 pub const VM_FOR_OF_BOUNDARIES_LEN_OFFSET: usize =

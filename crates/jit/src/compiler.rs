@@ -49,12 +49,13 @@ use runtime::jit::{
     JIT_DEOPT_PROBE, JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext,
     LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, SLOT_RUN_CURSOR_OFFSET,
     SLOT_RUN_KEY_OFFSET, SLOT_RUN_LEN_OFFSET, TYPED_ARRAY_LENGTH_SENTINEL,
-    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BODY_CONTEXT_OFFSET, VM_BUILDER_OFFSET,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
+    VM_ARRAY_INDEX_STACK_LEN_OFFSET, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BODY_CONTEXT_OFFSET,
+    VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
     VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
     VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LEX_RUN_OFFSET,
-    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET, VM_SWITCH_DISC_SET_OFFSET,
-    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_STACK_LEN_OFFSET, VM_SWITCH_DISC_OFFSET,
+    VM_SWITCH_DISC_SET_OFFSET, VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -4679,6 +4680,186 @@ impl<'a> Lowerer<'a> {
         Ok(self.builder.use_var(value_var))
     }
 
+    /// The env lane's machine-code fast path (G13 continuation): the
+    /// `body_context`/`lexical_env` swap `leaf_call_env` performs, emitted
+    /// around a direct call to the leaf's entry instead of a helper round trip.
+    ///
+    /// Only the frame shape the machine code can build itself qualifies: an
+    /// ALIASED frame (the frame IS the argument region, so there is nothing to
+    /// fill) with room for the leaf's working area. Everything else — a
+    /// non-aliased frame, a record without an environment, a null `vm` (the
+    /// scaffold) — branches to `slow`, the helper path.
+    ///
+    /// The two interpreter stack lengths are restored shrink-only, exactly what
+    /// `leaf_call_env`'s `truncate` calls do; the swap is undone BEFORE the
+    /// pending check in `emit_leaf_result_tail`, so a throwing leaf leaves the
+    /// caller's environment in place.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_env_leaf_fast(
+        &mut self,
+        cache: ClifValue,
+        entry: ClifValue,
+        args_ptr: ClifValue,
+        argc: ClifValue,
+        pre_call_offset: ClifValue,
+        merge: Block,
+        slow: Block,
+    ) -> Result<(), Unsupported> {
+        let ctx = self.vm();
+        let vm_ptr = self.vm_ptr();
+        let load = |sel: &mut Self, field: usize, ty: Type| {
+            sel.builder.ins().load(
+                ty,
+                MemFlagsData::new(),
+                cache,
+                Offset32::new(leaf_inline_offset(field) as i32),
+            )
+        };
+        let env = load(
+            self,
+            std::mem::offset_of!(LeafInlineInfo, environment),
+            types::I64,
+        );
+        let frame_size = load(
+            self,
+            std::mem::offset_of!(LeafInlineInfo, frame_size),
+            types::I32,
+        );
+        let arity = load(
+            self,
+            std::mem::offset_of!(LeafInlineInfo, arity),
+            types::I32,
+        );
+        let stack_usage = load(
+            self,
+            std::mem::offset_of!(LeafInlineInfo, stack_usage),
+            types::I64,
+        );
+        let needs_env = load(
+            self,
+            std::mem::offset_of!(LeafInlineInfo, needs_env),
+            types::I32,
+        );
+        let has_env = self.builder.ins().icmp_imm_u(IntCC::NotEqual, env, 0);
+        let has_env = self.bint(has_env);
+        let has_vm = self.builder.ins().icmp_imm_u(IntCC::NotEqual, vm_ptr, 0);
+        let has_vm = self.bint(has_vm);
+        let frame_size_64 = self.builder.ins().uextend(types::I64, frame_size);
+        let fs_eq_ar = self.builder.ins().icmp(IntCC::Equal, frame_size, arity);
+        let argc_ge = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, frame_size_64, argc);
+        let aliased = self.builder.ins().band(fs_eq_ar, argc_ge);
+        let aliased = self.bint(aliased);
+        let buf_end = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, buf_end) as i32),
+        );
+        let argc_bytes = self.builder.ins().imul_imm_s(argc, 8);
+        let args_top = self.builder.ins().iadd(args_ptr, argc_bytes);
+        let stack_bytes = self.builder.ins().imul_imm_s(stack_usage, 8);
+        let top_needed = self.builder.ins().iadd(args_top, stack_bytes);
+        let fits = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, top_needed, buf_end);
+        let fits = self.bint(fits);
+        let ok = self.builder.ins().band(has_env, has_vm);
+        let ok = self.builder.ins().band(ok, aliased);
+        let ok = self.builder.ins().band(ok, fits);
+        let fast = self.builder.create_block();
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        let saved_body = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm_ptr,
+            Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+        );
+        let saved_lex = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm_ptr,
+            Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+        );
+        let saved_stack = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm_ptr,
+            Offset32::new(VM_STACK_LEN_OFFSET as i32),
+        );
+        let saved_index = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm_ptr,
+            Offset32::new(VM_ARRAY_INDEX_STACK_LEN_OFFSET as i32),
+        );
+        // A leaf that reads a per-iteration binding resolves it against
+        // `lexical_env`, so only that shape swaps the second field.
+        let needs_env = self.builder.ins().icmp_imm_u(IntCC::NotEqual, needs_env, 0);
+        let new_lex = self.builder.ins().select(needs_env, env, saved_lex);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            env,
+            vm_ptr,
+            Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+        );
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            new_lex,
+            vm_ptr,
+            Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+        );
+        let frame_bytes = self.builder.ins().imul_imm_s(frame_size_64, 8);
+        let stack_ptr = self.builder.ins().iadd(args_ptr, frame_bytes);
+        let inst =
+            self.builder
+                .ins()
+                .call_indirect(self.sig_entry, entry, &[args_ptr, stack_ptr, ctx]);
+        let result = self.builder.func.dfg.inst_results(inst)[0];
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            saved_body,
+            vm_ptr,
+            Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+        );
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            saved_lex,
+            vm_ptr,
+            Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+        );
+        self.restore_stack_len(vm_ptr, VM_STACK_LEN_OFFSET, saved_stack);
+        self.restore_stack_len(vm_ptr, VM_ARRAY_INDEX_STACK_LEN_OFFSET, saved_index);
+        self.emit_leaf_result_tail(result, pre_call_offset, merge)
+    }
+
+    /// Truncate one of the interpreter stacks back to `saved` (shrink-only, what
+    /// `Vec::truncate` does).
+    fn restore_stack_len(&mut self, vm_ptr: ClifValue, offset: usize, saved: ClifValue) {
+        let current = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm_ptr,
+            Offset32::new(offset as i32),
+        );
+        let shrink = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, saved, current);
+        let out = self.builder.ins().select(shrink, saved, current);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            out,
+            vm_ptr,
+            Offset32::new(offset as i32),
+        );
+    }
+
     fn call_slow(
         &mut self,
         sig: SigRef,
@@ -5558,12 +5739,24 @@ impl<'a> Lowerer<'a> {
         let stack_ptr = self.builder.ins().iadd(frame_base, frame_bytes);
         self.emit_leaf_call_tail(filled, frame_base, stack_ptr, pre_call_sp, merge)?;
         // The env lane (G13): the record says the leaf reads its environment,
-        // which the machine code cannot call in-frame — the
-        // `body_context`/`lexical_env` swap has to span the call. The helper
-        // rebuilds the frame and performs the whole call in one round trip
-        // (a separate `leaf_call_fill` would only add an FFI boundary; the
-        // non-aliased in-frame lane still uses it).
+        // which the machine code could not call in-frame — the
+        // `body_context`/`lexical_env` swap has to span the call. It can now do
+        // that itself for an aliased frame (see `emit_env_leaf_fast`); every
+        // other shape takes the helper, which rebuilds the frame and performs
+        // the whole call in one round trip.
         self.builder.switch_to_block(env_lane);
+        let env_slow = self.builder.create_block();
+        self.emit_env_leaf_fast(
+            cache,
+            cached_entry,
+            args_ptr,
+            argc,
+            pre_call_sp,
+            merge,
+            env_slow,
+        )?;
+        self.builder.switch_to_block(env_slow);
+        self.builder.seal_block(env_slow);
         let value = self.emit_raw_call(
             self.sig_call_slow,
             Helper::LeafCallEnv,
