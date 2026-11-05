@@ -16757,3 +16757,34 @@ trip, the record validate, the fill, the swap/restore) and ~2.8 ns per read
 (the dependent load chain). Cutting either means moving the swap into machine
 code around a direct call, or hoisting the run resolution out of a basic
 block — both structural, neither a small edit.
+
+## MEASURED NEGATIVE (2026-11-05): the context-run hoist is dead code
+
+A context read now costs ~2.8 ns and the cost is the dependent chain
+(`vm -> body_context|lexical_env -> cache key -> cursor -> slots -> value`), so
+the obvious next step is to resolve that chain once per straight-line region
+instead of once per read. The register lane looked like the place: `RunRegBody`
+is straight-line (the JIT refuses `LeafOp::Jump`), so nothing in it can change
+either env field, and the resolution could be hoisted to the body's entry —
+one guarded load per read from the run, or from a `CONTEXT_SLOT_MISS` static of
+TDZ sentinels when no run validates.
+
+Implemented exactly that, and measured **no effect**: the 8-captured-read leaf
+probe −1.1% / 0.0% (both orders), the one-read probe 0.0%, and with
+`SLAG_OPT=0` +0.8% / +2.4%. A diagnostic print in the `RunRegBody` arm never
+fired for either probe.
+
+**The hot leaf body never lowers to `RunRegBody`.** The register form needs
+*every* step to lower to a `LeafOp`, and a capture-reading leaf compiles as a
+plain step body (`LoadContextSlot` × N interleaved with `Binary`), which the
+per-step tier lowers one step per block — so there is no straight-line region to
+hoist into, and each read keeps its own resolution. The same hoist in the step
+tier would need a sound invalidation list covering every step that assigns
+`lexical_env`/`body_context`, with a silent-wrong-value failure mode for any
+step added later, for ~1.5 ns/read. Reverted.
+
+That leaves the ~8 ns of env-lane overhead (the FFI round trip, the record
+validate, the frame fill and the swap) as the only remaining lever of size, and
+it has the cleaner invariant: perform the swap in machine code around a direct
+entry call, which needs the same work in both tiers
+(`compiler.rs`'s `emit_call` and `opt_lower`'s `emit_leaf_call`).
