@@ -17016,8 +17016,29 @@ member call itself ~28 ns. Two independent levers, both helper-bound:
 Also worth recording: `SLAG_OPT=0` is **equal or faster** on all four rows
 (`fib` 77 vs 72, `closures` 33 vs 36, `fn_object` 32 vs 34, `method` 100 vs 99),
 and `SLAG_INLINE=1` changes nothing. The optimizing tier is not contributing to
-call-heavy code; the baseline per-step tier is what these rows measure.
+call-heavy code; the baseline per-step tier is what these rows measure. That is
+not a lift refusal or a deopt storm: `JIT_DUMP_STEPS=1` and
+`SLAG_JIT_DEOPT_TRACE=1` are both silent on these workloads, so the tier
+compiles them and simply gains nothing — both tiers pay the same helpers, and a
+helper call is 4-5 ns whatever emitted it.
 
 Order: (1) the sync narrowing above — it is compiler-only and returns ~10 ns of
 the 21; (2) the inline frame fill / member-read cell; (3) whatever the
 optimizing tier needs to actually take these bodies.
+
+## LANDED (2026-11-05): the loop's sync is narrowed to the loop's own writes
+
+The first of the two sync levers above. The flush is emitted at the assigned
+set's full width at every sync point; inside a loop, only the names the loop
+assigns can be stale, because a flush leaves every slot agreeing with its global
+and each sync's reload re-establishes that for *every* declared name. A loop
+that can reach a sync point now flushes the whole set once in its pre-header and
+narrows to its own assignments (a nested loop unions with its enclosing narrow
+set). `method`: 98 -> 80 ms, 1.88 -> **1.54** of `bs`; the in-loop flush is two
+`StoreGlobal` pairs instead of four. Rows whose loops contain no call are
+unchanged, as expected.
+
+What is left of the sync is therefore the reload (`LoadGlobal`+`InitLocal` per
+declared name, already inlined by the JIT) plus two `set_global_slot` helpers;
+the remaining lever there is the fused `SyncFlush` step, worth maybe 3-4 ns more.
+The bigger remaining item is still the call itself — see the frame fill above.
