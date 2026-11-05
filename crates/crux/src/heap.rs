@@ -26,6 +26,8 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use crate::inline_array::InlineArray;
+
 /// A value whose object graph the collector can trace. Fields holding `Gc<T>`
 /// must visit them in `trace`.
 pub trait Trace: 'static {
@@ -553,6 +555,72 @@ impl<T: Trace> Gc<T> {
         // SAFETY (caller): `payload` lives in a live box, so `base` is that
         // box's address.
         unsafe { Gc::from_box_ptr(base) }
+    }
+}
+
+impl<T: Trace> Gc<InlineArray<T>> {
+    /// Allocate a box whose payload is an [`InlineArray`] with `len` elements
+    /// in trailing storage: one arena slot holds the header and the elements
+    /// together, so a consumer pays one allocation where a `Vec` (or a
+    /// separate element box) would pay two.
+    ///
+    /// `init` writes each element in place, in index order. It must not
+    /// allocate through the heap — the heap is mutably borrowed here — so an
+    /// element it returns must be built without one.
+    pub fn with_len(len: usize, mut init: impl FnMut(usize) -> T) -> Self {
+        assert!(
+            std::mem::align_of::<T>() <= ARENA_GRANULARITY,
+            "an inline element type must fit the arena's alignment"
+        );
+        // `offset_of!` on the box's own `data` field, then the array's element
+        // offset within its payload (one `usize` for the length).
+        let elements_offset =
+            std::mem::offset_of!(GcBox<InlineArray<T>>, data) + InlineArray::<T>::ELEMENTS_OFFSET;
+        let element_bytes = len.saturating_mul(std::mem::size_of::<T>());
+        let size = round_up(
+            elements_offset.saturating_add(element_bytes),
+            ARENA_GRANULARITY,
+        );
+        debug_assert!(
+            size <= u32::MAX as usize,
+            "an inline array must fit its header's size field"
+        );
+        let gc = with_heap_mut(|heap| {
+            let raw = heap.alloc(size, std::mem::align_of::<GcBox<InlineArray<T>>>())
+                as *mut GcBox<InlineArray<T>>;
+            // SAFETY: `raw` is a fresh arena slot of at least `size` bytes; the
+            // header and the element run are written through raw pointers (no
+            // reference over uninitialized memory) before any handle can see
+            // the box, and `init` writes every element.
+            unsafe {
+                let header = std::ptr::addr_of_mut!((*raw).header);
+                std::ptr::addr_of_mut!((*header).flags).write(Cell::new(FLAG_LIVE | FLAG_YOUNG));
+                std::ptr::addr_of_mut!((*header).size).write(size as u32);
+                std::ptr::addr_of_mut!((*header).vtable).write(GcBox::<InlineArray<T>>::VTABLE);
+                let payload = std::ptr::addr_of_mut!((*raw).data);
+                InlineArray::<T>::write_len(payload, len);
+                let elements = InlineArray::<T>::elements_ptr_mut(payload);
+                for index in 0..len {
+                    elements.add(index).write(init(index));
+                }
+            }
+            heap.note_alloc(raw as usize, size);
+            Gc {
+                ptr: unsafe { NonNull::new_unchecked(raw) },
+                _not_send_sync: std::marker::PhantomData,
+            }
+        });
+        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
+        maybe_stress_collect(gc.as_any());
+        gc
+    }
+
+    /// Allocate an inline array holding a copy of `values`.
+    pub fn from_slice(values: &[T]) -> Self
+    where
+        T: Clone,
+    {
+        Self::with_len(values.len(), |index| values[index].clone())
     }
 }
 
