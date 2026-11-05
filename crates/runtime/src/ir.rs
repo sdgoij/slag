@@ -18123,6 +18123,11 @@ struct Compiler {
     /// certified-script path (no sync is emitted).
     script_certified: Option<HashSet<crux::AtomId>>,
     script_var_certs: Option<HashMap<crux::AtomId, bool>>,
+    /// The names the in-loop flush owes: after a pre-header flush every slot
+    /// agrees with its global, and each sync's reload restores that for every
+    /// declared name — so inside a loop only the names the loop itself assigns
+    /// can go stale. `None` = flush the whole assigned set.
+    script_flush_only: Option<HashSet<crux::AtomId>>,
     /// Whether the call being compiled (or the `new` being compiled) is a
     /// certified script's sync point: `compile_call_args` emits the global flush
     /// right before the call step, and the caller emits the reload after it.
@@ -20007,6 +20012,7 @@ impl Compiler {
                 self.emit(Step::NormalizeCompletion);
             }
             StmtKind::While { test, body } => {
+                let guard = self.begin_loop_sync(stmt);
                 self.emit(Step::ResetCompletion);
                 let test_label = self.new_label();
                 let end_label = self.new_label();
@@ -20038,8 +20044,10 @@ impl Compiler {
                 self.place(end_label);
                 self.emit(Step::NormalizeCompletion);
                 self.scope_stack.pop();
+                self.end_loop_sync(guard);
             }
             StmtKind::DoWhile { body, test } => {
+                let guard = self.begin_loop_sync(stmt);
                 self.emit(Step::ResetCompletion);
                 let body_label = self.new_label();
                 let test_label = self.new_label();
@@ -20061,15 +20069,22 @@ impl Compiler {
                 self.place(end_label);
                 self.emit(Step::NormalizeCompletion);
                 self.scope_stack.pop();
+                self.end_loop_sync(guard);
             }
             StmtKind::For {
                 init,
                 test,
                 update,
                 body,
-            } => self.compile_for(init.as_ref(), test.as_ref(), update.as_ref(), body)?,
+            } => {
+                let guard = self.begin_loop_sync(stmt);
+                self.compile_for(init.as_ref(), test.as_ref(), update.as_ref(), body)?;
+                self.end_loop_sync(guard);
+            }
             StmtKind::ForIn { left, right, body } => {
+                let guard = self.begin_loop_sync(stmt);
                 self.compile_for_in(left, right, body)?;
+                self.end_loop_sync(guard);
             }
             StmtKind::ForOf {
                 left,
@@ -20077,11 +20092,13 @@ impl Compiler {
                 body,
                 is_await,
             } => {
+                let guard = self.begin_loop_sync(stmt);
                 if *is_await {
                     self.compile_async_for_of(left, right, body)?;
                 } else {
                     self.compile_for_of(left, right, body)?;
                 }
+                self.end_loop_sync(guard);
             }
             StmtKind::Labeled { label, body } => {
                 self.emit(Step::ResetCompletion);
@@ -24344,7 +24361,8 @@ impl Compiler {
     /// compiler's side of a sync point (a call that may read or write a declared
     /// name through the global). An unassigned name is left alone — its slot only
     /// mirrors what the prologue loaded, and writing a read-only global (e.g.
-    /// `Infinity`) would throw.
+    /// `Infinity`) would throw. Inside a loop that contains a sync point the
+    /// flush is narrowed to the names the loop assigns (`begin_loop_sync`).
     fn emit_script_global_flush(&mut self) {
         let pairs: Vec<(usize, crux::AtomId)> = {
             let (Some(assigned), Some(scope)) =
@@ -24352,10 +24370,13 @@ impl Compiler {
             else {
                 return;
             };
+            let only = self.script_flush_only.as_ref();
             let mut pairs: Vec<(usize, crux::AtomId)> = scope
                 .slots
                 .iter()
-                .filter(|(name, _)| assigned.contains(name))
+                .filter(|(name, _)| {
+                    assigned.contains(name) && only.is_none_or(|o| o.contains(name))
+                })
                 .map(|(name, slot)| (*slot, *name))
                 .collect();
             pairs.sort_unstable();
@@ -24391,6 +24412,43 @@ impl Compiler {
             .collect();
         pairs.sort_unstable();
         pairs
+    }
+
+    /// Narrow the loop's in-loop flush: a loop that can reach a sync point
+    /// flushes the whole assigned set once before it, after which every slot
+    /// agrees with its global, and only the names the loop itself assigns can
+    /// go stale (each sync's reload restores the agreement for all of them).
+    /// Returns the enclosing narrow set to hand back to `end_loop_sync`; `None`
+    /// when the loop owes nothing (no frame, no call, or not a certified
+    /// script).
+    fn begin_loop_sync(&mut self, stmt: &Stmt) -> Option<Option<HashSet<crux::AtomId>>> {
+        if self
+            .scope
+            .as_ref()
+            .is_none_or(|scope| scope.slots.is_empty())
+            || self.script_assigned.is_none()
+            || !stmt_may_call(stmt)
+        {
+            return None;
+        }
+        let mut narrowed = HashSet::new();
+        collect_assigned_stmt(stmt, &mut narrowed);
+        let saved = self.script_flush_only.clone();
+        // Flush what the enclosing region still owes, at the width it has
+        // there, then suppose only this loop's own assignments from here on.
+        self.emit_script_global_flush();
+        self.script_flush_only = Some(match &saved {
+            // An inner loop can still dirty a name its enclosing loop tracks.
+            Some(outer) => outer.union(&narrowed).cloned().collect(),
+            None => narrowed,
+        });
+        Some(saved)
+    }
+
+    fn end_loop_sync(&mut self, saved: Option<Option<HashSet<crux::AtomId>>>) {
+        if let Some(saved) = saved {
+            self.script_flush_only = saved;
+        }
     }
 
     fn compile_call(&mut self, call: &syntax::ast::CallExpr) -> Result<(), JsError> {
@@ -31795,6 +31853,66 @@ fn expr_assigns_name(expr: &Expr, name: crux::AtomId) -> bool {
 /// template) anywhere — such a node can run arbitrary code (a builtin that
 /// writes the global callee, an uncertified function that assigns it), so a
 /// fused callee-after-args read is unsafe with one in the arguments.
+/// Whether executing a statement list can reach a call — the only thing that
+/// makes a sync point inside it. A nested function's body does not run here
+/// (the call that runs it is itself an expression, which `expr_contains_call`
+/// sees), and a shape this walk does not model answers `true`: the only
+/// consumer is the decision to pre-flush a loop, so over-answering is safe.
+fn stmt_may_call(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Block(block) => block.stmts.iter().any(stmt_may_call),
+        StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => false,
+        StmtKind::Expr(expr) => expr_contains_call(expr),
+        StmtKind::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|decl| decl.init.as_ref().is_some_and(expr_contains_call)),
+        StmtKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expr_contains_call(test)
+                || stmt_may_call(consequent)
+                || alternate.as_deref().is_some_and(stmt_may_call)
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            expr_contains_call(test) || stmt_may_call(body)
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            let init_calls = match init {
+                None => false,
+                Some(ForInit::Expr(expr)) => expr_contains_call(expr),
+                Some(ForInit::VarDecl { decls, .. }) => decls
+                    .iter()
+                    .any(|decl| decl.init.as_ref().is_some_and(expr_contains_call)),
+            };
+            init_calls
+                || test.as_ref().is_some_and(expr_contains_call)
+                || update.as_ref().is_some_and(expr_contains_call)
+                || stmt_may_call(body)
+        }
+        StmtKind::Return(expr) => expr.as_ref().is_some_and(expr_contains_call),
+        StmtKind::Throw(expr) => expr_contains_call(expr),
+        StmtKind::Labeled { body, .. } => stmt_may_call(body),
+        StmtKind::ForOf { right, body, .. } | StmtKind::ForIn { right, body, .. } => {
+            expr_contains_call(right) || stmt_may_call(body)
+        }
+        // A declaration's own body runs later, not here.
+        StmtKind::FunctionDecl(_) | StmtKind::ClassDecl(_) => false,
+        // `try`/`switch`/`with`/`using` are never admitted to a certified
+        // script; answer conservatively rather than model them.
+        StmtKind::With { .. }
+        | StmtKind::Try { .. }
+        | StmtKind::Switch { .. }
+        | StmtKind::UsingDecl { .. } => true,
+    }
+}
+
 fn expr_contains_call(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Paren(inner) => expr_contains_call(inner),

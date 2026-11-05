@@ -7620,6 +7620,46 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_sync_flushes_what_the_enclosing_region_owes() {
+        // A loop that reaches a sync point flushes the whole assigned set once
+        // before it and then only owes the names it assigns itself. The callee
+        // here is a *previous* script's closure that resolves `before` through
+        // the global object, so the pre-header flush is what it sees: without
+        // it the global would still hold `undefined` while the slot holds 'A'.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent
+            .run_script("var readBefore = function () { return before; };")
+            .unwrap();
+        assert_eq!(
+            agent
+                .run_script(
+                    "var before = 'A';\n\
+                     var out = '';\n\
+                     for (var i = 0; i < 3; i++) { out = out + readBefore(); }\n\
+                     out"
+                )
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("AAA")))
+        );
+        // And the reload still covers every declared name: the callee's write
+        // through the global reaches the loop's own reads afterwards.
+        agent
+            .run_script("var bumpN = function () { n = n + 10; };")
+            .unwrap();
+        assert_eq!(
+            agent
+                .run_script(
+                    "var n = 0;\n\
+                     for (var i = 0; i < 2; i++) { bumpN(); }\n\
+                     n"
+                )
+                .unwrap(),
+            Value::Number(20.0)
+        );
+    }
+
+    #[test]
     fn fast_script_bails_preserve_env_behavior() {
         // try/catch (a catch param shadows a same-named global), `with`,
         // and direct eval all fall back to the env path and keep their
