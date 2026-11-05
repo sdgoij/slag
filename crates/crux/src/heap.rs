@@ -515,6 +515,63 @@ impl<T: Trace> Gc<T> {
         gc
     }
 
+    /// Allocate a box holding `T` plus `tail_bytes` of trailing storage in the
+    /// same arena slot: the escape hatch for a payload whose size is a runtime
+    /// value (array elements, environment slots, a property run).
+    ///
+    /// The tail starts at the first `tail_align`-aligned offset after `T`.
+    /// `init` writes the payload and receives the tail's address; it runs with
+    /// the heap borrowed, so it must not allocate.
+    ///
+    /// # Safety
+    ///
+    /// `init` must write every field of `*payload` (the slot starts
+    /// uninitialized) and initialize every tail byte that `T::trace` or a
+    /// later reader will touch. The header records the slot's total size, so
+    /// nothing else knows how much of the tail is live: `T` must decide that
+    /// from its own fields, and `trace` must visit exactly those.
+    pub unsafe fn with_tail(
+        tail_bytes: usize,
+        tail_align: usize,
+        init: impl FnOnce(*mut T, *mut u8),
+    ) -> Self {
+        assert!(
+            tail_align.is_power_of_two() && tail_align <= ARENA_GRANULARITY,
+            "a tail must be aligned within the arena's granularity"
+        );
+        let payload_offset = std::mem::offset_of!(GcBox<T>, data);
+        let tail_offset = align_up(payload_offset + std::mem::size_of::<T>(), tail_align);
+        let size = round_up(tail_offset.saturating_add(tail_bytes), ARENA_GRANULARITY);
+        debug_assert!(
+            size <= u32::MAX as usize,
+            "a tailed box must fit its header's size field"
+        );
+        let gc = with_heap_mut(|heap| {
+            let raw = heap.alloc(size, std::mem::align_of::<GcBox<T>>()) as *mut GcBox<T>;
+            // SAFETY: `raw` is a fresh arena slot of at least `size` bytes; the
+            // header and the caller's `init` write the payload and the tail
+            // through raw pointers before any handle can see the box.
+            unsafe {
+                let header = std::ptr::addr_of_mut!((*raw).header);
+                std::ptr::addr_of_mut!((*header).flags).write(Cell::new(FLAG_LIVE | FLAG_YOUNG));
+                std::ptr::addr_of_mut!((*header).size).write(size as u32);
+                std::ptr::addr_of_mut!((*header).vtable).write(GcBox::<T>::VTABLE);
+                init(
+                    std::ptr::addr_of_mut!((*raw).data),
+                    (raw as *mut u8).add(tail_offset),
+                );
+            }
+            heap.note_alloc(raw as usize, size);
+            Gc {
+                ptr: unsafe { NonNull::new_unchecked(raw) },
+                _not_send_sync: std::marker::PhantomData,
+            }
+        });
+        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
+        maybe_stress_collect(gc.as_any());
+        gc
+    }
+
     /// The box base address, for NaN-boxing into `Value`'s 44-bit payload.
     pub(crate) fn box_ptr(self) -> usize {
         self.ptr.as_ptr() as usize
@@ -569,50 +626,25 @@ impl<T: Trace> Gc<InlineArray<T>> {
     /// element it returns must be built without one.
     pub fn with_len(len: usize, mut init: impl FnMut(usize) -> T) -> Self {
         assert!(
-            std::mem::align_of::<T>() <= ARENA_GRANULARITY,
-            "an inline element type must fit the arena's alignment"
+            std::mem::align_of::<T>() <= std::mem::align_of::<usize>(),
+            "an inline element must not out-align a word"
         );
-        // `offset_of!` on the box's own `data` field, then the array's element
-        // offset within its payload (one `usize` for the length).
-        let elements_offset =
-            std::mem::offset_of!(GcBox<InlineArray<T>>, data) + InlineArray::<T>::ELEMENTS_OFFSET;
         let element_bytes = len.saturating_mul(std::mem::size_of::<T>());
-        let size = round_up(
-            elements_offset.saturating_add(element_bytes),
-            ARENA_GRANULARITY,
-        );
-        debug_assert!(
-            size <= u32::MAX as usize,
-            "an inline array must fit its header's size field"
-        );
-        let gc = with_heap_mut(|heap| {
-            let raw = heap.alloc(size, std::mem::align_of::<GcBox<InlineArray<T>>>())
-                as *mut GcBox<InlineArray<T>>;
-            // SAFETY: `raw` is a fresh arena slot of at least `size` bytes; the
-            // header and the element run are written through raw pointers (no
-            // reference over uninitialized memory) before any handle can see
-            // the box, and `init` writes every element.
-            unsafe {
-                let header = std::ptr::addr_of_mut!((*raw).header);
-                std::ptr::addr_of_mut!((*header).flags).write(Cell::new(FLAG_LIVE | FLAG_YOUNG));
-                std::ptr::addr_of_mut!((*header).size).write(size as u32);
-                std::ptr::addr_of_mut!((*header).vtable).write(GcBox::<InlineArray<T>>::VTABLE);
-                let payload = std::ptr::addr_of_mut!((*raw).data);
-                InlineArray::<T>::write_len(payload, len);
-                let elements = InlineArray::<T>::elements_ptr_mut(payload);
-                for index in 0..len {
-                    elements.add(index).write(init(index));
-                }
-            }
-            heap.note_alloc(raw as usize, size);
-            Gc {
-                ptr: unsafe { NonNull::new_unchecked(raw) },
-                _not_send_sync: std::marker::PhantomData,
-            }
-        });
-        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
-        maybe_stress_collect(gc.as_any());
-        gc
+        // SAFETY: the tail is `len` elements at `ELEMENTS_OFFSET` from the
+        // payload (the alignment keeps them there), and `InlineArray`'s own
+        // `len` field plus `trace` describe exactly that run.
+        unsafe {
+            Self::with_tail(
+                element_bytes,
+                std::mem::align_of::<T>().max(InlineArray::<T>::ELEMENTS_OFFSET),
+                |payload, tail| {
+                    InlineArray::<T>::write_len(payload, len);
+                    for index in 0..len {
+                        (tail as *mut T).add(index).write(init(index));
+                    }
+                },
+            )
+        }
     }
 
     /// Allocate an inline array holding a copy of `values`.
@@ -3446,6 +3478,60 @@ mod tests {
         assert!(!Gc::ptr_eq(a, b));
         let copied = a;
         assert!(Gc::ptr_eq(copied, a));
+    }
+
+    /// A payload that reads a run of handles stored outside itself, in the tail
+    /// of its own box: the shape a variable-sized object takes.
+    struct Tailed {
+        len: usize,
+        run: Cell<*mut Gc<Node>>,
+    }
+
+    impl Trace for Tailed {
+        fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+            for index in 0..self.len {
+                // SAFETY: `run` was set by `with_tail`'s initializer to this
+                // box's own tail, and `len` is how many handles it wrote there.
+                unsafe { (*self.run.get().add(index)).trace(visit) }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tail_lives_in_its_own_box_and_is_traced() {
+        let start = with_heap(|heap| heap.live_count());
+        let child = Gc::new(Node::default());
+        let before = with_heap(|heap| heap.allocated_bytes());
+        // `Tailed` is two words and the run is two handles: 16 + 16 + 16 = 48
+        // bytes, one arena slot for the payload and the run together.
+        let tailed: Gc<Tailed> = unsafe {
+            Gc::with_tail(
+                2 * std::mem::size_of::<Gc<Node>>(),
+                std::mem::align_of::<Gc<Node>>(),
+                |payload: *mut Tailed, tail| {
+                    let run = tail as *mut Gc<Node>;
+                    run.write(child);
+                    run.add(1).write(child);
+                    std::ptr::addr_of_mut!((*payload).len).write(2);
+                    std::ptr::addr_of_mut!((*payload).run).write(Cell::new(run));
+                },
+            )
+        };
+        assert_eq!(
+            with_heap(|heap| heap.allocated_bytes()) - before,
+            48,
+            "the run is paid for by the box that owns it"
+        );
+        let live = with_heap(|heap| heap.live_count());
+        assert_eq!(live, start + 2, "the payload and its child");
+        with_heap_mut(|heap| heap.collect(&[tailed.as_any()]));
+        assert_eq!(
+            with_heap(|heap| heap.live_count()),
+            live,
+            "the child is reachable through the payload's tail"
+        );
+        with_heap_mut(|heap| heap.collect(&[]));
+        assert_eq!(with_heap(|heap| heap.live_count()), start);
     }
 
     #[test]
