@@ -1639,8 +1639,7 @@ fn carried_environment(env: &EnvRef) -> Result<CarriedEnvironment, Unsupported> 
     // and can re-enter the agent, and a `RefCell` held across that is a
     // collection the trace skips.
     let bindings = declarative
-        .bindings
-        .borrow()
+        .binding_entries()
         .iter()
         .map(|(name, binding)| (name.clone(), binding.clone()))
         .collect::<Vec<_>>();
@@ -1699,8 +1698,7 @@ fn carried_global_bindings(realm: &Handle<Realm>) -> Result<Vec<(JsString, Bindi
     // collection the trace skips.
     global
         .declarative
-        .bindings
-        .borrow()
+        .binding_entries()
         .iter()
         .map(|(name, binding)| {
             if binding.indirect.is_some() {

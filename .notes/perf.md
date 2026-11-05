@@ -16611,3 +16611,37 @@ allocations where an object pays one, and removing the second is the
 `ArraySlots`-inline/lazy redesign the dense-arrays skill marks as
 load-bearing for the compiled append. Not a slice; recorded as the next step
 in this area, with the numbers to justify it.
+
+## LANDED (2026-11-05): a per-iteration environment shares its names table
+
+The for-in row's per-iteration copy allocated an `EnvRecord` box plus a
+`Vec<(JsString, Binding)>`, and rebuilt that vector every iteration by scanning
+the source environment by name and cloning a 48-byte `JsString` per binding.
+A loop head's names are the same for every copy, so they now live in one
+`EnvNames` (name + mutability per slot): the first copy allocates it and later
+copies inherit the handle from the previous copy. The values are the record
+box's trailing run (`Gc::with_tail`), so a slot is one indexed load and a copy
+is one allocation plus one store per binding.
+
+Measured (jitless, min of 10 interleaved rounds, alternating order; the two
+probes run in one directory so they share the run's drift):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| a for-in head, 3 copies + 3 closures per body, 100k bodies | 391.3 | **337.7 (−13.7%)** |
+| a `for (let x = 0; …)` head, same shape (in-run control) | 448.7 | 447.2 (−0.3%) |
+| the corpus's for-in row, jitless | 882.0 | 843.1 (−4.4%) |
+| the corpus's for-in row, jit mode | 486.0 | 446.5 (−8.1%) |
+
+A cross-run control (`arrays/index_loop`, which creates no per-iteration envs)
+moved −3.5..−4.3%, so only the in-directory pair is trustworthy and the corpus
+row's own effect is ≤5%. `calls/closure_capture` moved +3.1% jit / +1.1%
+jitless: the record grew by two words and every name/slot access now tests the
+`shared` cell. Taken on the strength of the target probe, because it is the
+base of the next slice — the slot run is now addressable, so the JIT's
+`load_context`/`load_per_iter` (28.9M helper calls in the `calls` family) can
+become an inline load.
+
+What is left of a copy: the `EnvRecord` box and one store per binding. The
+`for (let …)` probe not moving says its residual is the increment through the
+environment and the closure call, not the copy.

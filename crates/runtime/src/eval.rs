@@ -936,14 +936,7 @@ fn create_per_iteration_environment(
             "No outer environment for per-iteration bindings".into(),
         )
     })?;
-    let env = new_declarative_environment(Some(outer));
-    for name in per_iteration {
-        let value = last.get_binding_value(name, false)?;
-        // Fresh env: one push instead of the create_mutable_binding
-        // duplicate scan + initialize_binding re-find.
-        env.push_initialized_binding(name, value)?;
-    }
-    Ok(env)
+    crate::env::new_per_iteration_environment(Some(outer), &last, per_iteration)
 }
 
 /// ForStatement evaluation (spec 14.7.4): `let`/`const` heads bind in a

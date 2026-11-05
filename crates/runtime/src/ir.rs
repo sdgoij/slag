@@ -10531,14 +10531,7 @@ impl Vm {
                             "No outer environment for per-iteration bindings".into(),
                         )
                     })?;
-                    let env = new_declarative_environment(Some(outer));
-                    for name in names {
-                        let value = last.get_binding_value(name, false)?;
-                        // The env is fresh: one push instead of the
-                        // create_mutable_binding duplicate scan +
-                        // initialize_binding re-find.
-                        env.push_initialized_binding(name, value)?;
-                    }
+                    let env = crate::env::new_per_iteration_environment(Some(outer), &last, names)?;
                     // The per-iteration environment replaces the lexical
                     // environment without joining the stack; the loop's exit
                     // restores the loop environment directly.
@@ -10556,12 +10549,11 @@ impl Vm {
                     // Later iterations re-use `PerIteration` above (the
                     // copies then come from the previous per-iteration env).
                     let source = self.body_context.unwrap_or(self.lexical_env);
-                    let env = new_declarative_environment(Some(self.lexical_env));
-                    for name in names {
-                        let value = source.get_binding_value(name, false)?;
-                        // Fresh env: one push (see `Step::PerIteration`).
-                        env.push_initialized_binding(name, value)?;
-                    }
+                    let env = crate::env::new_per_iteration_environment(
+                        Some(self.lexical_env),
+                        &source,
+                        names,
+                    )?;
                     if let EnvRecord::Declarative(declarative) = &*env {
                         declarative.mark_context_transparent();
                     }

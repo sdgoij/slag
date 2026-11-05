@@ -6514,13 +6514,7 @@ fn per_iteration_env(
     outer: crate::env::EnvRef,
     source: crate::env::EnvRef,
 ) -> Result<crate::env::EnvRef, JsError> {
-    let env = crate::env::new_declarative_environment(Some(outer));
-    for name in names {
-        let value = source.get_binding_value(name, false)?;
-        // Fresh env: one push instead of the create_mutable_binding
-        // duplicate scan + initialize_binding re-find.
-        env.push_initialized_binding(name, value)?;
-    }
+    let env = crate::env::new_per_iteration_environment(Some(outer), &source, names)?;
     if let crate::env::EnvRecord::Declarative(declarative) = &*env {
         declarative.mark_context_transparent();
     }

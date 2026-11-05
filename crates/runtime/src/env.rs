@@ -440,6 +440,16 @@ impl Trace for DeclarativeEnv {
         if let Some(outer) = &self.outer {
             outer.trace(visit);
         }
+        if let Some(shared) = self.shared.get() {
+            shared.trace(visit);
+            let slots = self.slots.get();
+            debug_assert!(!slots.is_null(), "a shared-layout env has a slot run");
+            for index in 0..shared.len() {
+                // SAFETY: the trailing run holds `shared.len()` initialized
+                // values in this env's own box.
+                unsafe { (*slots.add(index)).trace(visit) }
+            }
+        }
         // The cells are RefCells: `RefCell<T>`'s trace skips a cell that is
         // mutably borrowed mid-collection (per-allocation `--gc-stress`) and
         // aborts the sweep instead of panicking. Tracing the whole `bindings`
@@ -511,6 +521,14 @@ impl Trace for EnvRecord {
 pub struct DeclarativeEnv {
     pub outer: Option<EnvRef>,
     pub bindings: RefCell<Vec<(JsString, Binding)>>,
+    /// The slot names of a per-iteration copy, shared with every other copy of
+    /// the same loop head. When set, the values live in this box's trailing
+    /// run (addressed by `slots`) and `bindings` stays empty until a
+    /// structural mutation materializes it.
+    shared: std::cell::Cell<Option<Handle<EnvNames>>>,
+    /// The first value of the trailing run (`shared`'s slot count of them), or
+    /// null when the values live in `bindings`.
+    slots: std::cell::Cell<*mut Value>,
     /// `using` and Annex B state, allocated on first use. Ordinary scopes —
     /// every block, every per-iteration copy, every function record — carry
     /// neither, and the two vectors were half of the record's footprint; the
@@ -526,6 +544,44 @@ pub struct DeclarativeEnv {
     /// scaffolding holding only the function's own name). The walk skips
     /// these when resolving an enclosing body's capture context.
     pub context_transparent: std::cell::Cell<bool>,
+}
+
+/// The slot names of a per-iteration environment, shared by every copy of one
+/// loop head: the copies differ only in their values, so the names (and their
+/// mutability) are allocated once per loop and inherited from the previous
+/// copy.
+///
+/// This is what makes a copy cheap: the constructor used to scan the source
+/// environment by name and clone a 48-byte `JsString` per binding, and the
+/// values then sat in an 80-byte `(JsString, Binding)` entry. With the names
+/// out of the instance, a copy is a value run in the new box, and a slot read
+/// is one indexed load.
+#[derive(Debug)]
+pub struct EnvNames {
+    /// `(name, mutable)` per slot, in slot order.
+    entries: Box<[(JsString, bool)]>,
+}
+
+impl EnvNames {
+    fn from_names(names: &[JsString]) -> Self {
+        let entries: Vec<(JsString, bool)> =
+            names.iter().map(|name| (name.clone(), true)).collect();
+        Self {
+            entries: entries.into_boxed_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Trace for EnvNames {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for (name, _) in self.entries.iter() {
+            name.trace(visit);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -551,10 +607,58 @@ impl DeclarativeEnv {
         Self {
             outer,
             bindings: RefCell::new(Vec::new()),
+            shared: std::cell::Cell::new(None),
+            slots: std::cell::Cell::new(std::ptr::null_mut()),
             extras: RefCell::new(None),
             is_catch_param: std::cell::Cell::new(false),
             context_transparent: std::cell::Cell::new(false),
         }
+    }
+
+    /// The slot names of a per-iteration copy, when this is one.
+    fn shared_names(&self) -> Option<Handle<EnvNames>> {
+        self.shared.get()
+    }
+
+    /// The record's bindings in the dynamic representation, materializing a
+    /// per-iteration copy first: the walkers that read names and flags (a
+    /// snapshot, a diagnostic) must see the same entries however the record
+    /// stores them.
+    pub(crate) fn binding_entries(&self) -> std::cell::Ref<'_, Vec<(JsString, Binding)>> {
+        self.materialize_shared();
+        self.bindings.borrow()
+    }
+
+    /// Turn a shared-layout copy back into the dynamic record: the names and
+    /// flags move into `bindings` and the trailing run is abandoned. Only the
+    /// structural paths call this — a per-iteration copy is created complete
+    /// and its slot shape never changes.
+    fn materialize_shared(&self) {
+        let Some(shared) = self.shared.get() else {
+            return;
+        };
+        let slots = self.slots.get();
+        let mut bindings = Vec::with_capacity(shared.len());
+        for (index, (name, mutable)) in shared.entries.iter().enumerate() {
+            // SAFETY: `slots` is this box's trailing run of `entries.len()`
+            // values, initialized by the constructor (to the TDZ sentinel when
+            // the copy was aborted).
+            let value = unsafe { *slots.add(index) };
+            bindings.push((
+                name.clone(),
+                Binding {
+                    value: (!value.is_uninitialized()).then_some(value),
+                    mutable: *mutable,
+                    strict: false,
+                    deletable: false,
+                    indirect: None,
+                    parameter: false,
+                },
+            ));
+        }
+        *self.bindings.borrow_mut() = bindings;
+        self.shared.set(None);
+        self.slots.set(std::ptr::null_mut());
     }
 
     fn with_extras<R>(&self, f: impl FnOnce(&mut EnvExtras) -> R) -> R {
@@ -602,6 +706,7 @@ impl DeclarativeEnv {
     /// Mark a binding as a formal parameter or `arguments` (the Annex B
     /// block-function hoist must not overwrite it).
     pub fn mark_parameter(&self, name: &JsString) {
+        self.materialize_shared();
         if let Some((_, binding)) = self
             .bindings
             .borrow_mut()
@@ -613,6 +718,9 @@ impl DeclarativeEnv {
     }
 
     fn is_parameter(&self, name: &JsString) -> bool {
+        if self.shared_names().is_some() {
+            return false;
+        }
         self.bindings
             .borrow()
             .iter()
@@ -623,6 +731,16 @@ impl DeclarativeEnv {
     /// context): `None` is the TDZ marker (a `let`/`const` binding that has
     /// not been initialized).
     pub fn slot_value(&self, index: usize) -> Option<Value> {
+        if let Some(shared) = self.shared.get() {
+            if index >= shared.len() {
+                return None;
+            }
+            // SAFETY: a shared-layout env's `slots` is the trailing run of its
+            // own box, `shared.len()` values wide, initialized by the
+            // constructor.
+            let value = unsafe { *self.slots.get().add(index) };
+            return (!value.is_uninitialized()).then_some(value);
+        }
         self.bindings.borrow().get(index).and_then(|(_, b)| b.value)
     }
 
@@ -631,6 +749,12 @@ impl DeclarativeEnv {
     /// body's own const writes are compile-rejected, but a nested closure's
     /// write to an enclosing const must still throw).
     pub fn slot_mutable(&self, index: usize) -> bool {
+        if let Some(shared) = self.shared.get() {
+            return shared
+                .entries
+                .get(index)
+                .is_some_and(|(_, mutable)| *mutable);
+        }
         self.bindings
             .borrow()
             .get(index)
@@ -647,12 +771,22 @@ impl DeclarativeEnv {
     /// Write the binding at `index` — the certified body's compile-time
     /// checks already enforce const and TDZ, so no validation here.
     pub fn set_slot(&self, index: usize, value: Value) {
+        if let Some(shared) = self.shared.get() {
+            if index < shared.len() {
+                // SAFETY: as `slot_value`.
+                unsafe { *self.slots.get().add(index) = value };
+            }
+            return;
+        }
         if let Some((_, b)) = self.bindings.borrow_mut().get_mut(index) {
             b.value = Some(value);
         }
     }
 
     fn has_binding(&self, name: &JsString) -> bool {
+        if let Some(shared) = self.shared.get() {
+            return shared.entries.iter().any(|(entry, _)| entry == name);
+        }
         self.bindings.borrow().iter().any(|(n, _)| n == name)
     }
 
@@ -672,6 +806,7 @@ impl DeclarativeEnv {
     }
 
     fn create_mutable_binding(&self, name: &JsString, deletable: bool) -> Result<(), JsError> {
+        self.materialize_shared();
         if self.has_binding(name) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -693,6 +828,7 @@ impl DeclarativeEnv {
     }
 
     fn create_immutable_binding(&self, name: &JsString, strict: bool) -> Result<(), JsError> {
+        self.materialize_shared();
         if self.has_binding(name) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -720,6 +856,7 @@ impl DeclarativeEnv {
     /// two-step form would. `deletable`/`strict`/`parameter` mirror the
     /// per-iteration creator's arguments.
     pub fn push_initialized_binding(&self, name: &JsString, value: Value) {
+        self.materialize_shared();
         self.bindings.borrow_mut().push((
             name.clone(),
             Binding {
@@ -734,6 +871,17 @@ impl DeclarativeEnv {
     }
 
     fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
+        if let Some(shared) = self.shared.get() {
+            let Some(index) = shared.entries.iter().position(|(n, _)| n == name) else {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    format!("Binding {:?} does not exist", name.to_string_lossy()),
+                ));
+            };
+            // SAFETY: as `slot_value`.
+            unsafe { *self.slots.get().add(index) = value };
+            return Ok(());
+        }
         let mut bindings = self.bindings.borrow_mut();
         let binding = bindings
             .iter_mut()
@@ -754,6 +902,46 @@ impl DeclarativeEnv {
         value: Value,
         strict: bool,
     ) -> Result<(), JsError> {
+        if let Some(shared) = self.shared.get() {
+            let Some(index) = shared.entries.iter().position(|(n, _)| n == name) else {
+                // spec step 1: sloppy code creates the missing binding.
+                if strict {
+                    return Err(JsError::new(
+                        ErrorKind::ReferenceError,
+                        format!("{:?} is not defined", name.to_string_lossy()),
+                    ));
+                }
+                self.create_mutable_binding(name, true)?;
+                return self.initialize_binding(name, value);
+            };
+            let mutable = shared.entries[index].1;
+            // SAFETY: as `slot_value`.
+            let current = unsafe { *self.slots.get().add(index) };
+            if current.is_uninitialized() {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    format!(
+                        "Cannot access {:?} before initialization",
+                        name.to_string_lossy()
+                    ),
+                ));
+            }
+            return if mutable {
+                // SAFETY: as `slot_value`.
+                unsafe { *self.slots.get().add(index) = value };
+                Ok(())
+            } else if strict {
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!(
+                        "Assignment to constant variable {:?}",
+                        name.to_string_lossy()
+                    ),
+                ))
+            } else {
+                Ok(())
+            };
+        }
         let Some(index) = self.bindings.borrow().iter().position(|(n, _)| n == name) else {
             // spec step 1: sloppy code creates the missing binding.
             if strict {
@@ -798,6 +986,9 @@ impl DeclarativeEnv {
     /// used while its cell's generation is current; a delete shifts the
     /// vector and therefore invalidates the cell.
     pub fn index_of(&self, name: &JsString) -> Option<usize> {
+        if let Some(shared) = self.shared.get() {
+            return shared.entries.iter().position(|(n, _)| n == name);
+        }
         self.bindings.borrow().iter().position(|(n, _)| n == name)
     }
 
@@ -815,6 +1006,40 @@ impl DeclarativeEnv {
         value: Value,
         strict: bool,
     ) -> Result<Option<Value>, JsError> {
+        if let Some(shared) = self.shared.get() {
+            let Some((stored_name, mutable)) = shared.entries.get(index) else {
+                return Ok(None);
+            };
+            if stored_name != name {
+                return Ok(None);
+            }
+            // SAFETY: as `slot_value`.
+            let current = unsafe { *self.slots.get().add(index) };
+            if current.is_uninitialized() {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    format!(
+                        "Cannot access {:?} before initialization",
+                        name.to_string_lossy()
+                    ),
+                ));
+            }
+            return if *mutable {
+                // SAFETY: as `slot_value`.
+                unsafe { *self.slots.get().add(index) = value };
+                Ok(Some(value))
+            } else if strict {
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!(
+                        "Assignment to constant variable {:?}",
+                        name.to_string_lossy()
+                    ),
+                ))
+            } else {
+                Ok(Some(current))
+            };
+        }
         let mut bindings = self.bindings.borrow_mut();
         let Some((stored_name, binding)) = bindings.get_mut(index) else {
             return Ok(None);
@@ -850,6 +1075,26 @@ impl DeclarativeEnv {
     }
 
     fn get_binding_value(&self, name: &JsString, _strict: bool) -> Result<Value, JsError> {
+        if let Some(shared) = self.shared.get() {
+            let Some(index) = shared.entries.iter().position(|(n, _)| n == name) else {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    format!("{:?} is not defined", name.to_string_lossy()),
+                ));
+            };
+            // SAFETY: as `slot_value`.
+            let value = unsafe { *self.slots.get().add(index) };
+            if value.is_uninitialized() {
+                return Err(JsError::new(
+                    ErrorKind::ReferenceError,
+                    format!(
+                        "Cannot access {:?} before initialization",
+                        name.to_string_lossy()
+                    ),
+                ));
+            }
+            return Ok(value);
+        }
         let bindings = self.bindings.borrow();
         let binding = bindings.iter().find(|(n, _)| n == name).ok_or_else(|| {
             JsError::new(
@@ -873,6 +1118,7 @@ impl DeclarativeEnv {
     }
 
     fn delete_binding(&self, name: &JsString) -> Result<bool, JsError> {
+        self.materialize_shared();
         let mut bindings = self.bindings.borrow_mut();
         let Some(index) = bindings.iter().position(|(n, _)| n == name) else {
             return Ok(true);
@@ -894,6 +1140,7 @@ impl DeclarativeEnv {
         target: EnvRef,
         target_name: &JsString,
     ) -> Result<(), JsError> {
+        self.materialize_shared();
         if self.has_binding(name) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
@@ -1325,6 +1572,64 @@ impl ModuleEnv {
 /// NewDeclarativeEnvironment (spec 9.2.2.1).
 pub fn new_declarative_environment(outer: Option<EnvRef>) -> EnvRef {
     Handle::new(EnvRecord::Declarative(DeclarativeEnv::new(outer)))
+}
+
+/// A per-iteration environment (spec 14.7.4.3): a fresh record whose slots
+/// hold `names` copied from `source`, sharing the names table with every other
+/// copy of the same loop head.
+///
+/// One arena slot holds the record and its values, and every copy after the
+/// first only carries a handle to the names — no `Vec`, no per-binding name
+/// clone, and no linear name scan per binding. The values are read through the
+/// record's `slots` cursor, so a certified body's static context-chain read is
+/// one indexed load.
+pub fn new_per_iteration_environment(
+    outer: Option<EnvRef>,
+    source: &EnvRef,
+    names: &[JsString],
+) -> Result<EnvRef, JsError> {
+    let shared = match &**source {
+        EnvRecord::Declarative(declarative) => declarative.shared_names(),
+        _ => None,
+    }
+    .filter(|shared| shared.len() == names.len())
+    .unwrap_or_else(|| Handle::new(EnvNames::from_names(names)));
+
+    let bytes = names.len().saturating_mul(std::mem::size_of::<Value>());
+    let mut failure = None;
+    // SAFETY: the initializer writes every field of the record and fills every
+    // slot before the handle can escape. The run starts at the TDZ sentinel
+    // (which traces as nothing), so a copy aborted by a lookup error still
+    // leaves a well-formed box for the collection the allocation itself runs.
+    let env: EnvRef = unsafe {
+        Handle::with_tail(
+            bytes,
+            std::mem::align_of::<Value>(),
+            |payload: *mut EnvRecord, tail| {
+                let run = tail as *mut Value;
+                for index in 0..names.len() {
+                    run.add(index).write(Value::uninitialized());
+                }
+                let declarative = DeclarativeEnv::new(outer);
+                declarative.shared.set(Some(shared));
+                declarative.slots.set(run);
+                payload.write(EnvRecord::Declarative(declarative));
+                for (index, name) in names.iter().enumerate() {
+                    match source.get_binding_value(name, false) {
+                        Ok(value) => run.add(index).write(value),
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+            },
+        )
+    };
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(env),
+    }
 }
 
 /// NewObjectEnvironment (spec 9.2.3.1).
