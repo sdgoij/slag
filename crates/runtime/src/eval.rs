@@ -7538,6 +7538,38 @@ mod tests {
     }
 
     #[test]
+    fn a_for_in_head_keeps_the_script_certified() {
+        // `for-in` used to drop the whole script's frame (and with it the JIT):
+        // the key binds straight to the slot like a for-of head and the
+        // enumeration is VM-side, so it belongs on the certified path.
+        let program = parser::parse_script(
+            "var o = { a: 1, b: 2 }; var s = ''; for (var k in o) { s += k; } s",
+        )
+        .unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        assert!(
+            body.scope.is_some() && body.script_globals.is_some(),
+            "a for-in head must not un-certify the script"
+        );
+        // The head is an assignment (the loop rewrites it every iteration), so
+        // it is flushed at a sync point and written back by the epilogue: a
+        // callee and the enclosing scope both see the current key.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert_eq!(
+            agent
+                .run_script(
+                    "var o = { a: 1, b: 2 }; var seen = '';\n\
+                     function note() { seen += k; }\n\
+                     for (var k in o) note();\n\
+                     seen + k"
+                )
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("abb")))
+        );
+    }
+
+    #[test]
     fn fast_script_bails_preserve_env_behavior() {
         // try/catch (a catch param shadows a same-named global), `with`,
         // and direct eval all fall back to the env path and keep their

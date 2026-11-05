@@ -30315,7 +30315,8 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) {
         StmtKind::Labeled { body, .. } => collect_assigned_stmt(body, assigned),
         StmtKind::ForOf {
             left, right, body, ..
-        } => {
+        }
+        | StmtKind::ForIn { left, right, body } => {
             if let ForBinding::VarDecl {
                 pattern: BindingPattern::Ident(name),
                 ..
@@ -30334,7 +30335,6 @@ fn collect_assigned_stmt(stmt: &Stmt, assigned: &mut HashSet<crux::AtomId>) {
         | StmtKind::With { .. }
         | StmtKind::Try { .. }
         | StmtKind::Switch { .. }
-        | StmtKind::ForIn { .. }
         | StmtKind::UsingDecl { .. } => {}
         // A function body can assign a declared name (an uncertified
         // function's write lands on the global object) — the prepass must
@@ -32014,6 +32014,27 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
             ) && script_slots_expr_allows(right)
                 && script_slots_stmt_allows(body, certified)
         }
+        StmtKind::ForIn { left, right, body } => {
+            // A simple `var` ident head binds each key straight to the slot
+            // (`ForOfBindLocal`), exactly like a for-of head; the enumeration
+            // is VM-side (`ForInBegin`'s key snapshot). `k` is an assignment
+            // (collected by the prepass) — the loop rewrites it every
+            // iteration, so it must be flushed at a sync point and written
+            // back by the epilogue.
+            match left {
+                ForBinding::VarDecl {
+                    kind: VarDeclKind::Var,
+                    pattern: BindingPattern::Ident(_),
+                    init,
+                    ..
+                } => {
+                    init.as_ref().is_none_or(script_slots_expr_allows)
+                        && script_slots_expr_allows(right)
+                        && script_slots_stmt_allows(body, certified)
+                }
+                _ => false,
+            }
+        }
         // Cut 35 slice 3: a certified (global-blind) top-level function
         // declaration cannot observe the slotified globals, so it no longer
         // disqualifies the frame path. An UNCERTIFIED one still does: its body
@@ -32027,7 +32048,6 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
         | StmtKind::With { .. }
         | StmtKind::Try { .. }
         | StmtKind::Switch { .. }
-        | StmtKind::ForIn { .. }
         | StmtKind::UsingDecl { .. } => false,
     }
 }
@@ -32566,12 +32586,9 @@ fn script_stmt_allows(stmt: &Stmt, catch_params: &mut Vec<crux::AtomId>) -> bool
                 .is_none_or(|block| script_scan_allows(&block.stmts, catch_params))
         }
         // `with` re-resolves every name against an object env; a `switch` case
-        // can hold lexical declarations; `for-in` heads have their own binding
-        // machinery; `using` is lexical. All fall back to the env path.
-        StmtKind::With { .. }
-        | StmtKind::Switch { .. }
-        | StmtKind::ForIn { .. }
-        | StmtKind::UsingDecl { .. } => false,
+        // can hold lexical declarations; `using` is lexical. All fall back to
+        // the env path.
+        StmtKind::With { .. } | StmtKind::Switch { .. } | StmtKind::UsingDecl { .. } => false,
         // A `for-of` with a simple `var` ident head binds via the global
         // cell / frame slot (`ForOfBindGlobal`/`ForOfBindLocal`) with no
         // per-iteration environment — the iterator protocol, the per-step
@@ -32592,6 +32609,25 @@ fn script_stmt_allows(stmt: &Stmt, catch_params: &mut Vec<crux::AtomId>) -> bool
             ) && script_expr_allows(right)
                 && script_stmt_allows(body, catch_params)
         }
+        // A `for-in` with a simple `var` ident head binds via the frame slot /
+        // global cell like a `for-of` head — the enumeration and the per-step
+        // key snapshot are VM-side — so it no longer drops the script's frame.
+        // A lexical head (per-iteration environments), a destructuring head, or
+        // a body with env-path statements keeps the whole script on the env
+        // path.
+        StmtKind::ForIn { left, right, body } => match left {
+            ForBinding::VarDecl {
+                kind: VarDeclKind::Var,
+                pattern: BindingPattern::Ident(_),
+                init,
+                ..
+            } => {
+                init.as_ref().is_none_or(script_expr_allows)
+                    && script_expr_allows(right)
+                    && script_stmt_allows(body, catch_params)
+            }
+            _ => false,
+        },
     }
 }
 

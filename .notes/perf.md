@@ -16943,3 +16943,31 @@ Two bugs surfaced on the way, both now regression tests:
 
 Still behind `bs`, i.e. the next lever is unchanged: the interpreter's call
 cost — `fib` 1.76, `closures` 1.74, `fn_object` 1.95, `sieve` 1.12.
+
+## LANDED (2026-11-05): a script-level for-in keeps the frame (and the JIT)
+
+`for-in` was the last loop head that dropped a script's frame: `script_scan_allows`
+refused `StmtKind::ForIn` outright, so `for (var k in o) s += o[k]` at top level
+ran interpreted on the global path. Nothing needed to be built — a `var` ident
+head binds each key straight to the slot (`ForOfBindLocal`) exactly like a
+for-of head, `compile_certified_for_in` already existed (function bodies use
+it), and the enumeration plus the per-step key snapshot are VM-side. Both scans
+now admit a `var` ident head (an Annex B `for (var a = init in o)` only when the
+initializer is allowed too), and `collect_assigned_stmt` records the head as an
+assignment — the loop rewrites it every iteration, so it is flushed at a sync
+point and written back by the epilogue.
+
+| bench | bs | before | after |
+| --- | ---: | ---: | ---: |
+| `forin` (jit) | 80 | 520 (6.05) | **21 (0.26)** |
+| `forin` (njit) | 80 | 520 (6.05) | **25 (0.31)** |
+
+That puts the script row at the `fn_forin` shape's speed (0.31) — a 25x win,
+and the largest single row of the Brimstone comparison. It rests on the `fix`
+commit before it: a `break` out of a nested for-in looped forever, which the
+enablement would have exposed at top level.
+
+Still behind `bs` after it: `method` 3.69 (blocked on the function-expression
+value in `Point.prototype.get = function () {…}`, which `script_slots_expr_allows`
+rejects — the closure could escape and be invoked implicitly, outside a sync
+point), then the call rows.
