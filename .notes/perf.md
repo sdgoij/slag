@@ -16830,3 +16830,67 @@ What is left in the lane: ~4 ns/call over a capture-free in-frame leaf (the
 record validate, the env loads and stores, the two stack-length restores) and
 ~2.8 ns per read, which the hoist experiment says cannot be hoisted for step
 bodies. The lane is no longer the biggest non-arithmetic cost of a closure call.
+
+## BASELINE (2026-11-05): Slag vs Brimstone, and the script-certification cliff
+
+Brimstone (`bs`, a bytecode interpreter with no JIT, 64d6698, release build) is
+the external yardstick: `slag` vs `bs` is "our engine", `slag --jitless` vs `bs`
+is "interpreter vs interpreter". Harness: `tools/brimstone/compare.sh` (one
+process per cell, 5 rounds, engine order rotated, min per cell; the workloads
+time themselves so startup is excluded).
+
+| bench | shape | bs | slag-jit | slag-njit | jit/bs | njit/bs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| arith | script | 190 | 882 | 856 | 4.64 | 4.51 |
+| array | script | 49 | 128 | 131 | 2.61 | 2.67 |
+| forin | script | 85 | 529 | 596 | 6.22 | 7.01 |
+| method | script | 56 | 203 | 187 | 3.62 | 3.34 |
+| object | script | 38 | 160 | 163 | 4.21 | 4.29 |
+| capture (8 captured reads) | fn | 63 | 62 | 154 | 0.98 | 2.44 |
+| capture2 (1 captured read) | fn | 23 | 20 | 77 | 0.87 | 3.35 |
+| closures (64 closures) | fn | 24 | 40 | 165 | 1.67 | 6.88 |
+| fib(30) | fn | 40 | 68 | 506 | 1.70 | 12.65 |
+| local (8 frame reads) | fn | 45 | 25 | 150 | 0.56 | 3.33 |
+| sieve(1e6) | fn | 82 | 85 | 215 | 1.04 | 2.62 |
+| string (concat) | fn | 8 | 15 | 16 | 1.88 | 2.00 |
+| fn_arith | fn | 78 | 7 | 351 | 0.09 | 4.50 |
+| fn_array | fn | 30 | 21 | 73 | 0.70 | 2.43 |
+| fn_forin | fn | 79 | 25 | 27 | 0.32 | 0.34 |
+| fn_object | fn | 21 | 35 | 76 | 1.67 | 3.62 |
+
+**The headline is not the JIT or the interpreter: a top-level loop is never
+compiled if the script calls anything through a member expression.**
+`analyze_script_scope` → `script_slots_expr_allows` accepts a `Call` only when
+the callee is a certified top-level function identifier; `console.log(...)`,
+`Date.now()` and `p.get()` all fail that, the whole script loses its `scope`,
+and `eval_program` never consults the JIT. `tools/brimstone/isolation` holds the
+three-file proof — the same 10M-iteration loop:
+
+| script | bs | slag-jit | slag-njit |
+| --- | ---: | ---: | ---: |
+| no call at all (`script_only`) | 242 | **69** | 461 |
+| calls a certified top-level fn (`script_fn`) | 256 | **78** | 460 |
+| calls `Date.now`/`console.log` (`script_call`) | 253 | **1056** | 1047 |
+
+One `console.log` costs 15x, and it is why every self-timing benchmark (i.e. the
+normal way benchmarks are written) measures our interpreter, not our JIT: the
+`script` rows above have `jit` and `njit` within noise of each other and are the
+2.6-6.2x rows. The fix that keeps the JIT is a flush/reload of the slotified
+globals around a non-certified call (exact, and O(assigned names) per such call
+site), not widening the gate — a called user method can read a script global.
+
+The second gap is the call path. `jitless` is 2.4-12.7x behind `bs`, worst on
+`fib` (a recursive call: 506 vs 40) and `closures` (165 vs 24). That is the
+interpreter's per-call cost, not arithmetic: the same loops in `fn_arith`/
+`fn_forin` are 4.5x/0.34x.
+
+Where the JIT applies Slag is now ahead of `bs` on loop-shaped rows (fn_arith
+0.09, fn_forin 0.32, local 0.56, fn_array 0.70, capture2 0.87) and at parity on
+`sieve`/`capture`, and behind on `fib` (1.70), `closures` (1.67), `fn_object`
+(1.67) and `string` (1.88) — the capture rows are the ones this session's three
+slices moved (a 5M-call capture probe went 336 -> 235 ms, and `capture` here is
+at parity with a native-quality interpreter).
+
+Order for the next slices: (1) the script-certification cliff — it dwarfs both
+the JIT and the interpreter gaps and is a bounded change; (2) the interpreter's
+call cost (`fib`, `closures`); (3) `fn_object`/`string`.
