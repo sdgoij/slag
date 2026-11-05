@@ -33,7 +33,7 @@ use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
-use crate::env::EnvRecord;
+use crate::env::{EnvRecord, EnvRef};
 use crate::ir::{
     Builder, CompiledBody, EnvStack, INTRINSIC_COUNT, INTRINSICS, MEMBER_CELLS, MemberValueCell,
     PropertyKeyName, ScopeInfo, Vm,
@@ -133,6 +133,17 @@ pub struct LeafInlineInfo {
     /// `body_context`/`lexical_env` swap has to span the call. The site takes
     /// the env lane (`leaf_call_env`) instead.
     pub uses_env: u32,
+    /// G13: the callee's closure environment (the `[[Environment]]` the env
+    /// lane swaps in), or `None` for a leaf that never reads one. Cached here
+    /// so the lane does not re-derive it per call (an `ecma_functions` lookup
+    /// behind a `RefCell` borrow plus two `Rc<CompiledBody>` clones). Sound for
+    /// the same reason the cached entry is: a sweeping collection clears the
+    /// record table and boxes never move, so a box named here cannot be freed
+    /// or recycled while the record is readable.
+    pub environment: Option<EnvRef>,
+    /// G13: 1 when the leaf reads a per-iteration binding, so the lane swaps
+    /// `lexical_env` as well as `body_context` (`CompiledBody::leaf_needs_env`).
+    pub needs_env: u32,
 }
 
 impl LeafInlineInfo {
@@ -149,6 +160,8 @@ impl LeafInlineInfo {
             tdz_mask: 0,
             fill_ok: 0,
             uses_env: 0,
+            environment: None,
+            needs_env: 0,
         }
     }
 }
@@ -2847,6 +2860,8 @@ fn leaf_fill_info(
         tdz_mask,
         fill_ok,
         uses_env: u32::from(uses_env),
+        environment: None,
+        needs_env: 0,
     }
 }
 
@@ -3196,23 +3211,29 @@ extern "C" fn leaf_call_probe(
     // `uses_env` set and refuses, and the compiled hit path's env lane
     // (`leaf_call_env`) owns the whole call.
     let uses_env = ir.leaf_uses_env;
-    let info = leaf_fill_info(
+    let needs_env = ir.leaf_needs_env;
+    let environment = entry.environment;
+    let mut info = leaf_fill_info(
         scope,
         strict,
         compiled.entry as u64,
         compiled.stack_usage,
         uses_env,
     );
+    info.environment = environment;
+    info.needs_env = u32::from(needs_env);
     // The frame fill (bind `this`, room check, write slots) is identical to
     // the compiled hit path's (G14) — see `fill_leaf_frame`; a rejection there
     // is the same rejection here. The probe fills from the scope itself, and
     // records the descriptor the hit path fills from, so the two cannot drift.
     // An env leaf is not filled here: the env lane fills from the record
     // before it swaps the env in, so a wide frame (no usable mask) must not be
-    // recorded as env-inlineable either.
-    let mut info = info;
+    // recorded as env-inlineable either, and neither must a leaf that would
+    // build a context of its own (a leaf creates no closures, so that cannot
+    // happen — the gate keeps the lane's `environment`-only swap honest if it
+    // ever does).
     if uses_env {
-        if info.fill_ok == 0 {
+        if info.fill_ok == 0 || !scope.context_names.is_empty() {
             info.entry = 0;
         }
     } else if !fill_leaf_frame(
@@ -3267,6 +3288,14 @@ extern "C" fn leaf_call_env(
     {
         return u64::MAX;
     }
+    // The probe recorded the callee's environment (the `[[Environment]]` the
+    // capture-context read resolves from) and whether the lane has to swap
+    // `lexical_env` too, so the lane needs no `ecma_functions` lookup, no
+    // `Rc<CompiledBody>` clone and no `new_body_context` (always `None` for a
+    // leaf — it creates no closures).
+    let Some(environment) = info.environment else {
+        return u64::MAX;
+    };
     let entry = info.entry;
     let frame_size = info.frame_size as usize;
     let arity = info.arity as usize;
@@ -3288,44 +3317,19 @@ extern "C" fn leaf_call_env(
     ) {
         return u64::MAX;
     }
-    let callee = Value::from_bits(callee);
-    let ValueKind::Function(function) = callee.kind() else {
-        return u64::MAX;
-    };
-    let Some(leaf) = agent.leaf_lookup(function.id()) else {
-        return u64::MAX;
-    };
-    // An env leaf always carries its closure environment (`leaf_lookup` sets
-    // it from `leaf_uses_env`); without one the swap would install nothing.
-    let Some(environment) = leaf.environment else {
-        return u64::MAX;
-    };
-    let strict = leaf.strict;
-    let ir = leaf.ir.clone();
-    let Some(scope) = ir.scope.as_ref() else {
-        return u64::MAX;
-    };
-    let _ = strict;
     let argc = argc as usize;
     let aliased = frame_size == arity && argc >= frame_size;
     let frame_base = if aliased {
         args
     } else {
         // SAFETY: the caller's machine code pushed `argc` argument slots at
-        // `args`, and `leaf_call_fill` already checked the frame fits above
+        // `args`, and `fill_leaf_frame` already checked the frame fits above
         // them (the room check the in-frame lane also relies on).
         unsafe { args.add(argc) }
     };
-    // SAFETY: `args` points at `argc` live argument slots in the caller's
-    // buffer, and `Value` is `#[repr(transparent)]` over `u64`.
-    let args_slice = unsafe { std::slice::from_raw_parts(args as *const Value, argc) };
-    let Ok(body_env) = scope.new_body_context(&environment, args_slice) else {
-        return u64::MAX;
-    };
-    let body_env = body_env.unwrap_or(environment);
-    let caller_body_context = vm.body_context.replace(body_env);
-    let caller_lexical_env = if ir.leaf_needs_env {
-        Some(std::mem::replace(&mut vm.lexical_env, body_env))
+    let saved_body_context = vm.body_context.replace(environment);
+    let saved_lexical_env = if info.needs_env != 0 {
+        Some(std::mem::replace(&mut vm.lexical_env, environment))
     } else {
         None
     };
@@ -3349,10 +3353,10 @@ extern "C" fn leaf_call_env(
     // one this leaf ran on, so `pending` is already its own).
     vm.stack.truncate(stack_len);
     vm.array_index_stack.truncate(array_index_stack_len);
-    if let Some(saved_env) = caller_body_context {
-        vm.body_context = Some(saved_env);
-    }
-    if let Some(saved_env) = caller_lexical_env {
+    // Put the caller's environment back EXACTLY as it was: a caller with no
+    // capture context of its own (`None`) must not be left holding the leaf's.
+    vm.body_context = saved_body_context;
+    if let Some(saved_env) = saved_lexical_env {
         vm.lexical_env = saved_env;
     }
     result

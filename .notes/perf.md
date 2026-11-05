@@ -16695,3 +16695,65 @@ rounds, alternating order) is flat within ±1%, with `calls/recursive_fib`
 isolated (84 ms both sides) because that row is call-overhead-bound
 (84 ns/call for two reads), which is where the next slice should look: the
 environment lane costs 31.6 ns/call against 20 ns/call for a capture-free leaf.
+
+## LANDED (2026-11-05): the leaf call's environment lane re-derives nothing
+
+With the context read inlined, the closure rows split cleanly, and the split
+says the read is no longer what a capture-taking call costs. Five probes, 5M
+calls each, one process per run:
+
+| probe | ns/call |
+| --- | ---: |
+| `function body() { return 1; }` — the in-frame lane | **7** |
+| `function body() { return x; }` (one captured read) — the env lane | **26** |
+| 8 frame reads, no capture | 12 |
+| 8 captured reads | 51 |
+
+So the env lane cost ~19 ns/call where the in-frame lane costs 7, and a
+captured read is ~3 of it. `leaf_call_env` re-derived, per call, a descriptor
+it could have cached: `Value::from_bits` + `kind()`, `agent.leaf_lookup(fn id)`
+(a `RefCell` borrow, a hash index, an `Rc<CompiledBody>` clone), a second `ir`
+clone, and `scope.new_body_context(&environment, args)` — which is *always*
+`None` for a leaf, because a leaf creates no closures. Only the env, the
+`leaf_needs_env` flag and the frame descriptor are needed, and the probe
+already has all three.
+
+The probe now records `LeafInlineInfo::environment` (the callee's
+`[[Environment]]`) and `needs_env`, and the lane is: validate the record, fill
+the frame, swap, call the entry, restore. That is the same trust model the
+in-frame lane's positive verdict already relies on — `code_gen` plus the
+callee's full NaN-box identity, and a sweeping collection clears the record
+table while boxes never move, so a box named in a record cannot be freed or
+recycled while the record is readable. A leaf that would build a body context
+(`scope.context_names` non-empty — impossible for a leaf) is refused the lane
+rather than swapped in half-way.
+
+Measured (min of 4-5 interleaved rounds, alternating order, both orders run):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| one captured read per call (`cap1`) | 179 | **121 (−32%)** |
+| eight captured reads (`captured`) | 292 | **235 (−19.5%)** |
+| `return 1` (in-frame lane, in-run control) | 80 | 78 (−2%) |
+| corpus `calls/closure_capture`, isolated | 93 | 79 (−15%) |
+
+The corpus families are flat when measured in isolation (opcost within ±3%,
+calls/control: `recursive_fib` −6%, the rest noise); a whole-corpus run on a
+loaded machine reported a uniform +7..+22% block that an isolated re-run did
+not reproduce, which is the min-of-N estimator's known failure mode, not a
+regression.
+
+**A restore that lost state, found on the way.** All four env restores
+(`leaf_call_env`, `run_leaf_body`, `run_leaf_regs`, and both `run_jit_leaf`
+tails) restored `body_context` only when the caller had one
+(`if let Some(saved) = caller_body_context { … = Some(saved) }`), so a caller
+with no capture context of its own was left holding the leaf's environment.
+The save is now an `Option<Option<EnvRef>>` ("did not swap" vs "restore
+`None`") and every site restores exactly. No probe reproduced an observable
+wrong value, so this is a latent fix rather than a bug report.
+
+What is left in the lane: ~8 ns/call over the in-frame lane (the FFI round
+trip, the record validate, the fill, the swap/restore) and ~2.8 ns per read
+(the dependent load chain). Cutting either means moving the swap into machine
+code around a direct call, or hoisting the run resolution out of a basic
+block — both structural, neither a small edit.

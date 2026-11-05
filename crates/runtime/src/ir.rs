@@ -13084,11 +13084,11 @@ impl Vm {
             };
             if ir.leaf_needs_env {
                 (
-                    self.body_context.replace(body_env),
+                    Some(self.body_context.replace(body_env)),
                     Some(std::mem::replace(&mut self.lexical_env, body_env)),
                 )
             } else {
-                (self.body_context.replace(body_env), None)
+                (Some(self.body_context.replace(body_env)), None)
             }
         } else {
             debug_assert!(!ir.leaf_uses_env);
@@ -13127,7 +13127,7 @@ impl Vm {
         self.loop_counter = caller_loop_counter;
         self.strict = caller_strict;
         if let Some(saved_env) = caller_body_context {
-            self.body_context = Some(saved_env);
+            self.body_context = saved_env;
         }
         if let Some(saved_env) = caller_lexical_env {
             self.lexical_env = saved_env;
@@ -13238,11 +13238,11 @@ impl Vm {
             };
             if ir.leaf_needs_env {
                 (
-                    self.body_context.replace(body_env),
+                    Some(self.body_context.replace(body_env)),
                     Some(std::mem::replace(&mut self.lexical_env, body_env)),
                 )
             } else {
-                (self.body_context.replace(body_env), None)
+                (Some(self.body_context.replace(body_env)), None)
             }
         } else {
             debug_assert!(!ir.leaf_uses_env);
@@ -13257,7 +13257,7 @@ impl Vm {
             self.stack.truncate(frame_base);
         }
         if let Some(saved_env) = caller_body_context {
-            self.body_context = Some(saved_env);
+            self.body_context = saved_env;
         }
         if let Some(saved_env) = caller_lexical_env {
             self.lexical_env = saved_env;
@@ -15753,11 +15753,11 @@ impl Vm {
             };
             if ir.leaf_needs_env {
                 (
-                    self.body_context.replace(body_env),
+                    Some(self.body_context.replace(body_env)),
                     Some(std::mem::replace(&mut self.lexical_env, body_env)),
                 )
             } else {
-                (self.body_context.replace(body_env), None)
+                (Some(self.body_context.replace(body_env)), None)
             }
         } else {
             debug_assert!(!ir.leaf_uses_env);
@@ -15930,7 +15930,7 @@ impl Vm {
             self.stack.truncate(pre_call - below);
             self.array_index_stack.truncate(array_index_stack_len);
             if let Some(saved_env) = caller_body_context {
-                self.body_context = Some(saved_env);
+                self.body_context = saved_env;
             }
             if let Some(saved_env) = caller_lexical_env {
                 self.lexical_env = saved_env;
@@ -15958,7 +15958,7 @@ impl Vm {
         self.stack.truncate(pre_call - below);
         self.array_index_stack.truncate(array_index_stack_len);
         if let Some(saved_env) = caller_body_context {
-            self.body_context = Some(saved_env);
+            self.body_context = saved_env;
         }
         if let Some(saved_env) = caller_lexical_env {
             self.lexical_env = saved_env;
