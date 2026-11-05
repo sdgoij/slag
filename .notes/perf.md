@@ -17091,10 +17091,32 @@ same shape costs 42 ns because `lower_leaf_ops_segmented` turns it into a
 compact register op list run by a tight trip-counted loop, not by the step
 dispatch. A non-leaf body runs the big loop. That, not the push/pop, is where
 the headroom is — and it is the same lever as the separate dispatch floor
-below (`arith` 35.5 ns/iteration against `bs`'s 17.4). Next slice: measure the
-push/pop's share directly (instrument the driver with a counter, as the lane
-probe did) and, if the dispatch dominates, extend the register executor to the
-straight-line segments of non-leaf bodies.
+below (`arith` 35.5 ns/iteration against `bs`'s 17.4). The per-step dispatch cost was then measured directly, with two bodies and the
+same call count (`deep` = body of ~8 steps, `deep8` = the same body plus 16
+slot reads and adds; both 2.002M calls, min of 3):
+
+| probe | ms | ns/call |
+| --- | ---: | ---: |
+| `deep` | 369 | 184 |
+| `deep8` | 609 | 304 |
+
+16 extra steps cost 120 ns, so **one dispatched step is ~7.5 ns** and `deep`'s
+own ~8 steps account for ~60 of its 184; the other **~124 ns is the same-stack
+push/pop**, not the callee's dispatch. A follow-up probe rules out the per-call
+env walk: a recursive body whose callee arrives as a *parameter* (so
+`ident_names` is empty and `global_reads_are_unshadowed` has nothing to walk)
+costs the same 381 vs 367 ms.
+
+Two attempts to ablate the push/pop's parts both broke invariants and had to be
+reverted (skipping the `save_scratch` value capture leaves `vm.ip` unreset, so
+the callee resumes in the caller's code; skipping the `ExecutionContext`
+push/pop breaks every `running_context()` reader). The next attempt should
+**instrument rather than ablate** — count and time the push/pop around
+`try_push_inline_call` — and the candidates left are `same_stack_lookup`'s
+per-call `SameStackEntry` clone out of a `RefCell`, `check_value_stack`,
+`new_body_context`, the `ExecutionContext` push/pop, `is_control_free` +
+`clear_control_state`, the `inline_calls` push of a ~350-byte frame, and the
+eleven field rebinds on each side.
 
 Separately, the raw dispatch floor is ~2x: `arith`'s 10M-iteration loop is
 35.5 ns/iteration against `bs`'s 17.4 (script-level) and `fn_arith`'s 34 vs 7.0
