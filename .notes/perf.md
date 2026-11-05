@@ -16894,3 +16894,52 @@ at parity with a native-quality interpreter).
 Order for the next slices: (1) the script-certification cliff — it dwarfs both
 the JIT and the interpreter gaps and is a bounded change; (2) the interpreter's
 call cost (`fib`, `closures`); (3) `fn_object`/`string`.
+
+## LANDED (2026-11-05): a non-certified call is a sync point, not a cliff
+
+The script-certification cliff above is closed. `analyze_script_scope` no
+longer requires a `Call`'s callee to be a certified top-level function: a call
+is a **sync point** instead, flushing every *assigned* slot to the global
+object between the arguments and the call step and reloading every *declared*
+one after it (both in slot order, so the step sequence is deterministic). The
+flush sits after the argument evaluation, not before — an argument that
+assigns a declared name must be what the callee sees — and the fused call
+shapes that bypass any interleaving (`CallFastGlobal`/`CallFastSlot`, the
+`call`/`apply` rewrite, the intrinsic fusions) are disabled while a sync is
+pending. `new` is a sync point for the same reason. Unassigned names are not
+flushed (writing `Infinity` would throw); declared ones are all reloaded (the
+callee may have written any of them).
+
+The isolation files, same 10M-iteration loop, min of 3:
+
+| script | bs | slag-jit before | slag-jit after |
+| --- | ---: | ---: | ---: |
+| `script_only` | 221 | 69 | **66** |
+| `script_fn` | 225 | 78 | **67** |
+| `script_call` | 221 | 1056 | **72** |
+
+`tools/brimstone/compare.sh 5` (rotated order, min per cell): the script rows
+went `arith` 4.64 -> **0.14**, `array` 2.61 -> **0.25**, `object` 4.21 ->
+**0.76**, `method` 3.62 -> **3.84**, `forin` 6.22 -> **6.05** (unchanged: a
+`for-in` head is still uncertified, and `method`'s `new Ctor()` is the next
+admission). One `console.log` no longer costs 15x.
+
+Two bugs surfaced on the way, both now regression tests:
+
+- **A function's parameter list is part of its certification.** A certified
+  function's call site emits no sync, but a default initializer runs before the
+  body — `f(_ = probe1 = …, __ = (eval('var x = "inside";'), …))` writes two
+  declared names from the parameter list of a global-blind body, which the two
+  `statements/function/scope-param-*-var-open` fixtures caught as `undefined is
+  not a function`. `certified_params_allow` now requires every parameter to be
+  a plain identifier (a destructuring pattern's property gets are user code) and
+  every default to be global-blind itself, so `function h(a = 1)` stays
+  certified and the fixing case falls back to the env path.
+- **A sloppy write to a non-writable global must not warm the value cell.**
+  `Vm::store_ident_value`'s fallback warmed the cell with the *attempted* value
+  after storing into an object record; `undefined = 5` is a silent no-op, so
+  the next compiled read served 5 (`undefined/15.1.1.3-1`). Only a declarative
+  binding is warmed now.
+
+Still behind `bs`, i.e. the next lever is unchanged: the interpreter's call
+cost — `fib` 1.76, `closures` 1.74, `fn_object` 1.95, `sieve` 1.12.

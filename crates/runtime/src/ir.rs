@@ -5504,19 +5504,25 @@ impl Vm {
         }
         let reference = crate::context::resolve_binding(agent, &crux::lookup(name), self.strict)?;
         crate::context::put_value(agent, &reference, value)?;
-        // Warm the cell for the next read/write: an object-record data
-        // property records its slot; a declarative binding records its
-        // binding-vector index.
+        // Warm the cell for the next read: a DECLARATIVE binding records its
+        // binding-vector index (spec 9.1.1.2.5 either stored the value or threw —
+        // a const write is a TypeError even in sloppy code — so `value` is what
+        // the binding now holds).
+        //
+        // The object-record case is deliberately NOT warmed here: this is the
+        // fallback after `try_global_cell_store` missed, which includes a
+        // non-writable property, and a sloppy write to one is a silent no-op —
+        // caching the attempted value (`undefined = 5`) would make the next
+        // compiled read serve it. The next read re-resolves and warms the cell
+        // itself (`load_ident`), which is the value that is actually there.
         if let crate::context::ReferenceBase::Environment(env) = &reference.base
             && let crate::env::EnvRecord::Global(global_env) = &**env
         {
             let name_string = crux::lookup(name);
-            if env.has_lexical_declaration(&name_string) {
-                if let Some(index) = global_env.declarative.index_of(&name_string) {
-                    self.warm_global_cell(agent, name, value, Some(index));
-                }
-            } else {
-                self.warm_global_cell(agent, name, value, None);
+            if env.has_lexical_declaration(&name_string)
+                && let Some(index) = global_env.declarative.index_of(&name_string)
+            {
+                self.warm_global_cell(agent, name, value, Some(index));
             }
         }
         Ok(())
@@ -18067,6 +18073,17 @@ struct Compiler {
     /// bodies, so an uncertified function's write to a declared name counts.
     /// `None` outside the certified-script path (the fuse never fires).
     script_assigned: Option<HashSet<crux::AtomId>>,
+    /// The certified script's global-blind top-level functions and the vars
+    /// holding a certified value: a call through one of these cannot observe
+    /// the slotified globals, so it is not a sync point. `None` outside the
+    /// certified-script path (no sync is emitted).
+    script_certified: Option<HashSet<crux::AtomId>>,
+    script_var_certs: Option<HashMap<crux::AtomId, bool>>,
+    /// Whether the call being compiled (or the `new` being compiled) is a
+    /// certified script's sync point: `compile_call_args` emits the global flush
+    /// right before the call step, and the caller emits the reload after it.
+    /// Saved and restored around a nested call, whose own sync is independent.
+    script_sync_pending: bool,
     /// The fused canonical loop's counter name (Cut 17): while compiling the
     /// body of an accumulator loop, the name resolves to `BindingLoc::Acc`,
     /// so its reads/assignments/updates touch `Vm::acc` instead of the
@@ -19140,6 +19157,13 @@ impl Compiler {
         // so its arguments must be built in the VM's vector, not on the
         // stack.
         let argc = self.compile_arguments(args, !direct_eval)?;
+        // A certified script's sync point (see `Compiler::script_sync_point`):
+        // the flush goes AFTER the arguments are evaluated, so a slot the
+        // argument expressions just wrote is what the callee sees — and the
+        // reload after the call then reads it back unchanged.
+        if self.script_sync_pending {
+            self.emit_script_global_flush();
+        }
         self.tail = tail;
         // A direct eval stays a tail call when in tail position: the flag is
         // name-based (`eval` as the callee identifier — a shadowed `eval`
@@ -22627,9 +22651,22 @@ impl Compiler {
                 Ok(())
             }
             ExprKind::Call(call) => {
+                // A call the certification cannot prove global-blind is a sync
+                // point: the compiler flushes the assigned slots to the global
+                // object just before the call (see `compile_call_args`) and
+                // reloads every declared one after it. Without the sync the whole
+                // script would stay off the certified path — and off the JIT.
+                let sync = self.script_sync_point(&call.callee);
+                let saved_sync = self.script_sync_pending;
+                self.script_sync_pending = sync;
                 let entered = self.enter_chain(expr);
-                self.compile_call(call)?;
+                let result = self.compile_call(call);
                 self.leave_chain(entered);
+                self.script_sync_pending = saved_sync;
+                result?;
+                if sync {
+                    self.emit_script_global_reload();
+                }
                 Ok(())
             }
             ExprKind::New(new) => {
@@ -22639,9 +22676,20 @@ impl Compiler {
                         "new super is a syntax error".into(),
                     ));
                 }
+                // A constructor is an escape point like a call (see the `Call`
+                // arm): its body can read or write a declared name through the
+                // global object, so the flush goes between the arguments and the
+                // construct step.
+                let sync = self.script_sync_point(&new.callee);
                 self.compile_expr(&new.callee)?;
                 self.compile_arguments(&new.args, false)?;
+                if sync {
+                    self.emit_script_global_flush();
+                }
                 self.emit(Step::Construct { span: new.span });
+                if sync {
+                    self.emit_script_global_reload();
+                }
                 Ok(())
             }
             ExprKind::Member(member) => {
@@ -24217,6 +24265,77 @@ impl Compiler {
         Ok(None)
     }
 
+    /// Whether evaluating `callee` (then calling or constructing it) is a sync
+    /// point for a certified script — see [`script_slots_expr_allows`].
+    fn script_sync_point(&self, callee: &Expr) -> bool {
+        let (Some(certified), Some(var_certs), Some(scope)) = (
+            self.script_certified.as_ref(),
+            self.script_var_certs.as_ref(),
+            self.scope.as_ref(),
+        ) else {
+            return false;
+        };
+        // A callee the analysis proved global-blind cannot see the slots.
+        if script_call_is_certified(callee, certified, var_certs) {
+            return false;
+        }
+        // Nothing to sync when the script declares no slot vars.
+        !scope.slots.is_empty()
+    }
+
+    /// Flush every slot the script assigns back to the global object: the
+    /// compiler's side of a sync point (a call that may read or write a declared
+    /// name through the global). An unassigned name is left alone — its slot only
+    /// mirrors what the prologue loaded, and writing a read-only global (e.g.
+    /// `Infinity`) would throw.
+    fn emit_script_global_flush(&mut self) {
+        let pairs: Vec<(usize, crux::AtomId)> = {
+            let (Some(assigned), Some(scope)) =
+                (self.script_assigned.as_ref(), self.scope.as_ref())
+            else {
+                return;
+            };
+            let mut pairs: Vec<(usize, crux::AtomId)> = scope
+                .slots
+                .iter()
+                .filter(|(name, _)| assigned.contains(name))
+                .map(|(name, slot)| (*slot, *name))
+                .collect();
+            pairs.sort_unstable();
+            pairs
+        };
+        for (slot, name) in pairs {
+            self.emit(Step::LoadLocal { slot });
+            self.emit(Step::StoreGlobal { name });
+        }
+    }
+
+    /// Reload every declared slot from the global object: the callee may have
+    /// assigned any declared name (an unassigned one included), so the slots are
+    /// potentially stale after a sync point.
+    fn emit_script_global_reload(&mut self) {
+        let pairs = self.script_slot_pairs();
+        for (slot, name) in pairs {
+            self.emit(Step::LoadGlobal { name });
+            self.emit(Step::InitLocal { slot });
+        }
+    }
+
+    /// The certified script's declared names and their frame slots, in slot
+    /// order (a deterministic step order across runs).
+    fn script_slot_pairs(&self) -> Vec<(usize, crux::AtomId)> {
+        let Some(scope) = self.scope.as_ref() else {
+            return Vec::new();
+        };
+        let mut pairs: Vec<(usize, crux::AtomId)> = scope
+            .slots
+            .iter()
+            .map(|(name, slot)| (*slot, *name))
+            .collect();
+        pairs.sort_unstable();
+        pairs
+    }
+
     fn compile_call(&mut self, call: &syntax::ast::CallExpr) -> Result<(), JsError> {
         // A tail-position call: every load below (callee, keys, args) is NOT
         // the tail call itself; the final call step re-checks the flag.
@@ -24483,6 +24602,7 @@ impl Compiler {
         // argument expression assigns its name.
         if !call.optional
             && !direct_eval
+            && !self.script_sync_pending
             && self.chain_depth == 0
             && let ExprKind::Ident(name) = &callee.kind
             && call.args.len() <= 2
@@ -24606,6 +24726,11 @@ impl Compiler {
     ) -> Result<bool, JsError> {
         // The rewritten call is still a call at `apply`/`call`, so it publishes
         // the same site a call with a named member callee does.
+        // A certified script's sync point needs the flush between the arguments
+        // and the call, which these fused shapes bypass — take the generic path.
+        if self.script_sync_pending {
+            return Ok(false);
+        }
         let site = call_site(call);
         let kind = match &member.property {
             MemberProperty::Name(name) if crux::lookup(*name) == JsString::from_utf8("apply") => {
@@ -24661,6 +24786,11 @@ impl Compiler {
         call: &syntax::ast::CallExpr,
         tail: bool,
     ) -> Result<bool, JsError> {
+        // A certified script's sync point needs the flush between the arguments
+        // and the call, which a fused intrinsic bypasses — take the generic path.
+        if self.script_sync_pending {
+            return Ok(false);
+        }
         let site = call_site(call);
         let kind = match &member.property {
             MemberProperty::Name(name) => {
@@ -27714,6 +27844,8 @@ pub fn compile_statements(
         scope: slots.as_ref().map(|slots| slots.scope.clone()),
         script_globals,
         script_assigned,
+        script_certified: slots.as_ref().map(|slots| slots.certified.clone()),
+        script_var_certs: slots.as_ref().map(|slots| slots.var_certs.clone()),
         strict,
         ..Compiler::default()
     };
@@ -30041,6 +30173,11 @@ struct ScriptSlots {
     /// read-only global like `Infinity` must not be written just because it
     /// was declared.
     assigned: HashSet<crux::AtomId>,
+    /// The global-blind top-level functions and the vars holding a certified
+    /// value: a call through one is not a sync point (the compiler flushes the
+    /// slotified globals around every other call).
+    certified: HashSet<crux::AtomId>,
+    var_certs: HashMap<crux::AtomId, bool>,
 }
 
 /// Analyze a top-level script for the certified binding paths: the
@@ -30779,7 +30916,31 @@ fn certified_fn_allows(
     if function.is_async || function.is_generator || function.statement_position {
         return false;
     }
+    if !certified_params_allow(&function.params, declared, certified) {
+        return false;
+    }
     certified_stmts_allows(&function.body.stmts, declared, certified)
+}
+
+/// Whether calling the function runs no user code before its body that could
+/// observe the global object: every parameter is a plain identifier (a
+/// destructuring pattern's property gets are user code) and every default
+/// initializer is itself global-blind (a default like `_ = probe = …` runs
+/// before the body, so a "global-blind body" says nothing about it). A call
+/// site certification accepts emits no sync, so the parameters must be safe
+/// for the same reason the body is.
+fn certified_params_allow(
+    params: &[BindingElement],
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
+    params.iter().all(|param| {
+        matches!(&param.pattern, BindingPattern::Ident(_))
+            && param
+                .init
+                .as_ref()
+                .is_none_or(|init| certified_expr_allows(init, declared, certified))
+    })
 }
 
 fn certified_stmts_allows(
@@ -30963,9 +31124,11 @@ fn certified_expr_allows(
         // — calling it later reads only its captured env, never the global
         // object. `this`/`super`/uncertified closures/classes are out.
         ExprKind::Function(function) => certified_fn_allows(function, declared, certified),
-        ExprKind::Arrow { is_async, body, .. } => {
-            certified_arrow_allows(*is_async, body, declared, certified)
-        }
+        ExprKind::Arrow {
+            is_async,
+            params,
+            body,
+        } => certified_arrow_allows(*is_async, params, body, declared, certified),
         ExprKind::This
         | ExprKind::Super
         | ExprKind::Call(_)
@@ -30986,11 +31149,12 @@ fn certified_expr_allows(
 /// bare expression.
 fn certified_arrow_allows(
     is_async: bool,
+    params: &[BindingElement],
     body: &syntax::ast::ArrowBody,
     declared: &HashSet<crux::AtomId>,
     certified: &HashSet<crux::AtomId>,
 ) -> bool {
-    if is_async {
+    if is_async || !certified_params_allow(params, declared, certified) {
         return false;
     }
     match body {
@@ -31019,9 +31183,11 @@ fn certified_value_expr(
             certified_value_expr(inner, declared, certified, return_certs, var_certs)
         }
         ExprKind::Function(function) => certified_fn_allows(function, declared, certified),
-        ExprKind::Arrow { is_async, body, .. } => {
-            certified_arrow_allows(*is_async, body, declared, certified)
-        }
+        ExprKind::Arrow {
+            is_async,
+            params,
+            body,
+        } => certified_arrow_allows(*is_async, params, body, declared, certified),
         ExprKind::Ident(name) => var_certs.get(name).copied().unwrap_or(false),
         ExprKind::Call(call) => match &call.callee.kind {
             ExprKind::Ident(name) => {
@@ -31674,7 +31840,11 @@ fn analyze_script_scope(
             scan.tdz.push(false);
             scan.next_slot += 1;
         }
-        script_slots_allows(stmts, &certified, &var_certs).then(|| ScriptSlots {
+        // A script with nothing to slotify (no declared `var` name outside the
+        // certified functions) gets no frame and stays on the ordinary path: the
+        // certified-script machinery exists to keep declared vars in slots, and a
+        // zero-slot frame would only change which engine runs the body.
+        (!slot_names.is_empty() && script_slots_allows(stmts, &certified)).then(|| ScriptSlots {
             scope: ScopeInfo {
                 frame_size: scan.next_slot,
                 arity: 0,
@@ -31697,64 +31867,59 @@ fn analyze_script_scope(
             },
             names: slot_names,
             assigned: assigned.clone(),
+            certified,
+            var_certs,
         })
     };
     Some((slots, globals, assigned))
 }
 
-/// Whether the script is a closed world for frame-slot vars (Cut 16): no
-/// callable can observe the real global object while the slots are
-/// authoritative (their staleness window is the whole script). Reject
-/// `call`/`new` expressions (except direct calls to a certified function),
-/// uncertified function declarations, `this`, closures (function/arrow/
-/// class expressions and object methods/getters/setters), and any
+/// Whether the script may keep its declared `var`s in frame slots (Cut 16).
+///
+/// The slots are authoritative for the script's whole run except inside a
+/// *sync point*: a call whose callee is not a certified global-blind function
+/// may read or write a declared name through the global object, so the compiler
+/// flushes the assigned slots to the global object before it and reloads every
+/// declared one after (see `Compiler::emit_script_global_flush`) — that is what
+/// keeps a script with `console.log`/`Date.now`/`p.get()` on the certified path
+/// instead of running it interpreted. `new` is a sync point for the same reason.
+/// What still rejects a script is what no flush can fix: `this`/`super`,
+/// closures (function/arrow/class expressions and object
+/// methods/getters/setters), `with`, destructuring patterns, and any
 /// `globalThis`-family identifier (a member access on it reaches the real
-/// global object). `assigned` (the epilogue write-back set) is collected
-/// by the prepass; `certified` is the global-blind function set (Cut 35
-/// slice 3).
-fn script_slots_allows(
-    stmts: &[Stmt],
-    certified: &HashSet<crux::AtomId>,
-    var_certs: &HashMap<crux::AtomId, bool>,
-) -> bool {
+/// global object). `assigned` (the epilogue write-back set) is collected by the
+/// prepass; `certified` is the global-blind function set (Cut 35 slice 3).
+fn script_slots_allows(stmts: &[Stmt], certified: &HashSet<crux::AtomId>) -> bool {
     stmts
         .iter()
-        .all(|stmt| script_slots_stmt_allows(stmt, certified, var_certs))
+        .all(|stmt| script_slots_stmt_allows(stmt, certified))
 }
 
-fn script_slots_stmt_allows(
-    stmt: &Stmt,
-    certified: &HashSet<crux::AtomId>,
-    var_certs: &HashMap<crux::AtomId, bool>,
-) -> bool {
+fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> bool {
     match &stmt.kind {
-        StmtKind::Block(block) => script_slots_allows(&block.stmts, certified, var_certs),
+        StmtKind::Block(block) => script_slots_allows(&block.stmts, certified),
         StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Expr(expr) => script_slots_expr_allows(expr, certified, var_certs),
+        StmtKind::Expr(expr) => script_slots_expr_allows(expr),
         StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
             // A destructuring pattern resolves through the environment
             // machinery, bypassing the frame slots — such a script must stay
             // on the global path.
             matches!(&decl.pattern, BindingPattern::Ident(_))
-                && decl
-                    .init
-                    .as_ref()
-                    .is_none_or(|init| script_slots_expr_allows(init, certified, var_certs))
+                && decl.init.as_ref().is_none_or(script_slots_expr_allows)
         }),
         StmtKind::If {
             test,
             consequent,
             alternate,
         } => {
-            script_slots_expr_allows(test, certified, var_certs)
-                && script_slots_stmt_allows(consequent, certified, var_certs)
+            script_slots_expr_allows(test)
+                && script_slots_stmt_allows(consequent, certified)
                 && alternate
                     .as_deref()
-                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, certified, var_certs))
+                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, certified))
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            script_slots_expr_allows(test, certified, var_certs)
-                && script_slots_stmt_allows(body, certified, var_certs)
+            script_slots_expr_allows(test) && script_slots_stmt_allows(body, certified)
         }
         StmtKind::For {
             init,
@@ -31764,29 +31929,20 @@ fn script_slots_stmt_allows(
         } => {
             let init_ok = match init {
                 None => true,
-                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr, certified, var_certs),
+                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr),
                 Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
                     matches!(&decl.pattern, BindingPattern::Ident(_))
-                        && decl
-                            .init
-                            .as_ref()
-                            .is_none_or(|init| script_slots_expr_allows(init, certified, var_certs))
+                        && decl.init.as_ref().is_none_or(script_slots_expr_allows)
                 }),
             };
             init_ok
-                && test
-                    .as_ref()
-                    .is_none_or(|expr| script_slots_expr_allows(expr, certified, var_certs))
-                && update
-                    .as_ref()
-                    .is_none_or(|expr| script_slots_expr_allows(expr, certified, var_certs))
-                && script_slots_stmt_allows(body, certified, var_certs)
+                && test.as_ref().is_none_or(script_slots_expr_allows)
+                && update.as_ref().is_none_or(script_slots_expr_allows)
+                && script_slots_stmt_allows(body, certified)
         }
-        StmtKind::Return(expr) => expr
-            .as_ref()
-            .is_none_or(|expr| script_slots_expr_allows(expr, certified, var_certs)),
-        StmtKind::Throw(expr) => script_slots_expr_allows(expr, certified, var_certs),
-        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, certified, var_certs),
+        StmtKind::Return(expr) => expr.as_ref().is_none_or(script_slots_expr_allows),
+        StmtKind::Throw(expr) => script_slots_expr_allows(expr),
+        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, certified),
         StmtKind::ForOf {
             left, right, body, ..
         } => {
@@ -31798,14 +31954,15 @@ fn script_slots_stmt_allows(
                     pattern: BindingPattern::Ident(_),
                     ..
                 }
-            ) && script_slots_expr_allows(right, certified, var_certs)
-                && script_slots_stmt_allows(body, certified, var_certs)
+            ) && script_slots_expr_allows(right)
+                && script_slots_stmt_allows(body, certified)
         }
         // Cut 35 slice 3: a certified (global-blind) top-level function
         // declaration cannot observe the slotified globals, so it no longer
-        // disqualifies the frame path. `script_scan_allows` already rejects
-        // `with`/`try`/`switch`/`for-in`/`using` (the whole script falls
-        // back to the env path); the rest are kept exhaustive.
+        // disqualifies the frame path. An UNCERTIFIED one still does: its body
+        // may define an accessor or a callback that runs outside a sync point
+        // (an implicit invocation), whose reads and writes of a declared name
+        // the flush/reload cannot cover.
         StmtKind::FunctionDecl(function) => {
             function.name.is_some_and(|name| certified.contains(&name))
         }
@@ -31818,11 +31975,18 @@ fn script_slots_stmt_allows(
     }
 }
 
-fn script_slots_expr_allows(
-    expr: &Expr,
-    certified: &HashSet<crux::AtomId>,
-    var_certs: &HashMap<crux::AtomId, bool>,
-) -> bool {
+/// Whether an assignment target keeps the frame slots authoritative: a plain
+/// identifier or a member reference does; a destructuring pattern binds by name
+/// through the environment machinery.
+fn script_assignment_target_allows(target: &Expr) -> bool {
+    match &target.kind {
+        ExprKind::Ident(_) | ExprKind::Member(_) => script_slots_expr_allows(target),
+        ExprKind::Paren(inner) => script_assignment_target_allows(inner),
+        _ => false,
+    }
+}
+
+fn script_slots_expr_allows(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Ident(name) => {
             let text = crux::lookup(*name).to_string_lossy();
@@ -31837,27 +32001,26 @@ fn script_slots_expr_allows(
         | ExprKind::Arrow { .. }
         | ExprKind::Class(_) => false,
         ExprKind::Call(call) => {
-            // Cut 35 slice 3: a direct call to a certified (global-blind)
-            // top-level function — or a var assigned a certified value (a
-            // certified closure, a certified-call result) — cannot observe
-            // the slotified globals: a certified function's global binding
-            // is stable (never assigned) and its body never reads a slot
-            // var; a certified-value var's current value comes from the
-            // slot, which is the script's own up-to-date copy.
-            let callee_ok = match &call.callee.kind {
-                ExprKind::Ident(name) => {
-                    certified.contains(name) || var_certs.get(name).copied().unwrap_or(false)
-                }
-                _ => false,
-            };
-            callee_ok
+            // A call is a SYNC POINT, not a bail: the compiler flushes the
+            // slotified globals to the global object before it and reloads them
+            // after (see `Compiler::emit_script_global_flush`), so a callee that
+            // reads or writes a declared name sees the real binding. The callee
+            // expression and the arguments must still be allowed — that is what
+            // keeps `this`, function expressions, `new` and the rest out.
+            script_slots_expr_allows(&call.callee)
                 && call.args.iter().all(|arg| match arg {
-                    Argument::Expr(e) | Argument::Spread(e) => {
-                        script_slots_expr_allows(e, certified, var_certs)
-                    }
+                    Argument::Expr(e) | Argument::Spread(e) => script_slots_expr_allows(e),
                 })
         }
-        ExprKind::New(_) => false,
+        ExprKind::New(new) => {
+            // A constructor is a sync point like a call (see the `Call` arm):
+            // its body can read or write a declared name through the global
+            // object.
+            script_slots_expr_allows(&new.callee)
+                && new.args.iter().all(|arg| match arg {
+                    Argument::Expr(e) | Argument::Spread(e) => script_slots_expr_allows(e),
+                })
+        }
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
             ObjectProperty::Method { .. }
             | ObjectProperty::Get { .. }
@@ -31865,68 +32028,77 @@ fn script_slots_expr_allows(
             ObjectProperty::Init { key, value, .. } => {
                 let key_ok = match key {
                     PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
-                    PropertyName::Computed(key_expr) => {
-                        script_slots_expr_allows(key_expr, certified, var_certs)
-                    }
+                    PropertyName::Computed(key_expr) => script_slots_expr_allows(key_expr),
                 };
-                key_ok && script_slots_expr_allows(value, certified, var_certs)
+                key_ok && script_slots_expr_allows(value)
             }
-            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr, certified, var_certs),
+            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr),
         }),
         ExprKind::Literal(_) => true,
         ExprKind::Array(array) => array.elements.iter().all(|element| match element {
             ArrayElement::Hole => true,
-            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => {
-                script_slots_expr_allows(expr, certified, var_certs)
-            }
+            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => script_slots_expr_allows(expr),
         }),
-        ExprKind::Paren(inner) => script_slots_expr_allows(inner, certified, var_certs),
-        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand, certified, var_certs),
-        ExprKind::Update { target, .. } => script_slots_expr_allows(target, certified, var_certs),
+        ExprKind::Paren(inner) => script_slots_expr_allows(inner),
+        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand),
+        ExprKind::Update { target, .. } => script_slots_expr_allows(target),
         ExprKind::Binary { left, right, .. } => {
-            script_slots_expr_allows(left, certified, var_certs)
-                && script_slots_expr_allows(right, certified, var_certs)
+            script_slots_expr_allows(left) && script_slots_expr_allows(right)
         }
         ExprKind::Logical { left, right, .. } => {
-            script_slots_expr_allows(left, certified, var_certs)
-                && script_slots_expr_allows(right, certified, var_certs)
+            script_slots_expr_allows(left) && script_slots_expr_allows(right)
         }
         ExprKind::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            script_slots_expr_allows(test, certified, var_certs)
-                && script_slots_expr_allows(consequent, certified, var_certs)
-                && script_slots_expr_allows(alternate, certified, var_certs)
+            script_slots_expr_allows(test)
+                && script_slots_expr_allows(consequent)
+                && script_slots_expr_allows(alternate)
         }
         ExprKind::Assign { target, value, .. } => {
-            script_slots_expr_allows(target, certified, var_certs)
-                && script_slots_expr_allows(value, certified, var_certs)
+            // A destructuring target binds by NAME through the pattern
+            // machinery, which never touches the frame slots — the script's
+            // copy of the bound name would go stale (and `collect_script_assigned`
+            // does not see the pattern's names either). Ident/member targets
+            // compile to slot/global steps.
+            script_assignment_target_allows(target) && script_slots_expr_allows(value)
         }
         ExprKind::Member(member) => {
-            let object_ok = script_slots_expr_allows(&member.object, certified, var_certs);
+            let object_ok = script_slots_expr_allows(&member.object);
             let key_ok = match &member.property {
-                MemberProperty::Computed(key) => {
-                    script_slots_expr_allows(key, certified, var_certs)
-                }
+                MemberProperty::Computed(key) => script_slots_expr_allows(key),
                 _ => true,
             };
             object_ok && key_ok
         }
-        ExprKind::Template(template) => template
-            .exprs
-            .iter()
-            .all(|expr| script_slots_expr_allows(expr, certified, var_certs)),
-        ExprKind::Sequence(exprs) => exprs
-            .iter()
-            .all(|expr| script_slots_expr_allows(expr, certified, var_certs)),
+        ExprKind::Template(template) => template.exprs.iter().all(script_slots_expr_allows),
+        ExprKind::Sequence(exprs) => exprs.iter().all(script_slots_expr_allows),
         ExprKind::PrivateIn { .. }
         | ExprKind::TaggedTemplate { .. }
         | ExprKind::Yield { .. }
         | ExprKind::Await(_)
         | ExprKind::MetaProperty { .. }
         | ExprKind::ImportCall { .. } => false,
+    }
+}
+
+/// Whether a call cannot observe the slotified globals, so it needs no
+/// flush/reload: its callee is a certified (global-blind) top-level function, or
+/// a var the analysis proved holds a certified value. Every other callee — a
+/// member call (`console.log`, `arr.push`), an uncertified function, an
+/// arbitrary expression — is a sync point.
+fn script_call_is_certified(
+    callee: &Expr,
+    certified: &HashSet<crux::AtomId>,
+    var_certs: &HashMap<crux::AtomId, bool>,
+) -> bool {
+    match &callee.kind {
+        ExprKind::Ident(name) => {
+            certified.contains(name) || var_certs.get(name).copied().unwrap_or(false)
+        }
+        _ => false,
     }
 }
 

@@ -7395,6 +7395,99 @@ mod tests {
     }
 
     #[test]
+    fn a_call_syncs_the_slotified_globals() {
+        // A call used to disqualify the whole script (`console.log`/`Date.now`
+        // and every member call), so its top-level loops ran interpreted. It is
+        // a SYNC POINT now: the assigned slots are flushed to the global object
+        // before it and every declared slot is reloaded after, so user code
+        // reached through the call sees — and can update — the real bindings.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // A previous script installs hooks whose user code reads (`toString`) and
+        // writes (`valueOf`) a name this realm does not declare yet, so both
+        // resolve through the global object at call time.
+        agent
+            .run_script(
+                "var hook = { toString: function () { return typeof n; }, \
+                 valueOf: function () { total = 77; return 1; } };",
+            )
+            .unwrap();
+        // The declaring script certifies despite the call.
+        let program = parser::parse_script(
+            "var n = 0; for (var i = 0; i < 3; i++) { n = n + i; } String(hook)",
+        )
+        .unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        assert!(
+            body.scope.is_some() && body.script_globals.is_some(),
+            "a member call must not un-certify the script"
+        );
+        // One `LoadLocal`+`StoreGlobal` per assigned name (the flush) and one
+        // `LoadGlobal`+`InitLocal` per declared name (the reload), on top of the
+        // prologue/epilogue pairs.
+        let stores = body
+            .steps
+            .iter()
+            .filter(|s| matches!(s, crate::ir::Step::StoreGlobal { .. }))
+            .count();
+        assert!(
+            stores >= 4,
+            "the epilogue and the flush both write back: {stores}"
+        );
+        // The flush: the callee's `toString` sees the slot's current value
+        // through the global object (`n` is 3 after the loop).
+        assert_eq!(
+            agent
+                .run_script("var n = 0; for (var i = 0; i < 3; i++) { n = n + i; } String(hook)")
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("number")))
+        );
+        // The reload: `valueOf` writes `total` through the global object, and the
+        // declaring script reads it back from its slot.
+        assert_eq!(
+            agent
+                .run_script("var total = 0; Number(hook); total")
+                .unwrap(),
+            Value::Number(77.0)
+        );
+    }
+
+    #[test]
+    fn a_param_default_is_part_of_the_function_certification() {
+        // A certified function's call site emits no sync, so its whole call
+        // must be global-blind — the parameters included. A default runs
+        // before the body: here `f`'s defaults assign `probe1` and run a direct
+        // eval that declares `x` in the global environment. Certification must
+        // reject `f` instead of letting the call skip the sync (which left the
+        // slots stale and made `probe1` undefined).
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert_eq!(
+            agent
+                .run_script(
+                    "var x = 'outside';\n\
+                     var probe1, probe2;\n\
+                     function f(
+                        _ = probe1 = function () { return x; },
+                        __ = (eval('var x = \"inside\";'), probe2 = function () { return x; })
+                     ) {}\n\
+                     f(); probe1() + probe2()"
+                )
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("insideinside")))
+        );
+        // The common `a = 1` default cannot observe the global object, so the
+        // script stays certified: the parameter rule is not a cliff.
+        let program =
+            parser::parse_script("var q = 0; function h(a = 1) { return a; } q = h();").unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        assert!(
+            body.scope.is_some() && body.script_globals.is_some(),
+            "a literal default must not un-certify the script"
+        );
+    }
+
+    #[test]
     fn fast_script_bails_preserve_env_behavior() {
         // try/catch (a catch param shadows a same-named global), `with`,
         // and direct eval all fall back to the env path and keep their
