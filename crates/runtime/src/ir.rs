@@ -31141,13 +31141,24 @@ fn certified_expr_allows(
                 && certified_expr_allows(value, declared, certified)
         }
         ExprKind::Member(member) => {
-            certified_expr_allows(&member.object, declared, certified)
-                && match &member.property {
-                    MemberProperty::Computed(key) => {
-                        certified_expr_allows(key, declared, certified)
-                    }
-                    _ => true,
+            // `this` may BE the global object (a plain call to a script-level
+            // function passes it, in sloppy mode and inside a certified body
+            // alike), so a member access through it is only current when the key
+            // is not one of the script's declared names — those are exactly the
+            // ones the frame slots mirror. A certified function's own name is
+            // exempt: its global binding is never assigned.
+            let through_this = matches!(member.object.kind, ExprKind::This);
+            let object_ok =
+                through_this || certified_expr_allows(&member.object, declared, certified);
+            let key_ok = match &member.property {
+                MemberProperty::Name(name) if through_this => {
+                    !declared.contains(name) || certified.contains(name)
                 }
+                MemberProperty::Computed(_) if through_this => false,
+                MemberProperty::Computed(key) => certified_expr_allows(key, declared, certified),
+                _ => true,
+            };
+            object_ok && key_ok
         }
         ExprKind::Array(array) => array.elements.iter().all(|element| match element {
             ArrayElement::Hole => true,
@@ -31901,31 +31912,33 @@ fn analyze_script_scope(
         // certified functions) gets no frame and stays on the ordinary path: the
         // certified-script machinery exists to keep declared vars in slots, and a
         // zero-slot frame would only change which engine runs the body.
-        (!slot_names.is_empty() && script_slots_allows(stmts, &certified)).then(|| ScriptSlots {
-            scope: ScopeInfo {
-                frame_size: scan.next_slot,
-                arity: 0,
-                slots: scan.slots,
-                tdz_store: scan.tdz,
-                shadow_slots: HashMap::new(),
-                shadowed_catch_params: HashSet::new(),
-                context_names: Vec::new(),
-                context_tdz: Vec::new(),
-                context_const: Vec::new(),
-                context_param: Vec::new(),
-                context_slots: HashMap::new(),
-                arguments_slot: None,
-                arguments_formals: None,
-                this_slot: None,
-                captured_this: None,
-                args_alias: false,
-                annex_b: Vec::new(),
-                statement_fns: Vec::new(),
-            },
-            names: slot_names,
-            assigned: assigned.clone(),
-            certified,
-            var_certs,
+        (!slot_names.is_empty() && script_slots_allows(stmts, &declared, &certified)).then(|| {
+            ScriptSlots {
+                scope: ScopeInfo {
+                    frame_size: scan.next_slot,
+                    arity: 0,
+                    slots: scan.slots,
+                    tdz_store: scan.tdz,
+                    shadow_slots: HashMap::new(),
+                    shadowed_catch_params: HashSet::new(),
+                    context_names: Vec::new(),
+                    context_tdz: Vec::new(),
+                    context_const: Vec::new(),
+                    context_param: Vec::new(),
+                    context_slots: HashMap::new(),
+                    arguments_slot: None,
+                    arguments_formals: None,
+                    this_slot: None,
+                    captured_this: None,
+                    args_alias: false,
+                    annex_b: Vec::new(),
+                    statement_fns: Vec::new(),
+                },
+                names: slot_names,
+                assigned: assigned.clone(),
+                certified,
+                var_certs,
+            }
         })
     };
     Some((slots, globals, assigned))
@@ -31940,43 +31953,62 @@ fn analyze_script_scope(
 /// declared one after (see `Compiler::emit_script_global_flush`) — that is what
 /// keeps a script with `console.log`/`Date.now`/`p.get()` on the certified path
 /// instead of running it interpreted. `new` is a sync point for the same reason.
-/// What still rejects a script is what no flush can fix: `this`/`super`,
-/// closures (function/arrow/class expressions and object
-/// methods/getters/setters), `with`, destructuring patterns, and any
-/// `globalThis`-family identifier (a member access on it reaches the real
-/// global object). `assigned` (the epilogue write-back set) is collected by the
-/// prepass; `certified` is the global-blind function set (Cut 35 slice 3).
-fn script_slots_allows(stmts: &[Stmt], certified: &HashSet<crux::AtomId>) -> bool {
+///
+/// A closure value is admitted when its own body is global-blind: it can then be
+/// invoked from anywhere — a `valueOf` run by an operator, a getter run by a
+/// member read, a callback a builtin calls — and still never touch a slot. An
+/// empty `this` is not admitted (at script level it IS the global object), but a
+/// member access *through* it is, as long as the key is not a declared name;
+/// that is the same staleness test the body scan uses.
+///
+/// What still rejects a script is what no flush can fix: `super`, classes and
+/// object methods/getters/setters, `with`, destructuring patterns, a bare
+/// `this`, and any `globalThis`-family identifier (a member access on it reaches
+/// the real global object). `declared` is the script's declared-name set,
+/// `certified` the global-blind function set (Cut 35 slice 3).
+fn script_slots_allows(
+    stmts: &[Stmt],
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
     stmts
         .iter()
-        .all(|stmt| script_slots_stmt_allows(stmt, certified))
+        .all(|stmt| script_slots_stmt_allows(stmt, declared, certified))
 }
 
-fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> bool {
+fn script_slots_stmt_allows(
+    stmt: &Stmt,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
     match &stmt.kind {
-        StmtKind::Block(block) => script_slots_allows(&block.stmts, certified),
+        StmtKind::Block(block) => script_slots_allows(&block.stmts, declared, certified),
         StmtKind::Empty | StmtKind::Debugger | StmtKind::Break(_) | StmtKind::Continue(_) => true,
-        StmtKind::Expr(expr) => script_slots_expr_allows(expr),
+        StmtKind::Expr(expr) => script_slots_expr_allows(expr, declared, certified),
         StmtKind::VarDecl { decls, .. } => decls.iter().all(|decl| {
             // A destructuring pattern resolves through the environment
             // machinery, bypassing the frame slots — such a script must stay
             // on the global path.
             matches!(&decl.pattern, BindingPattern::Ident(_))
-                && decl.init.as_ref().is_none_or(script_slots_expr_allows)
+                && decl
+                    .init
+                    .as_ref()
+                    .is_none_or(|init| script_slots_expr_allows(init, declared, certified))
         }),
         StmtKind::If {
             test,
             consequent,
             alternate,
         } => {
-            script_slots_expr_allows(test)
-                && script_slots_stmt_allows(consequent, certified)
+            script_slots_expr_allows(test, declared, certified)
+                && script_slots_stmt_allows(consequent, declared, certified)
                 && alternate
                     .as_deref()
-                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, certified))
+                    .is_none_or(|stmt| script_slots_stmt_allows(stmt, declared, certified))
         }
         StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
-            script_slots_expr_allows(test) && script_slots_stmt_allows(body, certified)
+            script_slots_expr_allows(test, declared, certified)
+                && script_slots_stmt_allows(body, declared, certified)
         }
         StmtKind::For {
             init,
@@ -31986,20 +32018,29 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
         } => {
             let init_ok = match init {
                 None => true,
-                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr),
+                Some(ForInit::Expr(expr)) => script_slots_expr_allows(expr, declared, certified),
                 Some(ForInit::VarDecl { decls, .. }) => decls.iter().all(|decl| {
                     matches!(&decl.pattern, BindingPattern::Ident(_))
-                        && decl.init.as_ref().is_none_or(script_slots_expr_allows)
+                        && decl
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| script_slots_expr_allows(init, declared, certified))
                 }),
             };
             init_ok
-                && test.as_ref().is_none_or(script_slots_expr_allows)
-                && update.as_ref().is_none_or(script_slots_expr_allows)
-                && script_slots_stmt_allows(body, certified)
+                && test
+                    .as_ref()
+                    .is_none_or(|expr| script_slots_expr_allows(expr, declared, certified))
+                && update
+                    .as_ref()
+                    .is_none_or(|expr| script_slots_expr_allows(expr, declared, certified))
+                && script_slots_stmt_allows(body, declared, certified)
         }
-        StmtKind::Return(expr) => expr.as_ref().is_none_or(script_slots_expr_allows),
-        StmtKind::Throw(expr) => script_slots_expr_allows(expr),
-        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, certified),
+        StmtKind::Return(expr) => expr
+            .as_ref()
+            .is_none_or(|expr| script_slots_expr_allows(expr, declared, certified)),
+        StmtKind::Throw(expr) => script_slots_expr_allows(expr, declared, certified),
+        StmtKind::Labeled { body, .. } => script_slots_stmt_allows(body, declared, certified),
         StmtKind::ForOf {
             left, right, body, ..
         } => {
@@ -32011,8 +32052,8 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
                     pattern: BindingPattern::Ident(_),
                     ..
                 }
-            ) && script_slots_expr_allows(right)
-                && script_slots_stmt_allows(body, certified)
+            ) && script_slots_expr_allows(right, declared, certified)
+                && script_slots_stmt_allows(body, declared, certified)
         }
         StmtKind::ForIn { left, right, body } => {
             // A simple `var` ident head binds each key straight to the slot
@@ -32028,9 +32069,10 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
                     init,
                     ..
                 } => {
-                    init.as_ref().is_none_or(script_slots_expr_allows)
-                        && script_slots_expr_allows(right)
-                        && script_slots_stmt_allows(body, certified)
+                    init.as_ref()
+                        .is_none_or(|init| script_slots_expr_allows(init, declared, certified))
+                        && script_slots_expr_allows(right, declared, certified)
+                        && script_slots_stmt_allows(body, declared, certified)
                 }
                 _ => false,
             }
@@ -32038,9 +32080,8 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
         // Cut 35 slice 3: a certified (global-blind) top-level function
         // declaration cannot observe the slotified globals, so it no longer
         // disqualifies the frame path. An UNCERTIFIED one still does: its body
-        // may define an accessor or a callback that runs outside a sync point
-        // (an implicit invocation), whose reads and writes of a declared name
-        // the flush/reload cannot cover.
+        // may observe them, and its value can escape into a property that an
+        // operator or a member read invokes implicitly — never a sync point.
         StmtKind::FunctionDecl(function) => {
             function.name.is_some_and(|name| certified.contains(&name))
         }
@@ -32055,15 +32096,25 @@ fn script_slots_stmt_allows(stmt: &Stmt, certified: &HashSet<crux::AtomId>) -> b
 /// Whether an assignment target keeps the frame slots authoritative: a plain
 /// identifier or a member reference does; a destructuring pattern binds by name
 /// through the environment machinery.
-fn script_assignment_target_allows(target: &Expr) -> bool {
+fn script_assignment_target_allows(
+    target: &Expr,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
     match &target.kind {
-        ExprKind::Ident(_) | ExprKind::Member(_) => script_slots_expr_allows(target),
-        ExprKind::Paren(inner) => script_assignment_target_allows(inner),
+        ExprKind::Ident(_) | ExprKind::Member(_) => {
+            script_slots_expr_allows(target, declared, certified)
+        }
+        ExprKind::Paren(inner) => script_assignment_target_allows(inner, declared, certified),
         _ => false,
     }
 }
 
-fn script_slots_expr_allows(expr: &Expr) -> bool {
+fn script_slots_expr_allows(
+    expr: &Expr,
+    declared: &HashSet<crux::AtomId>,
+    certified: &HashSet<crux::AtomId>,
+) -> bool {
     match &expr.kind {
         ExprKind::Ident(name) => {
             let text = crux::lookup(*name).to_string_lossy();
@@ -32072,30 +32123,42 @@ fn script_slots_expr_allows(expr: &Expr) -> bool {
                 "globalThis" | "global" | "window" | "self" | "top" | "parent" | "frames"
             )
         }
-        ExprKind::This
-        | ExprKind::Super
-        | ExprKind::Function(_)
-        | ExprKind::Arrow { .. }
-        | ExprKind::Class(_) => false,
+        // A closure is a value that can be invoked from anywhere, including an
+        // operator's `valueOf` or a member read's getter — neither is a sync
+        // point. It is therefore admitted only when it can never observe the
+        // slots: a global-blind body (the same scan a certified top-level
+        // function goes through). A class is out: its methods, statics and
+        // computed keys are the same hazard one level out.
+        ExprKind::Function(function) => certified_fn_allows(function, declared, certified),
+        ExprKind::Arrow {
+            is_async,
+            params,
+            body,
+        } => certified_arrow_allows(*is_async, params, body, declared, certified),
+        ExprKind::This | ExprKind::Super | ExprKind::Class(_) => false,
         ExprKind::Call(call) => {
             // A call is a SYNC POINT, not a bail: the compiler flushes the
             // slotified globals to the global object before it and reloads them
             // after (see `Compiler::emit_script_global_flush`), so a callee that
             // reads or writes a declared name sees the real binding. The callee
             // expression and the arguments must still be allowed — that is what
-            // keeps `this`, function expressions, `new` and the rest out.
-            script_slots_expr_allows(&call.callee)
+            // keeps `this`, `super`, classes and the rest out.
+            script_slots_expr_allows(&call.callee, declared, certified)
                 && call.args.iter().all(|arg| match arg {
-                    Argument::Expr(e) | Argument::Spread(e) => script_slots_expr_allows(e),
+                    Argument::Expr(e) | Argument::Spread(e) => {
+                        script_slots_expr_allows(e, declared, certified)
+                    }
                 })
         }
         ExprKind::New(new) => {
             // A constructor is a sync point like a call (see the `Call` arm):
             // its body can read or write a declared name through the global
             // object.
-            script_slots_expr_allows(&new.callee)
+            script_slots_expr_allows(&new.callee, declared, certified)
                 && new.args.iter().all(|arg| match arg {
-                    Argument::Expr(e) | Argument::Spread(e) => script_slots_expr_allows(e),
+                    Argument::Expr(e) | Argument::Spread(e) => {
+                        script_slots_expr_allows(e, declared, certified)
+                    }
                 })
         }
         ExprKind::Object(object) => object.props.iter().all(|prop| match prop {
@@ -32105,34 +32168,40 @@ fn script_slots_expr_allows(expr: &Expr) -> bool {
             ObjectProperty::Init { key, value, .. } => {
                 let key_ok = match key {
                     PropertyName::Ident(_) | PropertyName::Str(_) | PropertyName::Number(_) => true,
-                    PropertyName::Computed(key_expr) => script_slots_expr_allows(key_expr),
+                    PropertyName::Computed(key_expr) => {
+                        script_slots_expr_allows(key_expr, declared, certified)
+                    }
                 };
-                key_ok && script_slots_expr_allows(value)
+                key_ok && script_slots_expr_allows(value, declared, certified)
             }
-            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr),
+            ObjectProperty::Spread(expr) => script_slots_expr_allows(expr, declared, certified),
         }),
         ExprKind::Literal(_) => true,
         ExprKind::Array(array) => array.elements.iter().all(|element| match element {
             ArrayElement::Hole => true,
-            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => script_slots_expr_allows(expr),
+            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => {
+                script_slots_expr_allows(expr, declared, certified)
+            }
         }),
-        ExprKind::Paren(inner) => script_slots_expr_allows(inner),
-        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand),
-        ExprKind::Update { target, .. } => script_slots_expr_allows(target),
+        ExprKind::Paren(inner) => script_slots_expr_allows(inner, declared, certified),
+        ExprKind::Unary { operand, .. } => script_slots_expr_allows(operand, declared, certified),
+        ExprKind::Update { target, .. } => script_slots_expr_allows(target, declared, certified),
         ExprKind::Binary { left, right, .. } => {
-            script_slots_expr_allows(left) && script_slots_expr_allows(right)
+            script_slots_expr_allows(left, declared, certified)
+                && script_slots_expr_allows(right, declared, certified)
         }
         ExprKind::Logical { left, right, .. } => {
-            script_slots_expr_allows(left) && script_slots_expr_allows(right)
+            script_slots_expr_allows(left, declared, certified)
+                && script_slots_expr_allows(right, declared, certified)
         }
         ExprKind::Conditional {
             test,
             consequent,
             alternate,
         } => {
-            script_slots_expr_allows(test)
-                && script_slots_expr_allows(consequent)
-                && script_slots_expr_allows(alternate)
+            script_slots_expr_allows(test, declared, certified)
+                && script_slots_expr_allows(consequent, declared, certified)
+                && script_slots_expr_allows(alternate, declared, certified)
         }
         ExprKind::Assign { target, value, .. } => {
             // A destructuring target binds by NAME through the pattern
@@ -32140,18 +32209,36 @@ fn script_slots_expr_allows(expr: &Expr) -> bool {
             // copy of the bound name would go stale (and `collect_script_assigned`
             // does not see the pattern's names either). Ident/member targets
             // compile to slot/global steps.
-            script_assignment_target_allows(target) && script_slots_expr_allows(value)
+            script_assignment_target_allows(target, declared, certified)
+                && script_slots_expr_allows(value, declared, certified)
         }
         ExprKind::Member(member) => {
-            let object_ok = script_slots_expr_allows(&member.object);
+            // A member access through `this` is admitted only for a key that is
+            // not a declared name: at script level (and in a plain call) `this`
+            // IS the global object, whose property for a declared name is the
+            // stale slot. Every other object is checked as usual — an alias to
+            // the global object would have to come from a declared name or the
+            // `globalThis` family, and both are rejected.
+            let through_this = matches!(member.object.kind, ExprKind::This);
+            let object_ok =
+                through_this || script_slots_expr_allows(&member.object, declared, certified);
             let key_ok = match &member.property {
-                MemberProperty::Computed(key) => script_slots_expr_allows(key),
+                MemberProperty::Name(name) if through_this => {
+                    !declared.contains(name) || certified.contains(name)
+                }
+                MemberProperty::Computed(_) if through_this => false,
+                MemberProperty::Computed(key) => script_slots_expr_allows(key, declared, certified),
                 _ => true,
             };
             object_ok && key_ok
         }
-        ExprKind::Template(template) => template.exprs.iter().all(script_slots_expr_allows),
-        ExprKind::Sequence(exprs) => exprs.iter().all(script_slots_expr_allows),
+        ExprKind::Template(template) => template
+            .exprs
+            .iter()
+            .all(|expr| script_slots_expr_allows(expr, declared, certified)),
+        ExprKind::Sequence(exprs) => exprs
+            .iter()
+            .all(|expr| script_slots_expr_allows(expr, declared, certified)),
         ExprKind::PrivateIn { .. }
         | ExprKind::TaggedTemplate { .. }
         | ExprKind::Yield { .. }

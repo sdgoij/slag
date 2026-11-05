@@ -7570,6 +7570,56 @@ mod tests {
     }
 
     #[test]
+    fn a_global_blind_closure_stays_on_the_certified_path() {
+        // A closure value can be invoked from anywhere — a `valueOf` an operator
+        // runs, a getter a member read runs, a callback a builtin runs — and
+        // none of those is a sync point. It is therefore admitted only when its
+        // own body is global-blind. Installing a prototype method from a
+        // function expression is the common shape (`method` in the Brimstone
+        // suite, which ran interpreted).
+        let program = parser::parse_script(
+            "function P(x) { this.x = x; }\n\
+             P.prototype.get = function () { return this.x; };\n\
+             var p = new P(7); var s = 0;\n\
+             for (var i = 0; i < 3; i++) s += p.get(); s",
+        )
+        .unwrap();
+        let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+        assert!(
+            body.scope.is_some() && body.script_globals.is_some(),
+            "a global-blind closure must not un-certify the script"
+        );
+        // What still disqualifies it: the closure reading a declared name, and
+        // `this.<declared name>` — `this` may be the global object, whose
+        // property for a declared name is the stale slot.
+        for source in [
+            "var c = 10; var f = function () { return c; }; f()",
+            "var x = 1; function g() { return this.x; } g()",
+            "var d = 1; var a = () => d; a()",
+        ] {
+            let program = parser::parse_script(source).unwrap();
+            let body = crate::ir::compile_statements(&program.body, false, true).unwrap();
+            assert!(body.scope.is_none(), "must not be certified: {source}");
+        }
+        // `this.<undeclared name>` is a real global property — always current,
+        // so it stays certified and correct.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        assert_eq!(
+            agent
+                .run_script(
+                    "globalThis.zz = 5;\n\
+                     var y = 0;\n\
+                     function r() { return this.zz; }\n\
+                     y = r();\n\
+                     y"
+                )
+                .unwrap(),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
     fn fast_script_bails_preserve_env_behavior() {
         // try/catch (a catch param shadows a same-named global), `with`,
         // and direct eval all fall back to the env path and keep their
