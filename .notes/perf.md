@@ -16645,3 +16645,53 @@ become an inline load.
 What is left of a copy: the `EnvRecord` box and one store per binding. The
 `for (let …)` probe not moving says its residual is the increment through the
 environment and the closure call, not the copy.
+
+## LANDED (2026-11-05): a capture context is a fixed-shape record, and a compiled read is one load
+
+A certified body's capture context was built by `create_mutable_binding` per
+captured name on a dynamic record: a `Vec` grown from empty, an
+`O(n^2)` duplicate-name scan, a 48-byte `JsString` clone per name, and a slot
+read that derefs the `Vec` into an 80-byte `(name, Binding)` entry and decodes
+`Option<Value>`. It is now the same fixed-shape record a per-iteration copy
+uses — one arena slot holding the record and its value run, one `EnvNames`
+table per activation — so `slot_value` is one indexed load and a name-keyed
+access scans a flat table instead of a vector of entries. `EnvNames` gained a
+`per_iteration` flag so a loop head's copy can only inherit a head's table (a
+body context is fixed-shape too, and its names are different).
+
+That made the compiled read worth inlining: `LoadContextSlot`/
+`LoadPerIteration` at depth 0 were a `load_context`/`load_per_iter` helper call
+each — 28.9M in the corpus's `calls` family. The Vm now carries two resolved
+slot runs (`ctx_run` keyed by `body_context.unwrap_or(lexical_env)`, `lex_run`
+keyed by `lexical_env`): the helper records one on every successful resolve, and
+compiled code compares the live environment against the key, re-loads the
+record's `slots` cursor (a record that materialized back into `bindings` nulls
+it), checks the index against the cached width and the slot against the TDZ
+sentinel, and loads the value. Anything else — a different activation, a
+`with`, a chain walk, a materialized record — falls back to the helper, so a
+miss can never produce a value and the cache never needs invalidating. The
+per-step tier, the register (leaf) tier and the optimizing tier all lower the
+read this way; `LoadPerIteration` never lifts, so it only has the first two.
+
+Measured (release, `scratch/w/captured.js` = 5M calls of a body reading one
+captured `var` 8 times, min of 4-5 interleaved rounds, alternating order):
+
+| probe | before | after |
+| --- | ---: | ---: |
+| 8 captured reads per call, jit | 336 | **256 (−23.8%)** |
+| the same body reading it once (`cap1`) | 172 | 158 (−8.1%) |
+| a body reading 8 locals instead (in-run control) | 100 | 100 (0.0%) |
+| 8 captured reads, jitless | 395 | 385 (−2.5%) |
+
+So a helper read cost 4.7 ns and the inline read costs 2.8 ns — cap1 and the
+8-read probe give the slope. The residue is the dependent-load chain
+(`vm → env → key/cursor → slots → value`), not the branch; hoisting the run
+resolution out of a basic block is the next step, not this one.
+
+`JIT_HELPER_STATS=1` on a 2M-iteration copy of the probe: `LoadContext`
+111,999,968 → **7** calls (one per activation). The whole corpus (79 rows, 4
+rounds, alternating order) is flat within ±1%, with `calls/recursive_fib`
+−6.5% and `control/generator_loop` −2.3%; `calls/closure_capture` is 0.0%
+isolated (84 ms both sides) because that row is call-overhead-bound
+(84 ns/call for two reads), which is where the next slice should look: the
+environment lane costs 31.6 ns/call against 20 ns/call for a capture-free leaf.

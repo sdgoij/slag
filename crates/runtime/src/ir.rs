@@ -30,7 +30,9 @@ use crate::context::{
     get_new_target, get_super_base, get_super_constructor, get_this_environment,
     resolve_this_binding,
 };
-use crate::env::{DeclarativeEnv, EnvRecord, EnvRef, new_declarative_environment};
+use crate::env::{
+    DeclarativeEnv, EnvNames, EnvRecord, EnvRef, SlotName, new_declarative_environment,
+};
 use crate::eval::block_declaration_instantiation;
 use crate::expr::{get_iterator, iterator_close, iterator_step};
 use crate::flow::Completion;
@@ -1890,6 +1892,10 @@ impl ScopeInfo {
     /// with the call arguments; captured `var`s start `undefined`; captured
     /// `let`/`const` start in the TDZ. `None` when the body captures
     /// nothing (the certified call keeps the plain closure env).
+    ///
+    /// The record is fixed-shape: the values are a run inside its own arena
+    /// slot and the names/flags are one table, so every context-slot step is
+    /// an indexed load.
     pub fn new_body_context(
         &self,
         outer: &EnvRef,
@@ -1898,26 +1904,23 @@ impl ScopeInfo {
         if self.context_names.is_empty() {
             return Ok(None);
         }
-        let env = new_declarative_environment(Some(*outer));
-        for (index, name) in self.context_names.iter().enumerate() {
-            let text = crux::lookup(*name);
-            if self.context_const[index] {
-                // Const bindings are created strict unconditionally (spec
-                // 16.1.8: CreateImmutableBinding(dn, true) for const
-                // declarations), so a sloppy nested closure's write to an
-                // enclosing `const` still throws like the env path.
-                env.create_immutable_binding(&text, true)?;
-            } else {
-                env.create_mutable_binding(&text, false)?;
-            }
-            let value = match self.context_param[index] {
-                Some(position) => args.get(position).cloned().unwrap_or(Value::Undefined),
-                None if !self.context_tdz[index] => Value::Undefined,
-                None => continue,
-            };
-            env.initialize_binding(&text, value)?;
-        }
-        Ok(Some(env))
+        let entries: Vec<SlotName> = (0..self.context_names.len())
+            .map(|index| SlotName {
+                name: crux::lookup(self.context_names[index]),
+                mutable: !self.context_const[index],
+                strict: self.context_const[index],
+            })
+            .collect();
+        let value_at = |index: usize| match self.context_param[index] {
+            Some(position) => args.get(position).copied().unwrap_or(Value::Undefined),
+            None if !self.context_tdz[index] => Value::Undefined,
+            None => Value::uninitialized(),
+        };
+        Ok(Some(crate::env::new_fixed_environment(
+            Some(*outer),
+            Handle::new(EnvNames::fixed(entries)),
+            value_at,
+        )))
     }
 }
 
@@ -4064,6 +4067,38 @@ fn builder_slice(builder: &Builder) -> &[u16] {
     }
 }
 
+/// The resolved slot run of a fixed-shape environment, cached on the Vm for
+/// the compiled context-slot reads: `key` is the environment the run was
+/// resolved from (traced, so the box — and the transparent chain above it that
+/// the walk skipped — stays alive), `cursor` the address of that record's
+/// `slots` cell, and `len` the run's width.
+///
+/// The compiled read compares the LIVE environment against `key` and re-loads
+/// the cursor, so the cache never needs invalidating: a fresh activation, a
+/// `with` block, a non-fixed-shape environment, or a record that materialized
+/// back into `bindings` (which nulls the cursor) simply misses and falls back
+/// to the helper (which refreshes the cache).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlotRun {
+    pub key: Option<EnvRef>,
+    pub cursor: *const std::cell::Cell<*mut Value>,
+    pub len: usize,
+}
+
+impl SlotRun {
+    pub(crate) const EMPTY: SlotRun = SlotRun {
+        key: None,
+        cursor: std::ptr::null(),
+        len: 0,
+    };
+}
+
+impl Trace for SlotRun {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.key.trace(visit);
+    }
+}
+
 #[derive(Debug)]
 pub struct Vm {
     pub ip: usize,
@@ -4107,6 +4142,13 @@ pub struct Vm {
     /// holding the body's captured bindings, fixed for the run. The
     /// per-iteration loop machinery copies fresh head bindings from it.
     pub(crate) body_context: Option<EnvRef>,
+    /// The capture-context slot run a compiled `LoadContextSlot` at depth 0
+    /// reads (keyed by `body_context.unwrap_or(lexical_env)`), and the
+    /// per-iteration run (`LoadPerIteration`, keyed by `lexical_env`). Both are
+    /// only consulted on an exact key match; a miss re-resolves through the
+    /// helper. See [`SlotRun`].
+    pub(crate) ctx_run: SlotRun,
+    pub(crate) lex_run: SlotRun,
     /// The running context's realm global object, resolved on first access
     /// and reused for the whole body run (a body's realm cannot change while
     /// its own steps run — nested calls push their own contexts). Avoids the
@@ -4287,6 +4329,8 @@ impl Trace for Vm {
         self.lexical_env.trace(visit);
         self.env_stack.trace(visit);
         self.body_context.trace(visit);
+        self.ctx_run.trace(visit);
+        self.lex_run.trace(visit);
         self.global.trace(visit);
         self.completion.trace(visit);
         self.try_stack.trace(visit);
@@ -4433,6 +4477,8 @@ impl Vm {
             lexical_env,
             env_stack: EnvStack::with_base(lexical_env),
             body_context: None,
+            ctx_run: SlotRun::EMPTY,
+            lex_run: SlotRun::EMPTY,
             global: None,
             globals_unshadowed: false,
             completion: Value::Undefined,
@@ -4782,6 +4828,10 @@ impl Vm {
         self.lexical_env = lexical_env;
         self.env_stack.reset(lexical_env);
         self.body_context = None;
+        // A pooled Vm outlives the agent that used it, so the slot-run keys
+        // must not survive a reset (the handles would name another heap).
+        self.ctx_run = SlotRun::EMPTY;
+        self.lex_run = SlotRun::EMPTY;
         self.global = None;
         self.globals_unshadowed = false;
         self.completion = Value::Undefined;
@@ -16339,6 +16389,52 @@ impl Vm {
             })?;
         }
         Ok(env)
+    }
+
+    /// Record the slot run a compiled depth-0 `LoadContextSlot` may read: keyed
+    /// by the env the read resolves FROM, pointing at `resolved`'s own run.
+    /// A non-fixed-shape (or non-declarative) resolved env records a null run,
+    /// so the compiled read keeps taking the helper.
+    pub(crate) fn cache_context_run(&mut self, resolved: &EnvRef) {
+        let key = self.body_context_env();
+        let run = match &**resolved {
+            EnvRecord::Declarative(declarative) => declarative.shared_run(),
+            _ => None,
+        };
+        self.ctx_run = match run {
+            Some((cursor, len)) => SlotRun {
+                key: Some(key),
+                cursor,
+                len,
+            },
+            None => SlotRun {
+                key: Some(key),
+                cursor: std::ptr::null(),
+                len: 0,
+            },
+        };
+    }
+
+    /// As [`Vm::cache_context_run`] for a depth-0 `LoadPerIteration`, keyed by
+    /// the live `lexical_env` (the per-iteration env itself).
+    pub(crate) fn cache_per_iteration_run(&mut self, resolved: &EnvRef) {
+        let key = self.lexical_env;
+        let run = match &**resolved {
+            EnvRecord::Declarative(declarative) => declarative.shared_run(),
+            _ => None,
+        };
+        self.lex_run = match run {
+            Some((cursor, len)) => SlotRun {
+                key: Some(key),
+                cursor,
+                len,
+            },
+            None => SlotRun {
+                key: Some(key),
+                cursor: std::ptr::null(),
+                len: 0,
+            },
+        };
     }
 
     /// The certified body's capture context (Cut 3 continuation): the env

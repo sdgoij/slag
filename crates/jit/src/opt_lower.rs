@@ -23,10 +23,12 @@ use runtime::ir::{
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
     JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext, LEAF_CALL_RECORD_SHIFT,
-    LeafCallRecord, LeafInlineInfo, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET,
-    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET,
-    VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET,
-    VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    LeafCallRecord, LeafInlineInfo, SLOT_RUN_CURSOR_OFFSET, SLOT_RUN_KEY_OFFSET,
+    SLOT_RUN_LEN_OFFSET, VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BODY_CONTEXT_OFFSET,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
+    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
+    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
@@ -1144,22 +1146,26 @@ fn lower_inst(
             };
             emit_global_read(builder, helpers, abi, *atom, true, Helper::LoadIdent)?
         }
-        // A lifted `LoadContextSlot`: the shared env-walk helper. `Imm::Context`
-        // carries (depth, index).
+        // A lifted `LoadContextSlot`: the depth-0 run cache, else the shared
+        // env-walk helper. `Imm::Context` carries (depth, index).
         Op::ContextLoad => {
             let Imm::Context { depth, index } = &inst.imm else {
                 return Err(Unsupported::Step("opt:context"));
             };
-            let depth = builder.ins().iconst(types::I64, *depth as i64);
-            let slot = builder.ins().iconst(types::I64, *index as i64);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_unary,
-                Helper::LoadContext,
-                &[depth, slot],
-            )?
+            if *depth == 0 {
+                emit_context_read(builder, helpers, abi, *index)?
+            } else {
+                let depth = builder.ins().iconst(types::I64, *depth as i64);
+                let slot = builder.ins().iconst(types::I64, *index as i64);
+                call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_unary,
+                    Helper::LoadContext,
+                    &[depth, slot],
+                )?
+            }
         }
         // A lifted `StoreContextSlot`: `args = [value]`.
         Op::ContextStore => {
@@ -2881,6 +2887,118 @@ fn emit_global_read(
     builder.switch_to_block(slow);
     let name = builder.ins().iconst(types::I64, atom as i64);
     let res = call_helper(builder, helpers, abi, abi.sig_bool, fallback, &[name])?;
+    builder.def_var(value, res);
+    builder.ins().jump(merge, &[]);
+
+    builder.seal_block(merge);
+    builder.switch_to_block(merge);
+    Ok(builder.use_var(value))
+}
+
+/// The lifted depth-0 context-slot read: the Vm's resolved slot run when it still
+/// validates against the live capture context, else the shared env helper (which
+/// refreshes the run). The mirror of the per-step `emit_context_slot_read`.
+fn emit_context_read(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    index: u32,
+) -> Result<ClifValue, Unsupported> {
+    let value = builder.declare_var(types::I64);
+    let vm = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, vm) as i32),
+    );
+    let look = builder.create_block();
+    let probe = builder.create_block();
+    let deref = builder.create_block();
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    let has_vm = builder.ins().icmp_imm_u(IntCC::NotEqual, vm, 0);
+    builder.ins().brif(has_vm, look, &[], slow, &[]);
+    builder.seal_block(look);
+
+    builder.switch_to_block(look);
+    let lexical = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm,
+        Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+    );
+    let body = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        vm,
+        Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+    );
+    let present = builder.ins().icmp_imm_u(IntCC::NotEqual, body, 0);
+    let base = builder.ins().select(present, body, lexical);
+    let run = builder.ins().iadd_imm_s(vm, VM_CTX_RUN_OFFSET as i64);
+    let key = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        run,
+        Offset32::new(SLOT_RUN_KEY_OFFSET as i32),
+    );
+    let cursor = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        run,
+        Offset32::new(SLOT_RUN_CURSOR_OFFSET as i32),
+    );
+    let len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        run,
+        Offset32::new(SLOT_RUN_LEN_OFFSET as i32),
+    );
+    let same_env = builder.ins().icmp(IntCC::Equal, base, key);
+    let has_cursor = builder.ins().icmp_imm_u(IntCC::NotEqual, cursor, 0);
+    let in_bounds = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedGreaterThan, len, index as i64);
+    let ok = builder.ins().band(same_env, has_cursor);
+    let ok = builder.ins().band(ok, in_bounds);
+    builder.ins().brif(ok, probe, &[], slow, &[]);
+    builder.seal_block(probe);
+
+    builder.switch_to_block(probe);
+    let slots = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), cursor, Offset32::new(0));
+    let has_run = builder.ins().icmp_imm_u(IntCC::NotEqual, slots, 0);
+    builder.ins().brif(has_run, deref, &[], slow, &[]);
+    builder.seal_block(deref);
+
+    builder.switch_to_block(deref);
+    let slot_value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots,
+        Offset32::new((index as usize * std::mem::size_of::<crux::Value>()) as i32),
+    );
+    let initialized = builder.ins().icmp_imm_u(
+        IntCC::NotEqual,
+        slot_value,
+        crux::value::UNINITIALIZED_BITS as i64,
+    );
+    builder.def_var(value, slot_value);
+    builder.ins().brif(initialized, merge, &[], slow, &[]);
+
+    builder.seal_block(slow);
+    builder.switch_to_block(slow);
+    let depth = builder.ins().iconst(types::I64, 0);
+    let slot = builder.ins().iconst(types::I64, index as i64);
+    let res = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::LoadContext,
+        &[depth, slot],
+    )?;
     builder.def_var(value, res);
     builder.ins().jump(merge, &[]);
 

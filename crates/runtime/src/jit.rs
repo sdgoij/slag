@@ -361,6 +361,13 @@ pub const VM_TRY_STACK_LEN_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) +
 pub const VM_TRY_STACK_PTR_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_PTR_OFFSET;
 pub const VM_TRY_STACK_CAP_OFFSET: usize = std::mem::offset_of!(Vm, try_stack) + VEC_CAP_OFFSET;
 pub const VM_LEXICAL_ENV_OFFSET: usize = std::mem::offset_of!(Vm, lexical_env);
+pub const VM_BODY_CONTEXT_OFFSET: usize = std::mem::offset_of!(Vm, body_context);
+/// The two compiled context-read caches (see `ir::SlotRun`).
+pub const VM_CTX_RUN_OFFSET: usize = std::mem::offset_of!(Vm, ctx_run);
+pub const VM_LEX_RUN_OFFSET: usize = std::mem::offset_of!(Vm, lex_run);
+pub const SLOT_RUN_KEY_OFFSET: usize = std::mem::offset_of!(crate::ir::SlotRun, key);
+pub const SLOT_RUN_CURSOR_OFFSET: usize = std::mem::offset_of!(crate::ir::SlotRun, cursor);
+pub const SLOT_RUN_LEN_OFFSET: usize = std::mem::offset_of!(crate::ir::SlotRun, len);
 pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
 /// G19: the pending `switch` discriminant (a raw `Value` `u64`) and its
 /// presence flag — the compiled `SwitchDisc`/`SwitchTest` read and write them
@@ -3825,16 +3832,24 @@ extern "C" fn load_context(ctx: *mut c_void, depth: u64, index: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
     match vm.context_chain_env(depth as usize) {
-        Ok(env) => match crate::ir::context_env(&env).slot_value(index as usize) {
-            Some(value) => value.bits(),
-            None => slow_error(
-                ctx,
-                JsError::new(
-                    ErrorKind::ReferenceError,
-                    "Cannot access a binding before initialization".into(),
+        Ok(env) => {
+            // Refresh the run the compiled depth-0 read addresses inline; a
+            // deeper chain position resolves from another env, so it leaves
+            // the cache alone.
+            if depth == 0 {
+                vm.cache_context_run(&env);
+            }
+            match crate::ir::context_env(&env).slot_value(index as usize) {
+                Some(value) => value.bits(),
+                None => slow_error(
+                    ctx,
+                    JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ),
                 ),
-            ),
-        },
+            }
+        }
         Err(error) => slow_error(ctx, error),
     }
 }
@@ -6637,16 +6652,21 @@ extern "C" fn load_per_iter(ctx: *mut c_void, depth: u64, index: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let vm = unsafe { &mut *ctx.vm };
     match vm.per_iteration_env(depth as usize) {
-        Ok(env) => match crate::ir::context_env(&env).slot_value(index as usize) {
-            Some(value) => value.bits(),
-            None => slow_error(
-                ctx,
-                JsError::new(
-                    ErrorKind::ReferenceError,
-                    "Cannot access a binding before initialization".into(),
+        Ok(env) => {
+            if depth == 0 {
+                vm.cache_per_iteration_run(&env);
+            }
+            match crate::ir::context_env(&env).slot_value(index as usize) {
+                Some(value) => value.bits(),
+                None => slow_error(
+                    ctx,
+                    JsError::new(
+                        ErrorKind::ReferenceError,
+                        "Cannot access a binding before initialization".into(),
+                    ),
                 ),
-            ),
-        },
+            }
+        }
         Err(error) => slow_error(ctx, error),
     }
 }

@@ -47,13 +47,14 @@ use runtime::jit::{
     BUILDER_LEN_OFFSET, BUILDER_OWNER_OFFSET, BUILDER_RHS_BITS_OFFSET, BUILDER_RHS_OK_OFFSET,
     BUILDER_RHS_UNIT_OFFSET, CertifiedInlineInfo, DISPATCH_DEOPT, GlobalValueCell, HELPER_COUNT,
     JIT_DEOPT_PROBE, JIT_GC_PROBE_INTERVAL, JIT_HELPER_COUNTS, JitCallContext,
-    LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, TYPED_ARRAY_LENGTH_SENTINEL,
-    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BUILDER_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET,
-    VM_COMPLETION_OFFSET, VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET,
-    VM_FOR_IN_STACK_LEN_OFFSET, VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET,
-    VM_IP_OFFSET, VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET,
-    VM_SWITCH_DISC_SET_OFFSET, VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET,
-    VM_TRY_STACK_PTR_OFFSET,
+    LEAF_CALL_RECORD_SHIFT, LeafCallRecord, LeafInlineInfo, SLOT_RUN_CURSOR_OFFSET,
+    SLOT_RUN_KEY_OFFSET, SLOT_RUN_LEN_OFFSET, TYPED_ARRAY_LENGTH_SENTINEL,
+    VM_ASYNC_FOR_OF_STACK_LEN_OFFSET, VM_BODY_CONTEXT_OFFSET, VM_BUILDER_OFFSET,
+    VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
+    VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
+    VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET, VM_LEX_RUN_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_SWITCH_DISC_OFFSET, VM_SWITCH_DISC_SET_OFFSET,
+    VM_TRY_STACK_CAP_OFFSET, VM_TRY_STACK_LEN_OFFSET, VM_TRY_STACK_PTR_OFFSET,
 };
 use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 use target_lexicon::PointerWidth;
@@ -4558,6 +4559,126 @@ impl<'a> Lowerer<'a> {
         self.builder.seal_block(skip);
     }
 
+    /// The compiled depth-0 context-slot read.
+    ///
+    /// `run_offset` selects the Vm's resolved slot run (`VM_CTX_RUN_OFFSET` for a
+    /// capture-context read, `VM_LEX_RUN_OFFSET` for a per-iteration one) and
+    /// `key_from_body` says how the key is derived: the capture-context read
+    /// resolves from `body_context` when a body set one, else from
+    /// `lexical_env` (the `context_chain_env` base), while a per-iteration read
+    /// addresses `lexical_env` itself. The run serves the read only when the
+    /// live environment still IS the one it was resolved from, the slot is in
+    /// bounds, and the slot is initialized; everything else takes `helper`,
+    /// which re-resolves through the env machinery and refreshes the cache. A
+    /// miss must never produce a value.
+    fn emit_context_slot_read(
+        &mut self,
+        run_offset: usize,
+        key_from_body: bool,
+        index: usize,
+        helper: Helper,
+    ) -> Result<ClifValue, Unsupported> {
+        let value_var = self.builder.declare_var(types::I64);
+        let vm_ptr = self.vm_ptr();
+        let look = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        // A null `vm` (the scaffold's bare ctx) has nothing to read: never
+        // dereference it — the helper answers for that harness.
+        let has_vm = self.builder.ins().icmp_imm_u(IntCC::NotEqual, vm_ptr, 0);
+        self.builder.ins().brif(has_vm, look, &[], slow, &[]);
+        self.builder.switch_to_block(look);
+        self.builder.seal_block(look);
+        let lexical = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm_ptr,
+            Offset32::new(VM_LEXICAL_ENV_OFFSET as i32),
+        );
+        let base = if key_from_body {
+            let body = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                vm_ptr,
+                Offset32::new(VM_BODY_CONTEXT_OFFSET as i32),
+            );
+            let present = self.builder.ins().icmp_imm_u(IntCC::NotEqual, body, 0);
+            self.builder.ins().select(present, body, lexical)
+        } else {
+            lexical
+        };
+        let run = self.builder.ins().iadd_imm_s(vm_ptr, run_offset as i64);
+        let key = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            run,
+            Offset32::new(SLOT_RUN_KEY_OFFSET as i32),
+        );
+        let cursor = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            run,
+            Offset32::new(SLOT_RUN_CURSOR_OFFSET as i32),
+        );
+        let len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            run,
+            Offset32::new(SLOT_RUN_LEN_OFFSET as i32),
+        );
+        let same_env = self.builder.ins().icmp(IntCC::Equal, base, key);
+        let same_env = self.bint(same_env);
+        let has_cursor = self.builder.ins().icmp_imm_u(IntCC::NotEqual, cursor, 0);
+        let has_cursor = self.bint(has_cursor);
+        let in_bounds =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedGreaterThan, len, index as i64);
+        let in_bounds = self.bint(in_bounds);
+        let ok = self.builder.ins().band(same_env, has_cursor);
+        let ok = self.builder.ins().band(ok, in_bounds);
+        self.builder.ins().brif(ok, probe, &[], slow, &[]);
+        self.builder.switch_to_block(probe);
+        self.builder.seal_block(probe);
+        // The record's own `slots` cell, re-read: a record that materialized
+        // back into `bindings` nulls it, which must miss.
+        let slots =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), cursor, Offset32::new(0));
+        let has_run = self.builder.ins().icmp_imm_u(IntCC::NotEqual, slots, 0);
+        let has_run = self.bint(has_run);
+        let deref = self.builder.create_block();
+        self.builder.ins().brif(has_run, deref, &[], slow, &[]);
+        self.builder.switch_to_block(deref);
+        self.builder.seal_block(deref);
+        let value = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots,
+            Offset32::new((index * std::mem::size_of::<Value>()) as i32),
+        );
+        let initialized = self.builder.ins().icmp_imm_u(
+            IntCC::NotEqual,
+            value,
+            crux::value::UNINITIALIZED_BITS as i64,
+        );
+        let initialized = self.bint(initialized);
+        self.builder.def_var(value_var, value);
+        self.builder.ins().brif(initialized, merge, &[], slow, &[]);
+        self.builder.seal_block(slow);
+        self.builder.switch_to_block(slow);
+        let depth_imm = self.builder.ins().iconst(types::I64, 0);
+        let index_imm = self.builder.ins().iconst(types::I64, index as i64);
+        let res = self.call_slow(self.sig_get_name, helper, &[depth_imm, index_imm])?;
+        self.builder.def_var(value_var, res);
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(value_var))
+    }
+
     fn call_slow(
         &mut self,
         sig: SigRef,
@@ -6084,15 +6205,24 @@ impl<'a> Lowerer<'a> {
                 self.emit_update(*slot, *op, *prefix, true, index)?
             }
             Step::LoadContextSlot { depth, index: slot } => {
-                // `context_chain_env(depth)` slot `slot` through the slow
-                // path (the env machinery is shared with the interpreter).
-                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
-                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
-                let res = self.call_slow(
-                    self.sig_get_name,
-                    Helper::LoadContext,
-                    &[depth_imm, slot_imm],
-                )?;
+                // Depth 0 reads the run the helper cached for this activation;
+                // a deeper chain position stays on the shared env machinery.
+                let res = if *depth == 0 {
+                    self.emit_context_slot_read(
+                        VM_CTX_RUN_OFFSET,
+                        true,
+                        *slot,
+                        Helper::LoadContext,
+                    )?
+                } else {
+                    let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                    let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                    self.call_slow(
+                        self.sig_get_name,
+                        Helper::LoadContext,
+                        &[depth_imm, slot_imm],
+                    )?
+                };
                 self.push(res);
                 self.fall_through(index);
             }
@@ -6133,16 +6263,25 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::LoadPerIteration { depth, index: slot } => {
-                // `per_iteration_env(depth)` slot `slot` through the slow
-                // path (a captured for-head binding's fresh per-iteration
-                // env).
-                let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
-                let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
-                let res = self.call_slow(
-                    self.sig_get_name,
-                    Helper::LoadPerIter,
-                    &[depth_imm, slot_imm],
-                )?;
+                // Depth 0 reads the run cached for the live per-iteration env
+                // (a captured for-head binding's fresh copy); a deeper walk
+                // stays on the shared env machinery.
+                let res = if *depth == 0 {
+                    self.emit_context_slot_read(
+                        VM_LEX_RUN_OFFSET,
+                        false,
+                        *slot,
+                        Helper::LoadPerIter,
+                    )?
+                } else {
+                    let depth_imm = self.builder.ins().iconst(types::I64, *depth as i64);
+                    let slot_imm = self.builder.ins().iconst(types::I64, *slot as i64);
+                    self.call_slow(
+                        self.sig_get_name,
+                        Helper::LoadPerIter,
+                        &[depth_imm, slot_imm],
+                    )?
+                };
                 self.push(res);
                 self.fall_through(index);
             }
@@ -10057,20 +10196,24 @@ impl<'a> Lowerer<'a> {
                 self.set_acc_bits(bits);
             }
             LeafOp::LoadContext { index } => {
-                // Depth-0 capture-context read through the slow path.
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                let res =
-                    self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
+                // Depth-0 capture-context read through the run cache.
+                let res = self.emit_context_slot_read(
+                    VM_CTX_RUN_OFFSET,
+                    true,
+                    *index,
+                    Helper::LoadContext,
+                )?;
                 self.set_acc_bits(res);
             }
             LeafOp::LoadPerIter { index } => {
-                // Depth-0 per-iteration read through the slow path (the
-                // leaf's `lexical_env` is its captured per-iteration env).
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                let res =
-                    self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])?;
+                // Depth-0 per-iteration read (the leaf's `lexical_env` is its
+                // captured per-iteration env).
+                let res = self.emit_context_slot_read(
+                    VM_LEX_RUN_OFFSET,
+                    false,
+                    *index,
+                    Helper::LoadPerIter,
+                )?;
                 self.set_acc_bits(res);
             }
             LeafOp::LoadCounter => {
@@ -10102,20 +10245,24 @@ impl<'a> Lowerer<'a> {
             LeafOp::BinContext { op, index } => {
                 // `acc = acc op context[index]` (the fused `LoadContext` +
                 // binary — the register executor's evaluation order).
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                let right =
-                    self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
+                let right = self.emit_context_slot_read(
+                    VM_CTX_RUN_OFFSET,
+                    true,
+                    *index,
+                    Helper::LoadContext,
+                )?;
                 let left_known = self.acc_is_number;
                 let left = self.acc_form();
                 self.emit_acc_binary(*op, left, BinForm::Bits(right), left_known, false)?;
             }
             LeafOp::BinPerIter { op, index } => {
                 // `acc = acc op per-iteration[index]` (depth 0).
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                let right =
-                    self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])?;
+                let right = self.emit_context_slot_read(
+                    VM_LEX_RUN_OFFSET,
+                    false,
+                    *index,
+                    Helper::LoadPerIter,
+                )?;
                 let left_known = self.acc_is_number;
                 let left = self.acc_form();
                 self.emit_acc_binary(*op, left, BinForm::Bits(right), left_known, false)?;
@@ -10128,10 +10275,12 @@ impl<'a> Lowerer<'a> {
             } => {
                 // `acc = context[index] op frame[slot]` (captured left,
                 // frame-slot right — the step path's evaluation order).
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                let left =
-                    self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])?;
+                let left = self.emit_context_slot_read(
+                    VM_CTX_RUN_OFFSET,
+                    true,
+                    *index,
+                    Helper::LoadContext,
+                )?;
                 let right = self.load_slot(*slot);
                 if *tdz {
                     self.emit_tdz_check(right)?;
@@ -10898,17 +11047,13 @@ impl<'a> Lowerer<'a> {
                 Ok(old)
             }
             RegOperand::Ctx { index } => {
-                // A captured binding as a member key/value: the depth-0
-                // context read through the slow path.
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                self.call_slow(self.sig_get_name, Helper::LoadContext, &[zero, index_imm])
+                // A captured binding as a member key/value: the depth-0 context
+                // read through the run cache.
+                self.emit_context_slot_read(VM_CTX_RUN_OFFSET, true, *index, Helper::LoadContext)
             }
             RegOperand::PerIter { index } => {
                 // A captured for-head binding as a member key/value.
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let index_imm = self.builder.ins().iconst(types::I64, *index as i64);
-                self.call_slow(self.sig_get_name, Helper::LoadPerIter, &[zero, index_imm])
+                self.emit_context_slot_read(VM_LEX_RUN_OFFSET, false, *index, Helper::LoadPerIter)
             }
             RegOperand::Acc => Ok(self.acc_bits()),
             RegOperand::Spilled => Err(Unsupported::Leaf("member operand shape")),

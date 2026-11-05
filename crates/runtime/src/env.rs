@@ -558,16 +558,47 @@ pub struct DeclarativeEnv {
 /// is one indexed load.
 #[derive(Debug)]
 pub struct EnvNames {
-    /// `(name, mutable)` per slot, in slot order.
-    entries: Box<[(JsString, bool)]>,
+    /// One entry per slot, in slot order.
+    entries: Box<[SlotName]>,
+    /// The table of a per-iteration copy (a loop head's fresh bindings), which
+    /// is the only shape a later copy may inherit: a body's capture context is
+    /// a fixed-shape record too, and its table holds different names.
+    per_iteration: bool,
+}
+
+/// One slot's name and flags in a fixed-shape record.
+#[derive(Debug)]
+pub struct SlotName {
+    pub name: JsString,
+    /// An assignment writes the slot.
+    pub mutable: bool,
+    /// An assignment is a TypeError even from sloppy code (a `const`, which
+    /// spec 16.1.8 creates strict unconditionally).
+    pub strict: bool,
 }
 
 impl EnvNames {
     fn from_names(names: &[JsString]) -> Self {
-        let entries: Vec<(JsString, bool)> =
-            names.iter().map(|name| (name.clone(), true)).collect();
+        let entries: Vec<SlotName> = names
+            .iter()
+            .map(|name| SlotName {
+                name: name.clone(),
+                mutable: true,
+                strict: false,
+            })
+            .collect();
         Self {
             entries: entries.into_boxed_slice(),
+            per_iteration: true,
+        }
+    }
+
+    /// A table whose shape is fixed for the record's lifetime (a certified
+    /// body's capture context). Never inherited by a per-iteration copy.
+    pub fn fixed(entries: Vec<SlotName>) -> Self {
+        Self {
+            entries: entries.into_boxed_slice(),
+            per_iteration: false,
         }
     }
 
@@ -578,8 +609,8 @@ impl EnvNames {
 
 impl Trace for EnvNames {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        for (name, _) in self.entries.iter() {
-            name.trace(visit);
+        for entry in self.entries.iter() {
+            entry.name.trace(visit);
         }
     }
 }
@@ -620,6 +651,18 @@ impl DeclarativeEnv {
         self.shared.get()
     }
 
+    /// The record's value run and its width, when the record has a fixed shape
+    /// — what a compiled context-slot read addresses directly (see
+    /// `Vm::cache_context_run`). The run is returned as the address of the
+    /// record's `slots` cursor, not the pointer itself: the compiled read
+    /// re-loads the cursor, so a record that materialized back into `bindings`
+    /// (which nulls it) can never be served a stale run.
+    pub(crate) fn shared_run(&self) -> Option<(*const std::cell::Cell<*mut Value>, usize)> {
+        self.shared
+            .get()
+            .map(|shared| (std::ptr::from_ref(&self.slots), shared.len()))
+    }
+
     /// The record's bindings in the dynamic representation, materializing a
     /// per-iteration copy first: the walkers that read names and flags (a
     /// snapshot, a diagnostic) must see the same entries however the record
@@ -639,17 +682,17 @@ impl DeclarativeEnv {
         };
         let slots = self.slots.get();
         let mut bindings = Vec::with_capacity(shared.len());
-        for (index, (name, mutable)) in shared.entries.iter().enumerate() {
+        for (index, entry) in shared.entries.iter().enumerate() {
             // SAFETY: `slots` is this box's trailing run of `entries.len()`
             // values, initialized by the constructor (to the TDZ sentinel when
             // the copy was aborted).
             let value = unsafe { *slots.add(index) };
             bindings.push((
-                name.clone(),
+                entry.name.clone(),
                 Binding {
                     value: (!value.is_uninitialized()).then_some(value),
-                    mutable: *mutable,
-                    strict: false,
+                    mutable: entry.mutable,
+                    strict: entry.strict,
                     deletable: false,
                     indirect: None,
                     parameter: false,
@@ -750,10 +793,7 @@ impl DeclarativeEnv {
     /// write to an enclosing const must still throw).
     pub fn slot_mutable(&self, index: usize) -> bool {
         if let Some(shared) = self.shared.get() {
-            return shared
-                .entries
-                .get(index)
-                .is_some_and(|(_, mutable)| *mutable);
+            return shared.entries.get(index).is_some_and(|entry| entry.mutable);
         }
         self.bindings
             .borrow()
@@ -785,7 +825,7 @@ impl DeclarativeEnv {
 
     fn has_binding(&self, name: &JsString) -> bool {
         if let Some(shared) = self.shared.get() {
-            return shared.entries.iter().any(|(entry, _)| entry == name);
+            return shared.entries.iter().any(|entry| entry.name == *name);
         }
         self.bindings.borrow().iter().any(|(n, _)| n == name)
     }
@@ -872,7 +912,7 @@ impl DeclarativeEnv {
 
     fn initialize_binding(&self, name: &JsString, value: Value) -> Result<(), JsError> {
         if let Some(shared) = self.shared.get() {
-            let Some(index) = shared.entries.iter().position(|(n, _)| n == name) else {
+            let Some(index) = shared.entries.iter().position(|entry| entry.name == *name) else {
                 return Err(JsError::new(
                     ErrorKind::ReferenceError,
                     format!("Binding {:?} does not exist", name.to_string_lossy()),
@@ -903,7 +943,7 @@ impl DeclarativeEnv {
         strict: bool,
     ) -> Result<(), JsError> {
         if let Some(shared) = self.shared.get() {
-            let Some(index) = shared.entries.iter().position(|(n, _)| n == name) else {
+            let Some(index) = shared.entries.iter().position(|entry| entry.name == *name) else {
                 // spec step 1: sloppy code creates the missing binding.
                 if strict {
                     return Err(JsError::new(
@@ -914,7 +954,7 @@ impl DeclarativeEnv {
                 self.create_mutable_binding(name, true)?;
                 return self.initialize_binding(name, value);
             };
-            let mutable = shared.entries[index].1;
+            let entry = &shared.entries[index];
             // SAFETY: as `slot_value`.
             let current = unsafe { *self.slots.get().add(index) };
             if current.is_uninitialized() {
@@ -926,11 +966,11 @@ impl DeclarativeEnv {
                     ),
                 ));
             }
-            return if mutable {
+            return if entry.mutable {
                 // SAFETY: as `slot_value`.
                 unsafe { *self.slots.get().add(index) = value };
                 Ok(())
-            } else if strict {
+            } else if strict || entry.strict {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     format!(
@@ -987,7 +1027,7 @@ impl DeclarativeEnv {
     /// vector and therefore invalidates the cell.
     pub fn index_of(&self, name: &JsString) -> Option<usize> {
         if let Some(shared) = self.shared.get() {
-            return shared.entries.iter().position(|(n, _)| n == name);
+            return shared.entries.iter().position(|entry| entry.name == *name);
         }
         self.bindings.borrow().iter().position(|(n, _)| n == name)
     }
@@ -1007,10 +1047,10 @@ impl DeclarativeEnv {
         strict: bool,
     ) -> Result<Option<Value>, JsError> {
         if let Some(shared) = self.shared.get() {
-            let Some((stored_name, mutable)) = shared.entries.get(index) else {
+            let Some(entry) = shared.entries.get(index) else {
                 return Ok(None);
             };
-            if stored_name != name {
+            if entry.name != *name {
                 return Ok(None);
             }
             // SAFETY: as `slot_value`.
@@ -1024,11 +1064,11 @@ impl DeclarativeEnv {
                     ),
                 ));
             }
-            return if *mutable {
+            return if entry.mutable {
                 // SAFETY: as `slot_value`.
                 unsafe { *self.slots.get().add(index) = value };
                 Ok(Some(value))
-            } else if strict {
+            } else if strict || entry.strict {
                 Err(JsError::new(
                     ErrorKind::TypeError,
                     format!(
@@ -1076,7 +1116,7 @@ impl DeclarativeEnv {
 
     fn get_binding_value(&self, name: &JsString, _strict: bool) -> Result<Value, JsError> {
         if let Some(shared) = self.shared.get() {
-            let Some(index) = shared.entries.iter().position(|(n, _)| n == name) else {
+            let Some(index) = shared.entries.iter().position(|entry| entry.name == *name) else {
                 return Err(JsError::new(
                     ErrorKind::ReferenceError,
                     format!("{:?} is not defined", name.to_string_lossy()),
@@ -1592,7 +1632,7 @@ pub fn new_per_iteration_environment(
         EnvRecord::Declarative(declarative) => declarative.shared_names(),
         _ => None,
     }
-    .filter(|shared| shared.len() == names.len())
+    .filter(|shared| shared.per_iteration && shared.len() == names.len())
     .unwrap_or_else(|| Handle::new(EnvNames::from_names(names)));
 
     let bytes = names.len().saturating_mul(std::mem::size_of::<Value>());
@@ -1629,6 +1669,45 @@ pub fn new_per_iteration_environment(
     match failure {
         Some(error) => Err(error),
         None => Ok(env),
+    }
+}
+
+/// A declarative environment whose shape is fixed when it is built: one arena
+/// slot holds the record and its values, and the names/flags live in a table
+/// shared with every record of the same shape. The certified path's capture
+/// context is built this way, so a slot read is one indexed load instead of a
+/// `Vec` deref into an 80-byte `(name, Binding)` entry.
+///
+/// `value_at` runs inside the allocation and must not allocate: the heap is
+/// already borrowed (a `Handle::new` there re-enters the heap and panics).
+pub fn new_fixed_environment(
+    outer: Option<EnvRef>,
+    shared: Handle<EnvNames>,
+    value_at: impl Fn(usize) -> Value,
+) -> EnvRef {
+    let bytes = shared.len().saturating_mul(std::mem::size_of::<Value>());
+    // SAFETY: the initializer writes every field of the record and fills every
+    // slot (starting at the TDZ sentinel, which traces as nothing) before the
+    // handle can escape, so the collection the allocation itself may run sees a
+    // well-formed box. `shared.len()` is the record's slot count for life.
+    unsafe {
+        Handle::with_tail(
+            bytes,
+            std::mem::align_of::<Value>(),
+            |payload: *mut EnvRecord, tail| {
+                let run = tail as *mut Value;
+                for index in 0..shared.len() {
+                    run.add(index).write(Value::uninitialized());
+                }
+                let declarative = DeclarativeEnv::new(outer);
+                declarative.shared.set(Some(shared));
+                declarative.slots.set(run);
+                payload.write(EnvRecord::Declarative(declarative));
+                for index in 0..shared.len() {
+                    run.add(index).write(value_at(index));
+                }
+            },
+        )
     }
 }
 
@@ -2088,5 +2167,82 @@ mod tests {
         env.create_global_var_binding(&name("a"), false).unwrap();
         assert!(global.has_own_property(&name("a")).unwrap());
         assert_eq!(global.own_property_keys().unwrap().len(), 1);
+    }
+
+    fn fixed(entries: Vec<(&str, bool, bool)>, value_at: impl Fn(usize) -> Value) -> EnvRef {
+        let entries: Vec<SlotName> = entries
+            .into_iter()
+            .map(|(text, mutable, strict)| SlotName {
+                name: name(text),
+                mutable,
+                strict,
+            })
+            .collect();
+        new_fixed_environment(None, Handle::new(EnvNames::fixed(entries)), value_at)
+    }
+
+    fn declarative_of(env: &EnvRef) -> &DeclarativeEnv {
+        match &**env {
+            EnvRecord::Declarative(declarative) => declarative,
+            _ => unreachable!("a fixed-shape record is declarative"),
+        }
+    }
+
+    #[test]
+    fn a_fixed_shape_record_answers_slots_and_names_like_a_dynamic_one() {
+        let env = fixed(
+            vec![("a", true, false), ("b", false, true), ("c", true, false)],
+            |index| match index {
+                0 => Value::Number(1.0),
+                1 => Value::Number(2.0),
+                _ => Value::uninitialized(),
+            },
+        );
+        // The slot run, including the TDZ sentinel and the out-of-bounds case.
+        let d = declarative_of(&env);
+        assert_eq!(d.slot_value(0), Some(Value::Number(1.0)));
+        assert_eq!(d.slot_value(2), None);
+        assert_eq!(d.slot_value(3), None);
+        // The name-keyed API still answers (a nested env-path closure reads
+        // through it).
+        assert_eq!(
+            env.get_binding_value(&name("a"), true).unwrap(),
+            Value::Number(1.0)
+        );
+        assert!(env.get_binding_value(&name("c"), true).is_err());
+        env.set_mutable_binding(&name("a"), Value::Number(5.0), true)
+            .unwrap();
+        assert_eq!(d.slot_value(0), Some(Value::Number(5.0)));
+        // A `const` is created strict unconditionally, so a SLOPPY write still
+        // throws and leaves the slot alone.
+        assert!(
+            env.set_mutable_binding(&name("b"), Value::Number(9.0), false)
+                .is_err()
+        );
+        assert_eq!(d.slot_value(1), Some(Value::Number(2.0)));
+        assert!(d.slot_mutable(0));
+        assert!(!d.slot_mutable(1));
+        assert_eq!(d.index_of(&name("c")), Some(2));
+        assert_eq!(d.index_of(&name("z")), None);
+        assert_eq!(d.binding_entries().len(), 3);
+    }
+
+    #[test]
+    fn a_materialized_fixed_shape_record_abandons_its_run() {
+        // The compiled context read re-loads the record's `slots` cursor on
+        // every hit, so a structural change (which materializes the values back
+        // into `bindings` and nulls the cursor) must miss.
+        let env = fixed(vec![("a", true, false)], |_| Value::Number(1.0));
+        let (cursor, len) = declarative_of(&env)
+            .shared_run()
+            .expect("a fixed shape has a run");
+        assert_eq!(len, 1);
+        assert!(!unsafe { (*cursor).get() }.is_null());
+        env.create_mutable_binding(&name("b"), true).unwrap();
+        let d = declarative_of(&env);
+        assert_eq!(d.slot_value(0), Some(Value::Number(1.0)));
+        assert_eq!(d.slot_value(1), None);
+        assert!(unsafe { (*cursor).get() }.is_null());
+        assert!(d.shared_run().is_none());
     }
 }
