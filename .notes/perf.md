@@ -17042,3 +17042,42 @@ What is left of the sync is therefore the reload (`LoadGlobal`+`InitLocal` per
 declared name, already inlined by the JIT) plus two `set_global_slot` helpers;
 the remaining lever there is the fused `SyncFlush` step, worth maybe 3-4 ns more.
 The bigger remaining item is still the call itself — see the frame fill above.
+
+## PROBED (2026-11-05): the `--jitless` gap, by call kind
+
+The Brimstone goal is the *interpreter*: `njit/bs` is 2-13x where `jit/bs` is
+0.10-1.9. Measured per call in `--jitless` (2M-call probes, min of 1 run each;
+`bs` for scale is 11-26 ns per call):
+
+| shape | ns/call |
+| --- | ---: |
+| script body -> leaf callee (`return n`) | 36 |
+| function body -> leaf callee | 42 |
+| function body -> non-leaf callee (a recursive chain) | **174** |
+| same loop with 10x the recursion depth | 174 (depth does not matter) |
+
+So a leaf call is ~40 ns and a call to a body that itself calls is ~174 ns —
+and the second number is *not* `ordinary_call`/the pooled Vm/`run_compiled_body`
+as the code comments suggest. A lane probe (`SLAG_LANE_PROBE`, since removed)
+counting the driver's `try_push_inline_call` outcomes over `deep.js` shows
+**2,000,000 same-stack pushes and 0 funnel misses**: the same-stack lane in
+`run_inner_impl` handles every call, so the 174 ns is that lane's own
+push/pop — `agent.same_stack_lookup`'s four-handle `SameStackEntry::clone`,
+`new_body_context`, the `ExecutionContext` push/pop, `is_control_free` (a ~20
+predicate scan), `save_scratch`/`restore_scratch` (~20 fields each way plus four
+truncates), and the `vm.stack` resize + frame fill.
+
+That reframes the interpreter slice: the target is the same-stack push/pop, not
+the funnel. The most promising piece is `save_scratch`/`restore_scratch`: a body
+that provably touches none of the saved fields (no `SwitchDisc`, no
+`BuilderBind`/`BuilderStore`/`BuilderAppend`, no `SetCompletion`/`SaveCompletion`,
+no accumulator loop, `env_constant` already asserted) could skip both — the
+callee cannot clobber what it never writes. Rows that would move: `fib` (13.2x of
+`bs`), `closures` (7.1x), `fn_arith` (4.9x — dispatch, not calls), `method`
+(4.2x), `fn_object` (4.1x), `local` (3.4x), `capture2` (3.3x).
+
+Separately, the raw dispatch floor is ~2x: `arith`'s 10M-iteration loop is
+35.5 ns/iteration against `bs`'s 17.4 (script-level) and `fn_arith`'s 34 vs 7.0
+(the same loop inside a function, where `bs`'s locals are much cheaper than its
+globals). Fixing the call path will not move those rows; they need the dispatch
+loop itself.
