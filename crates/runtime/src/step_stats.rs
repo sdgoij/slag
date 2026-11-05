@@ -253,7 +253,7 @@ pub fn tag(step: &Step) -> Bucket {
 
         Step::EnterPerIteration { .. } | Step::PerIteration { .. } => Bucket::PerIterEnv,
 
-        Step::ForInBegin
+        Step::ForInBegin { .. }
         | Step::ForInNext { .. }
         | Step::ForOfBegin { .. }
         | Step::ForOfNext { .. }

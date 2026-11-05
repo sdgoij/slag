@@ -841,7 +841,13 @@ pub enum Step {
         names: Vec<JsString>,
     },
     LeaveIterTdzEnv,
-    ForInBegin,
+    /// Opens a for-in enumeration. `top`/`end` are the loop's step span, used
+    /// to pop the state when a `break`/`continue` leaves the loop without
+    /// exhausting it (`end` is the loop's break target, exclusive).
+    ForInBegin {
+        top: usize,
+        end: usize,
+    },
     /// Cut 35 slice 18: `back` is where a successful fetch continues — the
     /// do-while loop shape's body start (the certified paths) or the next
     /// step (the generic paths, matching the old fall-through).
@@ -2182,7 +2188,7 @@ impl CompiledBody {
             matches!(
                 step,
                 Step::EnterTry { .. }
-                    | Step::ForInBegin
+                    | Step::ForInBegin { .. }
                     | Step::ForInNext { .. }
                     | Step::ForOfBegin { .. }
                     | Step::ForOfNext { .. }
@@ -2237,7 +2243,7 @@ impl CompiledBody {
             matches!(
                 step,
                 Step::EnterTry { .. }
-                    | Step::ForInBegin
+                    | Step::ForInBegin { .. }
                     | Step::ForOfBegin { .. }
                     | Step::AsyncForOfBegin { .. }
                     | Step::DestructureBegin
@@ -2705,6 +2711,12 @@ pub struct ForInState {
     pub(crate) index: usize,
     pub(crate) base_generation: u32,
     pub(crate) fast: bool,
+    /// The loop's step span (see [`Step::ForInBegin`]). A transfer whose target
+    /// falls outside it left the loop, so the enumeration must be dropped: it
+    /// is otherwise popped only on exhaustion, and a "break" would leave it on
+    /// top for the enclosing loop's `ForInNext` to consume as its own.
+    pub(crate) top: usize,
+    pub(crate) end: usize,
 }
 
 /// Whether a for-in base's own-property structure is tracked exactly by the
@@ -7821,6 +7833,23 @@ impl Vm {
         }
     }
 
+    /// Drop the for-in states of loops a `break`/`continue` exits: the
+    /// enumeration is popped only on exhaustion, so a loop abandoned
+    /// mid-iteration would otherwise leave its state on top, where the
+    /// enclosing loop's `ForInNext` would consume it — yielding the inner
+    /// loop's remaining keys as the outer loop's and never draining either.
+    ///
+    /// The span is `top..end` with `end` EXCLUSIVE: `end` is the loop's own
+    /// break target, and a `break` to it does leave the loop (the exhausted
+    /// path pops in `ForInNext` and jumps past `end`, so it never gets here).
+    fn close_for_in_upto(&mut self, target: usize) {
+        while let Some(state) = self.for_in_stack.last()
+            && !(state.top <= target && target < state.end)
+        {
+            self.for_in_stack.pop();
+        }
+    }
+
     /// Close the iterators of for-of loops a `break`/`continue` exits (the
     /// compiled `ForOfClose` at each loop's end was skipped): a loop whose
     /// `(top, end)` span does not contain the transfer target.
@@ -10723,7 +10752,7 @@ impl Vm {
                         );
                     }
                 }
-                Step::ForInBegin => {
+                Step::ForInBegin { top, end } => {
                     let rhs = self.pop();
                     if is_nullish(&rhs) {
                         // spec ForInOfHeadEvaluation step 7.a: a nullish
@@ -10738,6 +10767,8 @@ impl Vm {
                             index: 0,
                             base_generation: 0,
                             fast: false,
+                            top: *top,
+                            end: *end,
                         });
                     } else {
                         let obj = crate::context::to_object(agent, &rhs)?;
@@ -10768,6 +10799,8 @@ impl Vm {
                             index: 0,
                             base_generation: obj.generation.get(),
                             fast,
+                            top: *top,
+                            end: *end,
                         });
                     }
                 }
@@ -16596,13 +16629,19 @@ impl Vm {
                     // (spec 7.4.6).
                     if let Ctl::Return { .. } = ctl {
                         self.close_for_of_return(agent)?;
+                        // The for-in enumerations belong to this activation
+                        // too; the caller's saved control state is restored
+                        // around the call, so dropping them here is enough.
+                        self.for_in_stack.clear();
                     } else if let Ctl::Throw { .. } = ctl {
                         self.close_for_of_throw(agent);
+                        self.for_in_stack.clear();
                     } else if let Ctl::Break { target } | Ctl::Continue { target } = ctl {
                         // A break/continue whose target lies before a
                         // for-of loop's end exits it — close the iterator
                         // (the compiled ForOfClose was skipped).
                         self.close_for_of_upto(agent, target)?;
+                        self.close_for_in_upto(target);
                     }
                     return Ok(match ctl {
                         Ctl::Normal { after } => {
@@ -16749,6 +16788,7 @@ impl Vm {
                     // it: close the iterator (spec 14.7.5.6 — the throw
                     // propagates through IteratorClose before the catch runs).
                     self.close_for_of_upto(agent, catch_start)?;
+                    self.close_for_in_upto(catch_start);
                     self.ip = catch_start;
                     return Ok(CtlResult::Continue);
                 }
@@ -17898,6 +17938,10 @@ enum Fixup {
     /// `break`/`continue` whose target lies outside the loop (the transfer
     /// leaves it, skipping the compiled `ForOfClose`) closes its iterator.
     ForOfBoundary(usize, usize, usize),
+    /// The for-in loop's `(top, end)` step span, carried on `ForInBegin` so a
+    /// `break`/`continue` that leaves the loop drops its enumeration state
+    /// (`end` is the loop's break target, exclusive).
+    ForInBoundary(usize, usize, usize),
     AsyncForOfBoundary(usize, usize, usize),
     /// The fused relational-imm loop test (Cut 4): the step's `target` is
     /// resolved at compile end; op/slot/imm were fixed at emission.
@@ -19381,6 +19425,12 @@ impl Compiler {
                         *done = self.labels[&label];
                     }
                 }
+                Fixup::ForInBoundary(index, top, end) => {
+                    if let Step::ForInBegin { top: t, end: e } = &mut self.steps[index] {
+                        *t = self.labels[&top];
+                        *e = self.labels[&end];
+                    }
+                }
                 Fixup::ForOfBoundary(index, top, end) => {
                     // Preserve the compiler-assigned `cursor` (a wholesale
                     // reconstruction would reset it to `(0, 0)`).
@@ -20152,6 +20202,7 @@ impl Compiler {
             | Fixup::JumpIfNullishKeep(index, _)
             | Fixup::JumpIfNotNullishKeep(index, _) => index,
             Fixup::ForOfBoundary(index, _, _) => index,
+            Fixup::ForInBoundary(index, _, _) => index,
             Fixup::AsyncForOfBoundary(index, _, _) => index,
             Fixup::JumpIfRelImm { index, .. } => index,
             Fixup::JumpIfRelGlobalImm { index, .. } => index,
@@ -21862,14 +21913,17 @@ impl Compiler {
             self.emit_certified_for_bind(*name, *kind);
         }
         self.compile_expr(right)?;
-        self.emit(Step::ForInBegin);
-        self.compile_certified_for_loop(
+        self.emit(Step::ForInBegin { top: 0, end: 0 });
+        let begin_index = self.steps.len() - 1;
+        let (top, end) = self.compile_certified_for_loop(
             left,
             body,
             Step::ForInNext { done: 0, back: 0 },
             false,
             NO_FOR_OF_CURSOR,
         )?;
+        self.fixups
+            .push(Fixup::ForInBoundary(begin_index, top, end));
         Ok(())
     }
 
@@ -21939,7 +21993,8 @@ impl Compiler {
         let tdz = self.enter_iter_tdz_env(left);
         self.compile_expr(right)?;
         self.leave_iter_tdz_env(tdz);
-        self.emit(Step::ForInBegin);
+        self.emit(Step::ForInBegin { top: 0, end: 0 });
+        let begin_index = self.steps.len() - 1;
         let top_label = self.new_label();
         let end_label = self.new_label();
         let continue_label = self.new_label();
@@ -21988,6 +22043,8 @@ impl Compiler {
         self.place(done_label);
         self.emit(Step::NormalizeCompletion);
         self.scope_stack.pop();
+        self.fixups
+            .push(Fixup::ForInBoundary(begin_index, top_label, end_label));
         Ok(())
     }
 
@@ -25403,7 +25460,7 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             // area); `ForOfNextBindLocal` lands it in a frame slot; the
             // bind steps pop it; the env-creation steps and `ForOfClose`
             // leave the value stack as-is.
-            Step::ForInBegin | Step::ForOfBegin { .. } => depth = depth.saturating_sub(1),
+            Step::ForInBegin { .. } | Step::ForOfBegin { .. } => depth = depth.saturating_sub(1),
             Step::ForInNext { .. } | Step::ForOfNext { .. } => depth += 1,
             Step::ForOfNextBindLocal { .. } => {}
             Step::ForOfBindLocal { .. } | Step::ForOfBindGlobal { .. } => {
@@ -26349,7 +26406,7 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
                 | Step::Continue { .. }
                 // Iterator machinery: protocol calls plus the for-of/for-in
                 // stacks the caller's break/return/throw paths close.
-                | Step::ForInBegin
+                | Step::ForInBegin { .. }
                 | Step::ForInNext { .. }
                 | Step::ForInBind { .. }
                 | Step::ForInRestore

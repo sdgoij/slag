@@ -829,7 +829,7 @@ pub struct JitHelpers {
     /// slot directly, `ForOfClose` closes a generic iterator, and
     /// `EnterPerIteration`/`PerIteration` create the certified loop's
     /// per-iteration envs (step-index helpers).
-    pub for_in_begin: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub for_in_begin: Option<extern "C" fn(vm: *mut c_void, step: u64, value: u64) -> u64>,
     pub for_in_next: Option<extern "C" fn(vm: *mut c_void, stack: u64) -> u64>,
     pub for_of_begin: Option<extern "C" fn(vm: *mut c_void, step: u64, value: u64) -> u64>,
     pub for_of_next: Option<extern "C" fn(vm: *mut c_void, stack: u64) -> u64>,
@@ -1854,7 +1854,7 @@ pub extern "C" fn test_switch_test(_vm: *mut c_void, _case: u64, test: u64) -> u
 /// Cut 57 iterator-machinery doubles: the fetch helpers return 1 (element
 /// fetched — the scaffolds never dereference the stack pointer), the env
 /// creators return a marker value.
-pub extern "C" fn test_for_in_begin(_vm: *mut c_void, _value: u64) -> u64 {
+pub extern "C" fn test_for_in_begin(_vm: *mut c_void, _step: u64, _value: u64) -> u64 {
     Value::Number(91.0).bits()
 }
 

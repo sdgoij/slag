@@ -7488,6 +7488,56 @@ mod tests {
     }
 
     #[test]
+    fn a_transfer_out_of_a_for_in_drops_its_enumeration() {
+        // The state is otherwise popped only on exhaustion, so a `break` left
+        // the inner loop's state on top and the enclosing loop's `ForInNext`
+        // consumed it as its own: it yielded the inner loop's remaining keys as
+        // the outer loop's and never drained either — an infinite loop.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        // `break` out of the inner loop: three outer iterations, one inner each.
+        assert_eq!(
+            agent
+                .run_script(
+                    "var o = { a: 1, b: 2, c: 3 }; var n = 0;\n\
+                     for (var i in o) { for (var j in o) { n++; break; } } n"
+                )
+                .unwrap(),
+            Value::Number(3.0)
+        );
+        // A throw caught between the two loops leaves the inner one, and the
+        // outer loop must still see its own enumeration.
+        assert_eq!(
+            agent
+                .run_script(
+                    "var o2 = { a: 1, b: 2 }; var n2 = 0;\n\
+                     for (var i2 in o2) {\n\
+                       try { for (var j2 in o2) throw 1; } catch (e) { n2 += 10; }\n\
+                     } n2"
+                )
+                .unwrap(),
+            Value::Number(20.0)
+        );
+        // Inside a function body, so the state must not survive the activation.
+        assert_eq!(
+            agent
+                .run_script(
+                    "var o3 = { a: 1, b: 2, c: 3 };\n\
+                     function g() {\n\
+                       var r = 0;\n\
+                       for (var i3 in o3) {\n\
+                         try { for (var j3 in o3) throw 1; } catch (e) { r++; }\n\
+                       }\n\
+                       return r;\n\
+                     }\n\
+                     g() + ',' + g()"
+                )
+                .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("3,3")))
+        );
+    }
+
+    #[test]
     fn fast_script_bails_preserve_env_behavior() {
         // try/catch (a catch param shadows a same-named global), `with`,
         // and direct eval all fall back to the env path and keep their

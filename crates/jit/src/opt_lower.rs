@@ -1524,14 +1524,18 @@ fn lower_inst(
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
         Op::ForInBegin => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:for-in-begin"));
+            };
             let rhs = arg!(0);
+            let step_imm = builder.ins().iconst(types::I64, step as i64);
             call_helper(
                 builder,
                 helpers,
                 abi,
-                abi.sig_bool,
+                abi.sig_unary,
                 Helper::ForInBegin,
-                &[rhs],
+                &[step_imm, rhs],
             )?;
             builder
                 .ins()

@@ -693,7 +693,7 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         // local bind pops the element, and the close is net-neutral. The
         // fetches are terminators (`jump_target`); their body delta is 0 and
         // their element edge's +1 is handled in `stack_depths`.
-        Step::ForOfBegin { .. } | Step::ForInBegin | Step::ForOfBindLocal { .. } => -1,
+        Step::ForOfBegin { .. } | Step::ForInBegin { .. } | Step::ForOfBindLocal { .. } => -1,
         Step::ForOfClose
         | Step::ForOfNext { .. }
         | Step::ForInNext { .. }
@@ -1739,14 +1739,14 @@ fn emit_step(
                 Imm::Int(index as i32),
             );
         }
-        Step::ForInBegin => {
+        Step::ForInBegin { .. } => {
             let rhs = stack.pop().ok_or(Unsupported::Stack)?;
             builder.emit_void(
                 block,
                 Op::ForInBegin,
                 &[rhs],
                 Op::ForInBegin.default_effects(),
-                Imm::None,
+                Imm::Int(index as i32),
             );
         }
         Step::ForOfBindLocal { slot } => {

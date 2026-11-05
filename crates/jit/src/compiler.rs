@@ -746,6 +746,11 @@ struct Lowerer<'a> {
     /// iterators before the body returns (the callee Vm's stacks are
     /// discarded on the error surface).
     has_for_of: bool,
+    /// Whether the body contains for-in machinery (`ForInBegin`). A
+    /// `break`/`continue`/`return` leaving a for-in loop drops its enumeration
+    /// state (the interpreter's `close_for_in_upto`), so those transfers route
+    /// through the control helpers instead of a direct `ip = target` jump.
+    has_for_in: bool,
     /// G18: whether the body contains for-await-of machinery
     /// (`AsyncForOfBegin`/the fetch steps). `close_for_of_upto` — the
     /// `Break`/`Continue` transfer's iterator close — pops the async for-of
@@ -905,6 +910,14 @@ impl<'a> Lowerer<'a> {
                 Step::ForOfBegin { .. } | Step::ForOfNext { .. } | Step::ForOfNextBindLocal { .. }
             )
         });
+        // A `break`/`continue`/`return` leaving a for-in loop must drop its
+        // enumeration state (the interpreter's `close_for_in_upto`); the
+        // `ip = target` jump would skip it and leave the state on top for the
+        // enclosing loop's fetch. Route those transfers through the helpers.
+        let has_for_in = body
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::ForInBegin { .. }));
         let has_async_for_of = body
             .steps
             .iter()
@@ -1053,6 +1066,7 @@ impl<'a> Lowerer<'a> {
             sig_entry,
             has_try,
             has_for_of,
+            has_for_in,
             has_async_for_of,
             has_destructure,
             has_suspension,
@@ -8467,7 +8481,7 @@ impl<'a> Lowerer<'a> {
             }
             Step::Return => {
                 let value = self.pop();
-                if self.has_try || self.has_for_of {
+                if self.has_try || self.has_for_of || self.has_for_in {
                     // A return inside a try must run any finally first
                     // (and a finally's pending-return overrides an outer
                     // control); a return in a for-of body must close the
@@ -8491,7 +8505,7 @@ impl<'a> Lowerer<'a> {
                 // a `Break`), the transfer is exactly `ip = target` — jump
                 // directly, skipping the helper call and its epoch bump (the
                 // dispatch mutated no stack the leaf-call probe reads).
-                if !self.has_try && !self.has_for_of && !self.has_async_for_of {
+                if !self.has_try && !self.has_for_of && !self.has_async_for_of && !self.has_for_in {
                     let block = self.ensure_block(*target);
                     self.builder.ins().jump(block, &[]);
                 } else {
@@ -8505,7 +8519,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Step::Continue { target } => {
-                if !self.has_try && !self.has_for_of && !self.has_async_for_of {
+                if !self.has_try && !self.has_for_of && !self.has_async_for_of && !self.has_for_in {
                     let block = self.ensure_block(*target);
                     self.builder.ins().jump(block, &[]);
                 } else {
@@ -8888,9 +8902,11 @@ impl<'a> Lowerer<'a> {
             // pops the boundary + iterator. `EnterPerIteration`/
             // `PerIteration` create the certified loop's per-iteration envs
             // (step-index helpers, the Cut 44 pattern).
-            Step::ForInBegin => {
+            Step::ForInBegin { .. } => {
                 let value = self.pop();
-                let _res = self.call_slow(self.sig_bool, Helper::ForInBegin, &[value])?;
+                let step_imm = self.builder.ins().iconst(types::I64, index as i64);
+                let _res =
+                    self.call_slow(self.sig_get_name, Helper::ForInBegin, &[step_imm, value])?;
                 self.fall_through(index);
             }
             Step::ForInNext { done, back } => {

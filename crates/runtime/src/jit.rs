@@ -1209,7 +1209,7 @@ pub struct JitSlowPaths {
     pub switch_test: extern "C" fn(ctx: *mut c_void, case: u64, test: u64) -> u64,
     /// `Step::ForInBegin` (Cut 57): push a for-in enumeration state for the
     /// RHS (a nullish RHS pushes an empty-key state so the loop is skipped).
-    pub for_in_begin: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    pub for_in_begin: extern "C" fn(ctx: *mut c_void, step: u64, value: u64) -> u64,
     /// `Step::ForInNext` (Cut 57): advance the innermost for-in enumeration;
     /// on a live key, write it at `stack[0]` and return 1; on exhaustion,
     /// pop the state and return 0.
@@ -5371,15 +5371,23 @@ extern "C" fn switch_test(ctx: *mut c_void, case: u64, test: u64) -> u64 {
 
 // ----- Cut 57: for-in / for-of + per-iteration envs -----
 
-extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
+extern "C" fn for_in_begin(ctx: *mut c_void, step: u64, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let vm = unsafe { &mut *ctx.vm };
+    let Some(crate::ir::Step::ForInBegin { top, end }) = step_at(ctx, step) else {
+        unreachable!("for_in_begin on a non-ForInBegin step");
+    };
+    // The fixup-patched span drives `close_for_in_upto` on a transfer that
+    // leaves the loop (the compiled `Break`/`Continue`/`Return` route through
+    // the interpreter's control helpers, which run it).
+    let (top, end) = (*top, *end);
     let rhs = Value::from_bits(value);
     if crate::expr::is_nullish(&rhs) {
         // spec ForInOfHeadEvaluation step 7.a: a nullish exprValue is a
-        // break completion — the loop is skipped, not an error. The
-        // empty-key state makes ForInNext pop straight to the done label.
+        // break completion — the loop is skipped, not an error (the S12.6.4
+        // and cptn-skip fixtures). The empty-key state makes ForInNext pop
+        // straight to the done label.
         let dummy = crux::object::JsObject::ordinary_object_create(None);
         vm.for_in_stack.push(crate::ir::ForInState {
             base: dummy,
@@ -5387,6 +5395,8 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
             index: 0,
             base_generation: 0,
             fast: false,
+            top,
+            end,
         });
         return Value::Undefined.bits();
     }
@@ -5432,6 +5442,8 @@ extern "C" fn for_in_begin(ctx: *mut c_void, value: u64) -> u64 {
         index: 0,
         base_generation: obj.generation.get(),
         fast,
+        top,
+        end,
     });
     Value::Undefined.bits()
 }
