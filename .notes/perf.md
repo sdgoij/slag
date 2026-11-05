@@ -17068,13 +17068,33 @@ predicate scan), `save_scratch`/`restore_scratch` (~20 fields each way plus four
 truncates), and the `vm.stack` resize + frame fill.
 
 That reframes the interpreter slice: the target is the same-stack push/pop, not
-the funnel. The most promising piece is `save_scratch`/`restore_scratch`: a body
-that provably touches none of the saved fields (no `SwitchDisc`, no
-`BuilderBind`/`BuilderStore`/`BuilderAppend`, no `SetCompletion`/`SaveCompletion`,
-no accumulator loop, `env_constant` already asserted) could skip both — the
-callee cannot clobber what it never writes. Rows that would move: `fib` (13.2x of
-`bs`), `closures` (7.1x), `fn_arith` (4.9x — dispatch, not calls), `method`
-(4.2x), `fn_object` (4.1x), `local` (3.4x), `capture2` (3.3x).
+the funnel — the same-stack lane is genuinely better (forcing the funnel on the
+same probe costs +38%), so going back is not an option.
+
+Two cuts were then ablated on one release build (min of 3, same session):
+
+| `--jitless` probe | base | scratch value restore skipped | forced funnel |
+| --- | ---: | ---: | ---: |
+| `deep` (2M calls, depth 1000) | 454 | 450 (-1%) | 625 (+38%) |
+| `shallow` (2.2M calls, depth 10) | 528 | 518 (-2%) | 627 (+19%) |
+
+So skipping `save_scratch`/`restore_scratch`'s value fields for a
+scratch-free callee — the plan this section first proposed — is **not worth
+doing**: it is under 2% of the call. The remaining ~130 ns over a leaf call is
+spread across the lookup/clone, `check_value_stack`, `new_body_context`, the
+`ExecutionContext` push/pop, `is_control_free`, the frame fill, the
+`inline_calls` push, the field rebinds, the `global_reads_are_unshadowed` walk,
+`clear_control_state`, and the **big dispatch loop** the callee then runs.
+
+The existence proof for the last of those is the leaf lane: a leaf body of the
+same shape costs 42 ns because `lower_leaf_ops_segmented` turns it into a
+compact register op list run by a tight trip-counted loop, not by the step
+dispatch. A non-leaf body runs the big loop. That, not the push/pop, is where
+the headroom is — and it is the same lever as the separate dispatch floor
+below (`arith` 35.5 ns/iteration against `bs`'s 17.4). Next slice: measure the
+push/pop's share directly (instrument the driver with a counter, as the lane
+probe did) and, if the dispatch dominates, extend the register executor to the
+straight-line segments of non-leaf bodies.
 
 Separately, the raw dispatch floor is ~2x: `arith`'s 10M-iteration loop is
 35.5 ns/iteration against `bs`'s 17.4 (script-level) and `fn_arith`'s 34 vs 7.0
