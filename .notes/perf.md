@@ -16971,3 +16971,53 @@ Still behind `bs` after it: `method` 3.69 (blocked on the function-expression
 value in `Point.prototype.get = function () {…}`, which `script_slots_expr_allows`
 rejects — the closure could escape and be invoked implicitly, outside a sync
 point), then the call rows.
+
+## PROBED (2026-11-05): where the call rows' time goes
+
+The four rows still behind `bs` after the certification work (`method` 1.88,
+`fib` 1.68-1.76, `closures` 1.64, `fn_object` 1.74) are all one shape: a call in
+a hot loop, at 20-50 ns per call. Decomposed by probe (release, min of 5, each
+2M iterations; the scripts differ only in the call):
+
+| shape | ms | ns/iter |
+| --- | ---: | ---: |
+| `s += p.x` — no call at all (script-level, certified) | 6 | 3 |
+| `s += get(p)` — call to a certified top-level fn, so NO sync | 21 | 10.5 |
+| `s += p.get()` — member call, so a sync each iteration | 98 | 49 |
+| the same loop inside a function body (no script sync applies) | 57 | 28 |
+
+So the certified-script **sync costs ~21 ns per iteration**, and the compiled
+member call itself ~28 ns. Two independent levers, both helper-bound:
+
+- **The sync is 4 `SetGlobalSlot` helper calls per iteration.** The emitted
+  sequence (see `--print-bytecode` on `method.js`, steps 52-68) is
+  `LoadLocal+StoreGlobal` for each *assigned* name, then `LoadGlobal+InitLocal`
+  for each *declared* one. The loads are inlined by the JIT (the global-value
+  cell), the frame stores are one instruction, but each `StoreGlobal` ends in
+  `set_global_slot` (the property-vector write cannot be inlined). Four FFI
+  round trips is the whole 21 ns. Two ways out, independent: (a) flush only the
+  names **dirty** since the previous sync — a loop that contains a sync point
+  can flush the whole assigned set once in its pre-header, after which the
+  in-loop sync only owes the names the loop itself assigns (`s`, `i` here, so
+  4 helpers -> 2); (b) one fused `SyncFlush`/`SyncReload` step, which makes it
+  one helper instead of four. Neither touches the JIT's SSA tier.
+- **The call itself is ~28 ns for a leaf callee with a 1-slot frame.** The
+  helper census for that shape (`JIT_HELPER_STATS=1`, 7 runs x 2M) is
+  `GetMemberName` 14M + `LeafCallFill` 14M and nothing else, i.e. two FFI calls
+  per iteration (~10 ns) on top of the entry call. A monomorphic member read
+  still calls the helper every time — the read cell never caches for this shape
+  — and the leaf frame fill is a helper because the *callee* is dynamic so its
+  `frame_size` is not a compile-time constant. The structural fix is the same
+  for both: emit the member-read cell re-validation inline and, for a callee the
+  site can prove (a self-call, or a certified verdict already in the call-site
+  record), fill the frame in machine code. That is a bigger slice than the sync
+  one and it touches the leaf lane's ABI.
+
+Also worth recording: `SLAG_OPT=0` is **equal or faster** on all four rows
+(`fib` 77 vs 72, `closures` 33 vs 36, `fn_object` 32 vs 34, `method` 100 vs 99),
+and `SLAG_INLINE=1` changes nothing. The optimizing tier is not contributing to
+call-heavy code; the baseline per-step tier is what these rows measure.
+
+Order: (1) the sync narrowing above — it is compiler-only and returns ~10 ns of
+the 21; (2) the inline frame fill / member-read cell; (3) whatever the
+optimizing tier needs to actually take these bodies.
