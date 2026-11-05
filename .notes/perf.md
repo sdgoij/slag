@@ -17123,3 +17123,23 @@ Separately, the raw dispatch floor is ~2x: `arith`'s 10M-iteration loop is
 (the same loop inside a function, where `bs`'s locals are much cheaper than its
 globals). Fixing the call path will not move those rows; they need the dispatch
 loop itself.
+
+## LANDED (2026-11-05): an unregistered call verdict is cached
+
+`Agent::builtin_call_lookup`'s miss path returned `BuiltinCall::Other` without
+storing it, so **every** non-leaf `EcmaScript` call re-ran the miss path — a
+thread-local `BUILTIN_HANDLERS` probe (a `RefCell` borrow plus a SipHash over
+the id) and a `builtin_dispatch_cache` lookup — only to be told the callee is
+not a builtin. An rdtsc probe around `do_call_fast` (2M-call `--jitless`
+recursion) measures the call step at **147.4 -> 84.6 cycles per call** (-43%,
+~21 ns at 3 GHz). `fib` njit 473 ms (12.1x of `bs`), from ~500.
+
+This was found by instrumenting rather than ablating: the earlier ablations of
+`save_scratch`/`restore_scratch` and the `ExecutionContext` push both broke
+invariants, while rdtsc attribution showed the truth in one build — scratch 1
+cycle/call (so the "scratch-free callee" idea above is dead), frame push 93 and
+pop 36, and the call step 147, the largest single item.
+
+Verified: clippy -D warnings, fmt, cargo test --workspace, test262 language
+23726/23726 + annexB 1086/1086 + built-ins 23821/23821, corpus 79/79 with 0
+mismatches.

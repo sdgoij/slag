@@ -3092,7 +3092,12 @@ impl Agent {
                 crate::function::BuiltinCall::Other
             }
         } else {
-            return crate::function::BuiltinCall::Other;
+            // An unregistered id — an `EcmaScript` body's — is `Other`, and
+            // caching that verdict is what keeps the miss path (a thread-local
+            // registry probe, a `RefCell` and a SipHash over the id) off the
+            // hot non-leaf call. The cell is direct-mapped on a hash of the id,
+            // so a collision evicts, exactly as for a builtin's verdict.
+            crate::function::BuiltinCall::Other
         };
         self.builtin_call_cells[index] = Some((id, call));
         call
