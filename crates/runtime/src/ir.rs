@@ -9177,22 +9177,9 @@ impl Vm {
                     // (two tag checks + a direct op) — the general evaluator
                     // adds a call and the RHS tag check for no semantic gain.
                     let value = if let Some(num) = left.as_number() {
-                        match op {
-                            BinaryOp::Add => Value::Number(num + *imm),
-                            BinaryOp::Sub => Value::Number(num - *imm),
-                            BinaryOp::Mul => Value::Number(num * *imm),
-                            BinaryOp::Div => Value::Number(num / *imm),
-                            BinaryOp::Rem => Value::Number(num % *imm),
-                            BinaryOp::Exp => Value::Number(num.powf(*imm)),
-                            // A relational on two Numbers is the plain f64
-                            // comparison, NaN included (the general evaluator
-                            // reaches the same answer through ToPrimitive and
-                            // a call, which `n < 2` in a hot body cannot afford).
-                            BinaryOp::LessThan => Value::Boolean(num < *imm),
-                            BinaryOp::LessEqual => Value::Boolean(num <= *imm),
-                            BinaryOp::GreaterThan => Value::Boolean(num > *imm),
-                            BinaryOp::GreaterEqual => Value::Boolean(num >= *imm),
-                            _ => {
+                        match imm_binary_inline(*op, num, *imm) {
+                            Some(value) => value,
+                            None => {
                                 crate::expr::apply_binary(agent, *op, &left, &Value::Number(*imm))?
                             }
                         }
@@ -13661,14 +13648,9 @@ impl Vm {
                     let value = if let Some(value) = smi_value {
                         value
                     } else if let Some(num) = self.acc.as_number() {
-                        match op {
-                            BinaryOp::Add => Value::Number(num + imm),
-                            BinaryOp::Sub => Value::Number(num - imm),
-                            BinaryOp::Mul => Value::Number(num * imm),
-                            BinaryOp::Div => Value::Number(num / imm),
-                            BinaryOp::Rem => Value::Number(num % imm),
-                            BinaryOp::Exp => Value::Number(num.powf(*imm)),
-                            _ => crate::expr::apply_binary(
+                        match imm_binary_inline(*op, num, *imm) {
+                            Some(value) => value,
+                            None => crate::expr::apply_binary(
                                 agent,
                                 *op,
                                 &self.acc,
@@ -17189,6 +17171,45 @@ fn truthy(value: &Value) -> bool {
         ValueKind::Boolean(b) => b,
         _ => crux::convert::to_boolean(value),
     }
+}
+
+/// The number-number immediate-RHS inline shared by `Step::BinaryImm` and
+/// `LeafOp::BinImm` (which mirrors it): the arithmetic shapes plus the bitwise
+/// ones. `apply_binary` has the same number fast path, but reaching it costs a
+/// call chain per evaluation — `i & MASK` in an index loop paid ~120 Ir for what
+/// is two ToInt32 conversions and an `and`.
+///
+/// `#[inline(always)]` because the caller's fallback is `apply_binary`'s call
+/// chain: an outlined copy would hand every non-inlined op (a relational, a
+/// BigInt operand) the `Option` round-trip it exists to avoid. Only two sites
+/// inline it, so the code growth is bounded.
+#[inline(always)]
+fn imm_binary_inline(op: BinaryOp, left: f64, imm: f64) -> Option<Value> {
+    let to_int32 = crux::convert::to_int32;
+    let to_uint32 = |value: f64| crux::convert::to_int32(value) as u32;
+    Some(match op {
+        BinaryOp::Add => Value::Number(left + imm),
+        BinaryOp::Sub => Value::Number(left - imm),
+        BinaryOp::Mul => Value::Number(left * imm),
+        BinaryOp::Div => Value::Number(left / imm),
+        BinaryOp::Rem => Value::Number(left % imm),
+        BinaryOp::Exp => Value::Number(left.powf(imm)),
+        // Two Numbers: `Abstract Relational Comparison` is the plain f64
+        // comparison (NaN included — every relational is false).
+        BinaryOp::LessThan => Value::Boolean(left < imm),
+        BinaryOp::LessEqual => Value::Boolean(left <= imm),
+        BinaryOp::GreaterThan => Value::Boolean(left > imm),
+        BinaryOp::GreaterEqual => Value::Boolean(left >= imm),
+        BinaryOp::BitAnd => Value::Number((to_int32(left) & to_int32(imm)) as f64),
+        BinaryOp::BitOr => Value::Number((to_int32(left) | to_int32(imm)) as f64),
+        BinaryOp::BitXor => Value::Number((to_int32(left) ^ to_int32(imm)) as f64),
+        BinaryOp::LeftShift => Value::Number((to_int32(left) << (to_uint32(imm) & 0x1F)) as f64),
+        BinaryOp::RightShift => Value::Number((to_int32(left) >> (to_uint32(imm) & 0x1F)) as f64),
+        BinaryOp::UnsignedRightShift => {
+            Value::Number((to_uint32(left) >> (to_uint32(imm) & 0x1F)) as f64)
+        }
+        _ => return None,
+    })
 }
 
 /// Split an array/object element into its target and optional default

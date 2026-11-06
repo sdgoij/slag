@@ -17450,3 +17450,39 @@ agree with the general path.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79, jit == jitless == the previous commit.
+
+## LANDED (2026-11-06): the immediate-RHS inline covers the bitwise ops
+
+`Step::BinaryImm` and `LeafOp::BinImm` each carried their own copy of a
+six-arm number-number inline (add/sub/mul/div/rem/exp) and fell to
+`apply_binary` for everything else. `apply_binary` has the identical number
+fast path — but reaching it costs a call chain per evaluation, and an index
+loop writes `i & MASK` every iteration: `arith`'s body is
+`k = i & 1023; s = (s + k) | 0` (two bitwise immediates) and `closures` keys its
+polymorphic call with `fns[i & 63]`.
+
+The two mirrors now share `imm_binary_inline`, which adds the four relationals
+(restoring what the earlier `fib` work put in `Step::BinaryImm`) and the six
+bitwise ops, mirroring `expr::bitwise_binary`'s own number fast path
+(`ToInt32`/`ToUint32`, the shift count masked to five bits).
+
+**The helper needs `#[inline(always)]`, and the first cut proved it.**
+Extracted with a plain `#[inline]` it measured `fib` +6.2% *instructions*
+(321.09M -> 341.03M, callgrind): `fib`'s `n < 2` is a relational, which the
+helper answers with `None`, so every evaluation paid an outlined call plus the
+`Option` round-trip before `apply_binary`. With `#[inline(always)]` `fib` is
+back to parity (321.11M) and only two sites grow. Measured against the parent:
+
+- `closures`: 1,403.7M -> 1,323.7M Ir (**-5.7%**), 86 -> 84 ms.
+- `arith`: 266 -> 219 ms (**-18%**).
+- `fib`: Ir parity (321.09M -> 321.11M), wall parity.
+- every other row within noise.
+
+Differential against the parent (`jit` and `--jitless`): 12 edge-case operands
+(`NaN`, `±Infinity`, `-0`-adjacent fractions, `2^31`, `-2^31-1`, `2^32+...`,
+`1e21`) x 10 immediates x 18 expression shapes (the six bitwise ops, shifts with
+out-of-range counts, the four relationals) — identical results.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79, jit == jitless == the previous commit.
