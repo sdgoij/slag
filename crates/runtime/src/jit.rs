@@ -6882,6 +6882,21 @@ pub fn resolve_callee(id: u64) -> Option<ResolvedCallee> {
 /// hook is not reconsulted. `in_flight` is forwarded to the cache — its
 /// eviction policy must not free an entry a running frame holds. Returns
 /// null when the body has no compiled code.
+/// Record one entry into a compiled body, for the JIT cache's eviction policy
+/// (see [`CompiledBody::jit_used`]). The cache never sees a warm call — a set
+/// `jit_info` pointer short-circuits every consult — so the call path is the
+/// only place that can say which bodies are still in use. The counter lives
+/// in the body record, on the cache line the `jit_info` read has already
+/// touched, and saturates rather than wrapping (the cache halves every
+/// counter on each turnover, so saturation is not reachable in practice).
+#[inline(always)]
+fn note_body_use(body: &CompiledBody) {
+    let used = body.jit_used.get();
+    if used < u32::MAX {
+        body.jit_used.set(used + 1);
+    }
+}
+
 pub(crate) fn lookup_info(
     hook: crate::jit::JitHook,
     ir: &std::rc::Rc<CompiledBody>,
@@ -6889,6 +6904,7 @@ pub(crate) fn lookup_info(
 ) -> *const JitCompiledInfo {
     let known = ir.jit_info.get();
     if known > 1 {
+        note_body_use(ir);
         known as *const JitCompiledInfo
     } else if known == 0 {
         // The compile-size cap (Cut 92): a body this large is never compiled.
@@ -7986,6 +8002,7 @@ mod tests {
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
+            jit_used: std::cell::Cell::new(0),
             ident_names: Vec::new(),
             has_loop,
             has_call_apply: false,
