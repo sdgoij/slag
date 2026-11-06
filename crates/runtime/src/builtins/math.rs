@@ -553,7 +553,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
             "pow",
             2,
             Box::new(|_, _: &Value, args: &[Value]| {
-                Ok(Value::Number(crux::number::exponentiate(
+                Ok(Value::Number(crate::expr::number_exponentiate(
                     arg(args, 0)?,
                     arg(args, 1)?,
                 )))

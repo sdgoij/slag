@@ -143,20 +143,6 @@ pub fn remainder(a: f64, b: f64) -> f64 {
     a % b
 }
 
-/// spec 6.1.6.1.6 Number::exponentiate, with the NaN/±0/infinite special cases.
-pub fn exponentiate(base: f64, exponent: f64) -> f64 {
-    if exponent.is_nan() {
-        return f64::NAN;
-    }
-    if exponent == 0.0 {
-        return 1.0;
-    }
-    if (base == 1.0 || base == -1.0) && exponent.is_infinite() {
-        return f64::NAN;
-    }
-    base.powf(exponent)
-}
-
 /// spec 6.1.6.1.7 Number::unaryMinus.
 pub fn unary_minus(x: f64) -> f64 {
     -x
@@ -1124,19 +1110,6 @@ mod tests {
         assert_eq!(remainder(-5.0, 2.0), -1.0);
         assert_eq!(remainder(5.0, -2.0), 1.0);
         assert!(remainder(5.0, 0.0).is_nan());
-    }
-
-    #[test]
-    fn exponentiate_special_cases() {
-        assert_eq!(exponentiate(2.0, 3.0), 8.0);
-        assert_eq!(exponentiate(2.0, 0.0), 1.0);
-        assert!(exponentiate(f64::NAN, 0.0) == 1.0);
-        assert!(exponentiate(1.0, f64::INFINITY).is_nan());
-        assert!(exponentiate(-1.0, f64::INFINITY).is_nan());
-        assert!(exponentiate(0.5, f64::INFINITY) == 0.0);
-        assert!(exponentiate(2.0, f64::INFINITY).is_infinite());
-        assert!(exponentiate(-2.0, 2.5).is_nan());
-        assert!(exponentiate(f64::NAN, 5.0).is_nan());
     }
 
     #[test]

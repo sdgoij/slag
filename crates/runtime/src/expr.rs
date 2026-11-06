@@ -1611,11 +1611,11 @@ fn bigint_shifted_floor(x: &crux::BigInt, shift: i64) -> crux::BigInt {
     }
 }
 
-/// Number::exponentiate (spec 6.1.6.1.8): a NaN base or exponent is NaN
-/// unless the exponent is ±0 (which yields 1), and an infinite exponent with
-/// |base| = 1 is NaN (Rust's `powf` returns 1 for those cases). The register
-/// lane's number inlines (`binary_inline`/`imm_binary_inline`) call this too —
-/// `powf` alone is not the spec's operation.
+/// Number::exponentiate (spec 6.1.6.1.8), with the NaN/±0/infinite special
+/// cases: an infinite exponent with |base| = 1 is NaN, `1 ** NaN` is NaN, and
+/// `NaN ** 0` is 1 (Rust's `powf` disagrees on the first two). The number
+/// inlines (`binary_inline`/`imm_binary_inline`) call this rather than `powf`,
+/// and `Math.pow` calls it too, so the three cannot drift.
 pub(crate) fn number_exponentiate(base: f64, exponent: f64) -> f64 {
     if exponent == 0.0 {
         return 1.0;
@@ -2562,5 +2562,28 @@ pub fn get_method(
             ErrorKind::TypeError,
             format!("{symbol_name} is not a function"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::number_exponentiate;
+
+    #[test]
+    fn number_exponentiate_special_cases() {
+        assert_eq!(number_exponentiate(2.0, 3.0), 8.0);
+        assert_eq!(number_exponentiate(2.0, 0.0), 1.0);
+        assert_eq!(number_exponentiate(f64::NAN, 0.0), 1.0);
+        assert_eq!(number_exponentiate(f64::NAN, -0.0), 1.0);
+        assert!(number_exponentiate(1.0, f64::INFINITY).is_nan());
+        assert!(number_exponentiate(-1.0, f64::INFINITY).is_nan());
+        assert!(number_exponentiate(1.0, f64::NEG_INFINITY).is_nan());
+        assert!(number_exponentiate(1.0, f64::NAN).is_nan());
+        assert_eq!(number_exponentiate(0.5, f64::INFINITY), 0.0);
+        assert_eq!(number_exponentiate(0.5, f64::NEG_INFINITY), f64::INFINITY);
+        assert_eq!(number_exponentiate(2.0, f64::INFINITY), f64::INFINITY);
+        assert_eq!(number_exponentiate(2.0, f64::NEG_INFINITY), 0.0);
+        assert!(number_exponentiate(-2.0, 2.5).is_nan());
+        assert!(number_exponentiate(f64::NAN, 5.0).is_nan());
     }
 }

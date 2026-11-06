@@ -17891,3 +17891,26 @@ default-mode language/annexB/built-ins 23726/1086/23821; corpus 79/79 identical
 in both modes. Pinned by `eval::tests::the_number_exponentiate_inlines_keep_the_specials`,
 which drives `Step::Binary`, `BinaryImm`, the register `BinConst` arm, and
 `Math.pow` through both the specials and the cases that were always right.
+
+## CLEANED UP (2026-11-06): one Number::exponentiate, not two
+
+The exp fix left `Number::exponentiate` implemented twice — `crux::number::exponentiate`
+(used by `Math.pow`) and `runtime::expr::number_exponentiate` (used by
+`apply_binary` and the number inlines). They agreed, but two copies of one spec
+clause is how the `--jitless` divergence happened in the first place, so the
+`crux` copy is gone: `expr::number_exponentiate` is the single implementation
+and `Math.pow` calls it.
+
+Which copy survives is a codegen question, not a taste one. Deleting the
+`runtime` copy and calling `crux`'s (with or without `#[inline]` to export its
+MIR) cost `local` +1.0% cycles / +0.7% instructions and `arith` +1.5% / -0.2%
+— the `Exp` arm lives inside `binary_inline`, which is `#[inline(always)]` into
+every register op, so moving the callee shifts that whole function's layout.
+Keeping the in-crate copy and deleting `crux`'s is instruction-identical to the
+fix commit (`local` 2,058.3M, `arith` 4,234.1M, both unchanged in 3/3
+interleaved runs). The unit test moved to `expr::tests` and gained `1 ** NaN`,
+`1 ** -Infinity`, `0.5 ** -Infinity`, and `NaN ** -0`.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821 in BOTH modes; corpus 79/79 identical in both modes.
