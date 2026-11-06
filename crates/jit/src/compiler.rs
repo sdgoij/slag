@@ -10404,12 +10404,18 @@ impl<'a> Lowerer<'a> {
                 }
                 self.set_acc_bits(bits);
             }
-            LeafOp::LoadContext { index } => {
-                // Depth-0 capture-context read through the run cache.
+            LeafOp::LoadContext { depth, index } => {
+                // Depth-0 capture-context read through the run cache. A
+                // depth>0 read only appears in a whole-body leaf program,
+                // which the interpreter runs itself (a `RunRegBody` loop
+                // body's lowering keeps depth 0).
+                if *depth != 0 {
+                    return Err(Unsupported::Step("RunRegBody"));
+                }
                 let res = self.emit_context_slot_read(
                     VM_CTX_RUN_OFFSET,
                     true,
-                    *index,
+                    *index as usize,
                     Helper::LoadContext,
                 )?;
                 self.set_acc_bits(res);
@@ -10451,13 +10457,16 @@ impl<'a> Lowerer<'a> {
                 // until the loop-carried analysis (slice B).
                 self.emit_acc_binary(*op, left, BinForm::Bits(right), left_known, false)?;
             }
-            LeafOp::BinContext { op, index } => {
+            LeafOp::BinContext { op, depth, index } => {
                 // `acc = acc op context[index]` (the fused `LoadContext` +
                 // binary — the register executor's evaluation order).
+                if *depth != 0 {
+                    return Err(Unsupported::Step("RunRegBody"));
+                }
                 let right = self.emit_context_slot_read(
                     VM_CTX_RUN_OFFSET,
                     true,
-                    *index,
+                    *index as usize,
                     Helper::LoadContext,
                 )?;
                 let left_known = self.acc_is_number;
@@ -10478,12 +10487,16 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::BinCtxReg {
                 op,
+                depth,
                 index,
                 slot,
                 tdz,
             } => {
                 // `acc = context[index] op frame[slot]` (captured left,
                 // frame-slot right — the step path's evaluation order).
+                if *depth != 0 {
+                    return Err(Unsupported::Step("RunRegBody"));
+                }
                 let left = self.emit_context_slot_read(
                     VM_CTX_RUN_OFFSET,
                     true,
@@ -11255,10 +11268,20 @@ impl<'a> Lowerer<'a> {
                 self.store_slot(*slot, new_value);
                 Ok(old)
             }
-            RegOperand::Ctx { index } => {
+            RegOperand::Ctx { depth, index } => {
                 // A captured binding as a member key/value: the depth-0 context
-                // read through the run cache.
-                self.emit_context_slot_read(VM_CTX_RUN_OFFSET, true, *index, Helper::LoadContext)
+                // read through the run cache. A depth>0 operand only appears
+                // in a whole-body leaf program, which the interpreter runs
+                // itself (a `RunRegBody` loop body's lowering keeps depth 0).
+                if *depth != 0 {
+                    return Err(Unsupported::Leaf("outer context operand"));
+                }
+                self.emit_context_slot_read(
+                    VM_CTX_RUN_OFFSET,
+                    true,
+                    *index as usize,
+                    Helper::LoadContext,
+                )
             }
             RegOperand::PerIter { index } => {
                 // A captured for-head binding as a member key/value.

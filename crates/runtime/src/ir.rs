@@ -1460,8 +1460,11 @@ pub enum LeafOp {
     /// uninitialized-binding check (a `let`/`const` slot before its
     /// initializer).
     LoadReg { slot: usize, tdz: bool },
-    /// acc = the leaf's capture-context slot (depth-0 `LoadContextSlot`).
-    LoadContext { index: usize },
+    /// acc = the leaf's capture-context slot, `depth` hops out from the
+    /// leaf's `body_context` (0 = its own context; the whole-body lowering
+    /// also admits an enclosing certified body's, which a `RunRegBody` loop
+    /// body never carries).
+    LoadContext { depth: u32, index: u32 },
     /// acc = the leaf's per-iteration slot (depth-0 `LoadPerIteration`).
     LoadPerIter { index: usize },
     /// acc = the accumulator-loop counter (Cut 35 slice 16/21: a body's
@@ -1483,8 +1486,12 @@ pub enum LeafOp {
     /// operands are not both strings, falls back to the exact generic
     /// `slot = slot + acc` (materializing the builder first).
     BuilderAppend { slot: usize },
-    /// acc = acc op context[slot].
-    BinContext { op: BinaryOp, index: usize },
+    /// acc = acc op context[depth][slot].
+    BinContext {
+        op: BinaryOp,
+        depth: u32,
+        index: u32,
+    },
     /// acc = acc op per-iteration[slot].
     BinPerIter { op: BinaryOp, index: usize },
     /// acc = acc op imm (the `Step::BinaryImm` number-number inline).
@@ -1507,6 +1514,7 @@ pub enum LeafOp {
     /// `LoadContext` and the `tdz` check like `BinReg`.
     BinCtxReg {
         op: BinaryOp,
+        depth: u32,
         index: usize,
         slot: usize,
         tdz: bool,
@@ -7991,11 +7999,32 @@ impl Vm {
         // the same-stack frame chain: the callee's own steps push `max_stack`
         // above its carved frame, and every enclosing frame keeps its segment.
         self.check_value_stack(ir.max_stack.saturating_add(scope.frame_size))?;
-        let body_env =
+        // A SELF-CALL reuses the caller's environment: the callee is the very
+        // function this activation runs, its body is capture-free and its
+        // environment constant, and its `[[Environment]]` is the caller's
+        // current environment. Every environment-derived field the push below
+        // would set (`lexical_env`, `body_context`, `current_function`,
+        // `strict`, `env_stack`, `globals_unshadowed`) already holds the
+        // callee's value, so the recursion re-derives nothing. The
+        // `ExecutionContext` is pushed regardless — it is what puts one frame
+        // per activation on an error trace (see
+        // `a_same_stack_recursion_reports_every_level`).
+        let self_call = self
+            .current_function
+            .is_some_and(|current| current.bits() == callee.bits())
+            && ir.env_constant
+            && scope.context_names.is_empty()
+            && Handle::ptr_eq(self.lexical_env, old_env)
+            && self.strict == strict
+            && agent.field_initializer_depth == 0;
+        let body_env = if self_call {
+            old_env
+        } else {
             match scope.new_body_context(&old_env, &self.stack[arg_start..arg_start + argc])? {
                 Some(context) => context,
                 None => old_env,
-            };
+            }
+        };
         agent
             .roots
             .execution_context_stack
@@ -8061,14 +8090,16 @@ impl Vm {
         if scope.arguments_slot.is_some() {
             self.call_args = self.stack[arg_start..arg_start + argc].to_vec();
         }
-        self.lexical_env = body_env;
-        self.env_stack.reset(body_env);
-        self.body_context = Some(body_env);
-        self.current_function = Some(callee);
+        if !self_call {
+            self.lexical_env = body_env;
+            self.env_stack.reset(body_env);
+            self.body_context = Some(body_env);
+            self.current_function = Some(callee);
+            self.strict = strict;
+            self.globals_unshadowed = Self::global_reads_are_unshadowed(body_env, &ir.ident_names);
+        }
         self.current_new_target = None;
-        self.strict = strict;
         agent.field_initializer_depth = 0;
-        self.globals_unshadowed = Self::global_reads_are_unshadowed(body_env, &ir.ident_names);
         Ok(Some(ir))
     }
 
@@ -13313,6 +13344,46 @@ impl Vm {
         outcome
     }
 
+    /// The capture-context env `depth` hops out from the leaf's `body_context`,
+    /// skipping the context-transparent envs — the register executor's mirror
+    /// of [`Self::context_chain_env`] (which the step path uses). A leaf
+    /// creates no closures and cannot change its environment, so the chain
+    /// walked here is the same one the step path would see.
+    #[inline]
+    fn leaf_context_env(&self, depth: usize) -> Result<EnvRef, JsError> {
+        let mut env = self.body_context_env();
+        let mut hops = depth;
+        loop {
+            if !is_context_transparent(&env) {
+                if hops == 0 {
+                    return Ok(env);
+                }
+                hops -= 1;
+            }
+            env = env.outer().ok_or_else(|| {
+                JsError::new(
+                    ErrorKind::ReferenceError,
+                    "No outer environment for a capture-context binding".into(),
+                )
+            })?;
+        }
+    }
+
+    /// The value of a capture-context slot `depth` hops out from the leaf's
+    /// body context — the cold depth>0 arm of `LoadContext`/`BinContext`.
+    /// Out of line so the executor's depth-0 path stays small.
+    #[cold]
+    #[inline(never)]
+    fn leaf_outer_slot(&self, depth: usize, index: usize) -> Result<Value, JsError> {
+        let env = self.leaf_context_env(depth)?;
+        context_env(&env).slot_value(index).ok_or_else(|| {
+            JsError::new(
+                ErrorKind::ReferenceError,
+                "Cannot access a binding before initialization".into(),
+            )
+        })
+    }
+
     /// The register dispatch loop. The frame segment starts at
     /// `stack[frame_base]` (slot `slot` lives at `frame_base + slot`); `acc`
     /// is the implicit result register, read and written by every op. Every
@@ -13336,27 +13407,34 @@ impl Vm {
                     }
                     self.acc = value;
                 }
-                LeafOp::LoadContext { index } => {
+                LeafOp::LoadContext { depth, index } => {
                     // `context_chain_env(0)` mirror: skip the
                     // context-transparent envs (a named function expression's
                     // self-binding scope, a per-iteration copy) that hold
                     // only scaffolding, so the read lands on the capture
-                    // context holding the binding.
-                    let mut env = self.body_context_env();
-                    while is_context_transparent(&env) {
-                        env = env.outer().ok_or_else(|| {
+                    // context holding the binding. A depth > 0 read walks out
+                    // through an enclosing certified body's contexts and is
+                    // the cold arm.
+                    let index = *index as usize;
+                    let value = if *depth == 0 {
+                        let mut env = self.body_context_env();
+                        while is_context_transparent(&env) {
+                            env = env.outer().ok_or_else(|| {
+                                JsError::new(
+                                    ErrorKind::ReferenceError,
+                                    "No outer environment for a capture-context binding".into(),
+                                )
+                            })?;
+                        }
+                        context_env(&env).slot_value(index).ok_or_else(|| {
                             JsError::new(
                                 ErrorKind::ReferenceError,
-                                "No outer environment for a capture-context binding".into(),
+                                "Cannot access a binding before initialization".into(),
                             )
-                        })?;
-                    }
-                    let value = context_env(&env).slot_value(*index).ok_or_else(|| {
-                        JsError::new(
-                            ErrorKind::ReferenceError,
-                            "Cannot access a binding before initialization".into(),
-                        )
-                    })?;
+                        })?
+                    } else {
+                        self.leaf_outer_slot(*depth as usize, index)?
+                    };
                     self.acc = value;
                 }
                 LeafOp::LoadPerIter { index } => {
@@ -13391,24 +13469,29 @@ impl Vm {
                     let right = *self.frame_get(*slot);
                     self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
-                LeafOp::BinContext { op, index } => {
+                LeafOp::BinContext { op, depth, index } => {
                     // The `context_chain_env(0)` transparent-env walk (see
-                    // `LoadContext`).
-                    let mut env = self.body_context_env();
-                    while is_context_transparent(&env) {
-                        env = env.outer().ok_or_else(|| {
+                    // `LoadContext`); depth > 0 takes the cold outer walk.
+                    let index = *index as usize;
+                    let right = if *depth == 0 {
+                        let mut env = self.body_context_env();
+                        while is_context_transparent(&env) {
+                            env = env.outer().ok_or_else(|| {
+                                JsError::new(
+                                    ErrorKind::ReferenceError,
+                                    "No outer environment for a capture-context binding".into(),
+                                )
+                            })?;
+                        }
+                        context_env(&env).slot_value(index).ok_or_else(|| {
                             JsError::new(
                                 ErrorKind::ReferenceError,
-                                "No outer environment for a capture-context binding".into(),
+                                "Cannot access a binding before initialization".into(),
                             )
-                        })?;
-                    }
-                    let right = context_env(&env).slot_value(*index).ok_or_else(|| {
-                        JsError::new(
-                            ErrorKind::ReferenceError,
-                            "Cannot access a binding before initialization".into(),
-                        )
-                    })?;
+                        })?
+                    } else {
+                        self.leaf_outer_slot(*depth as usize, index)?
+                    };
                     self.acc = Self::binary_inline(agent, *op, &self.acc, &right)?;
                 }
                 LeafOp::BinPerIter { op, index } => {
@@ -13480,6 +13563,7 @@ impl Vm {
                 }
                 LeafOp::BinCtxReg {
                     op,
+                    depth,
                     index,
                     slot,
                     tdz,
@@ -13487,22 +13571,28 @@ impl Vm {
                     // The `context_chain_env(0)` transparent-env walk (see
                     // `LoadContext`), then the frame-slot read with its
                     // `tdz` check — the step path's evaluation order
-                    // (captured left first, frame right second).
-                    let mut env = self.body_context_env();
-                    while is_context_transparent(&env) {
-                        env = env.outer().ok_or_else(|| {
+                    // (captured left first, frame right second). Depth > 0
+                    // takes the cold outer walk.
+                    let index = *index;
+                    let left = if *depth == 0 {
+                        let mut env = self.body_context_env();
+                        while is_context_transparent(&env) {
+                            env = env.outer().ok_or_else(|| {
+                                JsError::new(
+                                    ErrorKind::ReferenceError,
+                                    "No outer environment for a capture-context binding".into(),
+                                )
+                            })?;
+                        }
+                        context_env(&env).slot_value(index).ok_or_else(|| {
                             JsError::new(
                                 ErrorKind::ReferenceError,
-                                "No outer environment for a capture-context binding".into(),
+                                "Cannot access a binding before initialization".into(),
                             )
-                        })?;
-                    }
-                    let left = context_env(&env).slot_value(*index).ok_or_else(|| {
-                        JsError::new(
-                            ErrorKind::ReferenceError,
-                            "Cannot access a binding before initialization".into(),
-                        )
-                    })?;
+                        })?
+                    } else {
+                        self.leaf_outer_slot(*depth as usize, index)?
+                    };
                     if *tdz && self.frame_get(*slot).is_uninitialized() {
                         return Err(JsError::new(
                             ErrorKind::ReferenceError,
@@ -14072,22 +14162,16 @@ impl Vm {
     #[inline(never)]
     fn leaf_operand_env_slow(&self, operand: &RegOperand) -> Result<Value, JsError> {
         match operand {
-            RegOperand::Ctx { index } => {
-                let mut env = self.body_context_env();
-                while is_context_transparent(&env) {
-                    env = env.outer().ok_or_else(|| {
+            RegOperand::Ctx { depth, index } => {
+                let env = self.leaf_context_env(*depth as usize)?;
+                context_env(&env)
+                    .slot_value(*index as usize)
+                    .ok_or_else(|| {
                         JsError::new(
                             ErrorKind::ReferenceError,
-                            "No outer environment for a capture-context binding".into(),
+                            "Cannot access a binding before initialization".into(),
                         )
-                    })?;
-                }
-                context_env(&env).slot_value(*index).ok_or_else(|| {
-                    JsError::new(
-                        ErrorKind::ReferenceError,
-                        "Cannot access a binding before initialization".into(),
-                    )
-                })
+                    })
             }
             RegOperand::PerIter { index } => context_env(&self.lexical_env)
                 .slot_value(*index)
@@ -26631,8 +26715,12 @@ pub enum RegOperand {
         tdz: bool,
         op: UpdateOp,
     },
+    /// A capture-context binding: `depth` hops out from the leaf's body
+    /// context (0 = its own). Narrow fields keep `RegOperand` at 16 bytes:
+    /// a wider variant would grow every operand in a `RunRegBody` op array.
     Ctx {
-        index: usize,
+        depth: u32,
+        index: u32,
     },
     PerIter {
         index: usize,
@@ -26669,8 +26757,8 @@ fn load_operand(ops: &mut Vec<LeafOp>, operand: RegOperand) -> bool {
         // A post-increment is only a member-store key (its write-back cannot
         // be a general load — `x = l++` stays on the step path).
         RegOperand::PostInc { .. } => false,
-        RegOperand::Ctx { index } => {
-            ops.push(LeafOp::LoadContext { index });
+        RegOperand::Ctx { depth, index } => {
+            ops.push(LeafOp::LoadContext { depth, index });
             true
         }
         RegOperand::PerIter { index } => {
@@ -26796,6 +26884,11 @@ fn lower_step(
     ops: &mut Vec<LeafOp>,
     stack: &mut Vec<RegOperand>,
     counter_reads: &mut usize,
+    // Whether a `LoadContextSlot` at depth > 0 may lower to the outer-context
+    // ops. Only the whole-body leaf lowering allows it: its ops run on the
+    // interpreter's register executor (`RunRegBody` ops are also compiled by
+    // the JIT, which has no outer-context form).
+    allow_outer: bool,
 ) -> Option<()> {
     match step {
         Step::Push(value) => stack.push(RegOperand::Const(*value)),
@@ -26867,8 +26960,15 @@ fn lower_step(
             let tdz = scope.tdz_store.get(*slot).copied().unwrap_or(false);
             stack.push(RegOperand::Reg { slot: *slot, tdz });
         }
-        Step::LoadContextSlot { depth: 0, index } => {
-            stack.push(RegOperand::Ctx { index: *index });
+        Step::LoadContextSlot { depth, index } => {
+            if *depth == 0 || allow_outer {
+                stack.push(RegOperand::Ctx {
+                    depth: *depth as u32,
+                    index: *index as u32,
+                });
+            } else {
+                return None;
+            }
         }
         Step::LoadPerIteration { depth: 0, index } => {
             stack.push(RegOperand::PerIter { index: *index });
@@ -26930,13 +27030,14 @@ fn lower_step(
                     // `(y) => x + y` leaf: `LoadContext` + `BinReg` —
                     // the env walk and the slot read have no side
                     // effects between them, so the order is unchanged).
-                    (RegOperand::Ctx { index }, RegOperand::Reg { slot, tdz }) => {
+                    (RegOperand::Ctx { depth, index }, RegOperand::Reg { slot, tdz }) => {
                         if !spill_live_acc(scope, ops, stack) {
                             return None;
                         }
                         ops.push(LeafOp::BinCtxReg {
                             op: *op,
-                            index,
+                            depth,
+                            index: index as usize,
                             slot,
                             tdz,
                         });
@@ -26980,8 +27081,12 @@ fn lower_step(
                             RegOperand::Reg { slot, tdz } => {
                                 ops.push(LeafOp::BinReg { op: *op, slot, tdz });
                             }
-                            RegOperand::Ctx { index } => {
-                                ops.push(LeafOp::BinContext { op: *op, index });
+                            RegOperand::Ctx { depth, index } => {
+                                ops.push(LeafOp::BinContext {
+                                    op: *op,
+                                    depth,
+                                    index,
+                                });
                             }
                             RegOperand::PerIter { index } => {
                                 ops.push(LeafOp::BinPerIter { op: *op, index });
@@ -27191,9 +27296,11 @@ fn lower_step(
                             tdz: false,
                         }),
                         RegOperand::Const(v) => ops.push(LeafOp::BinConst { op: bop, value: v }),
-                        RegOperand::Ctx { index } => {
-                            ops.push(LeafOp::BinContext { op: bop, index })
-                        }
+                        RegOperand::Ctx { depth, index } => ops.push(LeafOp::BinContext {
+                            op: bop,
+                            depth,
+                            index,
+                        }),
                         RegOperand::PerIter { index } => {
                             ops.push(LeafOp::BinPerIter { op: bop, index })
                         }
@@ -27638,6 +27745,7 @@ fn lower_leaf_ops_segmented(
                 &mut ops,
                 &mut stack,
                 &mut counter_reads,
+                false,
             )
             .is_none()
             {
@@ -27718,6 +27826,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &mut ScopeInfo) -> Option<Box<[LeafOp]>
             &mut ops,
             &mut stack,
             &mut counter_reads,
+            true,
         )?;
     }
     match ops.last() {

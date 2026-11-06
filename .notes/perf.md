@@ -17254,3 +17254,61 @@ Next, by the same method: attribute `closures` between the env-leaf swap and the
 element read (counters around `run_inline_leaf`), and `fib`'s remaining 85-cycle
 call step (the two `RefCell` cache probes it still makes for a callee that is
 neither a leaf nor a builtin).
+
+## LANDED (2026-11-05): depth>0 capture reads reach the register lane; a self-call skips the env work
+
+The two follow-ups from the section above, each A/B'd in one session against
+the binary before it (min of 15-31, `--jitless`, rotated order).
+
+**A whole-body leaf may now read an enclosing certified body's capture context.**
+`closures`' callee is `function (x) { return base + k + x; }`: `k` is in the
+IIFE's context (depth 0) and `base` in `bench`'s (depth 1), so
+`LoadContextSlot { depth: 1 }` failed `lower_leaf_ops`' depth-0-only match and
+the whole body stayed on the step path (`run_leaf_body` → the big dispatch,
+85 Ir/call). The depth now rides on `LeafOp::LoadContext`/`BinContext`/
+`BinCtxReg` and `RegOperand::Ctx`, and the executor's depth-0 path is untouched
+(cold depth>0 goes through `leaf_outer_slot`, which mirrors
+`context_chain_env`'s transparent-env walk). `lower_step` takes an
+`allow_outer` flag: only the whole-body lowering sets it, so a `RunRegBody`
+loop body still carries depth 0 — those ops ARE compiled by the JIT, which has
+no outer-context form (it returns `Unsupported` if one ever appears).
+`closures` 118 -> 86 ms (-27%); a hand-checked differential script (depth 0/1/2,
+captured writes after closure creation) gives identical results in jit and
+`--jitless`, and the full test262 sweep is green.
+
+**A self-call reuses the caller's environment.** In `try_push_inline_call`, when
+the callee is the running function (`current_function`'s bits match), its body
+is capture-free with `env_constant`, `[[Environment]]` is the caller's current
+environment, `strict` matches, and `field_initializer_depth` is 0, the pushed
+activation would re-derive exactly the state the caller already holds: skip
+`new_body_context`, the `lexical_env`/`body_context`/`current_function`/
+`strict`/`env_stack` writes, and the `global_reads_are_unshadowed` walk; the
+`InlineCallFrame` still saves all of them, so the pop is unchanged. `fib`
+433 -> 421 ms (-3%). The `ExecutionContext` push is **kept** — a same-stack
+recursion must report one frame per activation
+(`a_same_stack_recursion_reports_every_level`), which is why collapsing the
+context stack (the larger win) is not available.
+
+**Trap: a new `LeafOp`/`RegOperand` field can grow the enums.** The first cut
+added `Outer { depth: usize, index: usize }` plus `LoadOuter`/`BinOuter`
+variants. `RegOperand` went 16 -> 24 bytes and `LeafOp` 48 -> 64 (the largest
+operand-carrying variant is `CompoundMemberComputedLocal`), which regressed
+`local` +5% and `object` +7% purely from the `RunRegBody` op-array density.
+Folding the depth into the existing context variants and using `u32` fields
+restored 16/48 and the regressions vanished (`local` 0.99, `object` 1.00 over
+31 rounds). `LeafOp` is 48 bytes on a 16-byte `RegOperand`; adding a variant
+that carries two operands plus a `usize` crosses into 64.
+
+Against the pre-change binary this session (`--jitless`, min of 9):
+`closures` 0.66, `capture` 0.67, `local` 0.75, `fn_array` 0.82, `array` 0.83,
+`object` 0.84, `fn_object` 0.86, `forin` 0.88, `fib` 0.89, `fn_forin` 0.91,
+`sieve` 0.94, `arith` 0.95, `fn_arith` 0.95, `capture2` 0.96, `method` 1.00.
+Against `bs`: `closures` 3.05 -> **2.56**, `fib` ~7.0, `method` 2.99,
+`fn_object` 2.00, `sieve` 1.94, `local` 1.76, `capture2` 1.61, `fn_arith` 1.57,
+`object` 1.36, `capture` 1.20, `fn_array` 1.16, `array` 0.86, `arith` 0.83,
+`forin`/`fn_forin` 0.39/0.40.
+
+Verified: `cargo clippy --workspace --all-targets -- -D warnings`, fmt,
+`cargo test --workspace` (all green), test262 language 23726/23726 +
+annexB 1086/1086 + built-ins 23821/23821, corpus 79/79 identical in jit and
+jitless.
