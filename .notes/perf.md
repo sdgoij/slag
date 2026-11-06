@@ -17227,3 +17227,30 @@ with a depth (a short `outer()` walk) would put that body on the register lane.
 Verified: clippy -D warnings, fmt, cargo test --workspace (all green),
 test262 language 23726/23726 + annexB 1086/1086 + built-ins 23821/23821,
 corpus 79/79 with identical results in jit and jitless.
+
+## PROBED (2026-11-05): `closures` is not cache thrash, `fib` is the same-stack lane
+
+Counters in `do_call_fast` (the stack-callee leaf cell), `Agent::leaf_lookup`
+(cell match vs resolve) and `try_push_inline_call`, over the two `--jitless`
+probes at 1M/2.5M calls:
+
+| workload | slot-cell hits | leaf cache | same-stack |
+| --- | ---: | ---: | ---: |
+| `closures` (64 cycled closures) | **99.99%** | 65 (warm-up only) | 65 |
+| `fib` | 0 | 2.5M (cached *rejections*) | 2.5M (every call) |
+
+So the "64 closures thrash the direct-mapped leaf caches" hypothesis is **wrong**:
+`SLOT_LEAF_CELLS` is 256 with the stack-callee index confined to its upper 128,
+and the 64 payloads land without collision. `closures` runs the leaf lane with a
+cell hit on essentially every call, so its ~116 ns/call is the *leaf env lane*
+itself — the callee reads captured `base`/`k`, so `run_leaf_entry` swaps
+`body_context`/`lexical_env` around the run — plus the computed element read
+`fns[i & 63]`.
+
+`fib` confirms the earlier picture from the other side: the leaf cell never hits
+(fib calls, so it is not a leaf) and every call enters the same-stack lane.
+
+Next, by the same method: attribute `closures` between the env-leaf swap and the
+element read (counters around `run_inline_leaf`), and `fib`'s remaining 85-cycle
+call step (the two `RefCell` cache probes it still makes for a callee that is
+neither a leaf nor a builtin).
