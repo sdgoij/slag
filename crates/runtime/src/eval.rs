@@ -7422,17 +7422,38 @@ mod tests {
             body.scope.is_some() && body.script_globals.is_some(),
             "a member call must not un-certify the script"
         );
-        // One `LoadLocal`+`StoreGlobal` per assigned name (the flush) and one
-        // `LoadGlobal`+`InitLocal` per declared name (the reload), on top of the
-        // prologue/epilogue pairs.
+        // One `ScriptGlobalFlush` per assigned name (the flush) and one
+        // `ScriptGlobalReload` per declared name (the reload), on top of the
+        // prologue/epilogue pairs (`LoadGlobal`+`InitLocal` and
+        // `LoadLocal`+`StoreGlobal`).
         let stores = body
             .steps
             .iter()
             .filter(|s| matches!(s, crate::ir::Step::StoreGlobal { .. }))
             .count();
+        let flushed = body
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                crate::ir::Step::ScriptGlobalFlush { pairs } => Some(pairs.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        let reloaded = body
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                crate::ir::Step::ScriptGlobalReload { pairs } => Some(pairs.len()),
+                _ => None,
+            })
+            .sum::<usize>();
         assert!(
-            stores >= 4,
-            "the epilogue and the flush both write back: {stores}"
+            stores >= 2 && flushed >= 2,
+            "the epilogue and the flush both write back: {stores} stores, {flushed} flushed"
+        );
+        assert!(
+            reloaded >= 2,
+            "the reload restores every declared slot: {reloaded}"
         );
         // The flush: the callee's `toString` sees the slot's current value
         // through the global object (`n` is 3 after the loop).

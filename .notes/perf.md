@@ -17324,3 +17324,52 @@ The site now caches the verdict itself in `AgentRoots::not_leaf_cells` — a `Ce
 **Two measurement traps met on the way.** (1) The first cut instead made `SlotLeafCell::entry` an `Option<LeafEntry>` and restructured the two hot lanes around it; `local` regressed 8% even though its callee is a leaf and the change is off its hot path. (2) Even after restoring every hot function to its original source (the compiled `do_call_fast_slot` is 4 bytes different, and `local`'s instruction count is *lower*), `local` still measured +4% against the sibling build. An inert perturbation — `GLOBAL_CELLS` 256 -> 512, which `local` cannot observe — moved it -4.3% with `fib` at 0.998, proving the swing is binary layout, not the change. Keep the negative table *separate* from the positive cell so the hot path stays one payload compare; do not re-merge them.
 
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins 23821/23821; corpus 79/79 identical in jit and jitless.
+
+## LANDED (2026-11-06): a script sync point is two fused steps, not one per name
+
+A certified top-level script keeps its declared `var`s in frame slots and syncs
+them with the global object at every call that could observe them
+(`Compiler::script_sync_point`): it flushes the assigned slots before the call
+and reloads every declared name after it. Both halves were emitted as one
+`LoadLocal`+`StoreGlobal` (or `LoadGlobal`+`InitLocal`) pair per name, so a
+script whose loop calls something paid 4 dispatches per declared name per
+iteration. `method` (`for (var i = 0; i < 2000000; i++) s += p.get();`) emitted
+20 steps per iteration for a body of six real ones, of which 14 were the sync.
+
+`Step::ScriptGlobalFlush { pairs }` / `Step::ScriptGlobalReload { pairs }` carry
+the `(slot, name)` pairs on the step and do the whole loop in one dispatch, so
+the same loop body is 10 steps (flush narrowed to the two names the loop
+assigns: 1; reload of all four declared names: 1). Pair order is slot order,
+exactly the order the unfused pairs ran in, so a global accessor observes the
+same sequence, and the flush keeps `LoadLocal`'s TDZ check.
+
+**The JIT re-expands them, it does not call a helper.** The first cut routed
+both steps through a `sig_step` helper that read the pairs from the running
+body and called `load_global_value`/`store_global_value` — correct, and the
+sweeps stayed green, but it measured `method` 141 -> 161 ms in *JIT mode*: the
+compiled `LoadGlobal`/`StoreGlobal` arms inline the global-value cell, while the
+helper takes the general path per name. The landed shape unrolls the pairs at
+compile time through the same `load_slot`/`emit_tdz_check`/`emit_global_store`
+and `emit_global_read`/`store_slot` calls the unfused steps used (the store
+sequence was factored out of `emit_step` into `emit_global_store`), so the
+machine code is the unfused sequence with fewer blocks.
+
+`method` (--jitless, interleaved min of 15): 211 -> 185 ms, **-12%**. Against
+`bs`: `method` njit/bs 2.72 -> 2.4. Every other row is unchanged: `object`,
+`arith`, `array`, `sieve`, `fib`, `local`, `closures`, `fn_*`, `capture*`,
+`forin` all land within ±8%, and `object`'s bytecode is byte-for-byte identical
+(it has no sync point — `objs.push(...)` certifies as global-blind), so its
+scatter is binary layout.
+
+**An inert control is what makes the -12% believable.** The same session's
+earlier cut also "improved" `method` in JIT mode by 14%, and so did an inert
+perturbation of the baseline (`GLOBAL_CELLS` 256 -> 512, which `method` cannot
+observe) — 141 -> 121 ms, the same delta from a semantically empty change. The
+JIT-mode gain is therefore not attributable; the interpreter's is, because the
+inert build measures 0.995 against the baseline in `--jitless` while the fused
+step measures 0.873-0.877. Measure every claim next to an inert sibling, in the
+mode you are claiming, not just next to the baseline.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace (40 suites, green); test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821; corpus 79/79, jit == jitless == the pre-change binary.

@@ -555,6 +555,8 @@ fn step_name(step: &Step) -> &'static str {
         | Step::AsyncYieldStarResume { .. } => "YieldStar/AsyncYieldStar",
         Step::Destructure { .. } | Step::DeclInit { .. } => "Destructure",
         Step::CreateArguments { .. } => "CreateArguments",
+        Step::ScriptGlobalFlush { .. } => "ScriptGlobalFlush",
+        Step::ScriptGlobalReload { .. } => "ScriptGlobalReload",
         Step::TypeofTop => "TypeofTop",
         Step::ImportCall { .. } | Step::ImportMeta => "Import",
         Step::ResolveVarIdent { .. } | Step::GetVarReferenceThis => "Reference machinery",
@@ -4385,6 +4387,126 @@ impl<'a> Lowerer<'a> {
         self.emit_global_read_probe(name, None)
     }
 
+    /// `Step::StoreGlobal`'s compiled store: validate the direct-mapped
+    /// global-value cell (name + the global's LIVE id/generation + a resolved
+    /// slot), update the cell's cached value (keeping the compiled `LoadGlobal`
+    /// fast path warm — a plain cached write does not bump the generation), and
+    /// hand the property-vector write to `set_global_slot` with the validated
+    /// slot. A stale cell, an unknown slot, or a null global falls through to
+    /// `set_global`, which re-resolves and mirrors the cell for the next read.
+    /// Leaves the builder in the merge block, so a caller that emits several
+    /// stores in one step can chain them.
+    fn emit_global_store(
+        &mut self,
+        name: crux::AtomId,
+        value: ClifValue,
+    ) -> Result<(), Unsupported> {
+        let ctx = self.vm();
+        let global = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
+        );
+        let cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
+        );
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let probe = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
+        let has_global_64 = self.bint(has_global);
+        self.builder
+            .ins()
+            .brif(has_global_64, probe, &[], slow, &[]);
+        self.builder.switch_to_block(probe);
+        let live_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            global,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let live_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            global,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let cell = self.builder.ins().iadd_imm_s(
+            cells,
+            ((name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>()) as i64,
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
+        );
+        let cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
+        );
+        let cell_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
+        );
+        let cell_slot = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, slot) as i32),
+        );
+        let name_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cell_name, name as i64);
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
+        let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
+        // A load-only cell (its slot never resolved) stays valid for
+        // reads but cannot serve the store's vector write.
+        let cell_slot_64 = self.builder.ins().uextend(types::I64, cell_slot);
+        let slot_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, cell_slot_64, u32::MAX as i64);
+        let name_id_ok = self.builder.ins().band(name_ok, id_ok);
+        let name_id_gen_ok = self.builder.ins().band(name_id_ok, gen_ok);
+        let ok = self.builder.ins().band(name_id_gen_ok, slot_ok);
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+        // The fast path: update the cached value, then write the
+        // property vector through the validated slot.
+        self.builder.switch_to_block(fast);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            value,
+            cell,
+            Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
+        );
+        let _stored = self.call_slow(
+            self.sig_set_name,
+            Helper::SetGlobalSlot,
+            &[name_imm, cell_slot_64, value],
+        )?;
+        self.builder.ins().jump(merge, &[]);
+        // The slow path: re-resolve through the runtime (which also
+        // mirrors the cell for the next read).
+        self.builder.switch_to_block(slow);
+        let _stored = self.call_slow(self.sig_update, Helper::SetGlobal, &[name_imm, value])?;
+        self.builder.ins().jump(merge, &[]);
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(())
+    }
+
     /// As `emit_global_read`, but a cell miss branches to `miss` (caller-owned,
     /// left unsealed) instead of emitting the `get_global` fallback — the LICM
     /// global guard takes the general loop on a miss. The merge block is sealed
@@ -8167,124 +8289,8 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::StoreGlobal { name } | Step::FusedStoreGlobal { name } => {
-                // Cut 36: inline the direct-mapped global-value fast cell on
-                // the write side too. The compiled code validates the cell
-                // (name + the global's LIVE id/generation + a resolved
-                // slot), updates the cell's cached value (keeping the
-                // compiled `LoadGlobal` fast path warm — a plain cached
-                // write does not bump the generation), and hands the
-                // property-vector write to `set_global_slot` with the
-                // validated slot — the one part that cannot be inlined (the
-                // vector's enum layout is runtime internal). A stale cell,
-                // an unknown slot, or a null global falls through to
-                // `set_global`, which re-resolves and mirrors the cell for
-                // the next read.
                 let value = self.pop();
-                let ctx = self.vm();
-                let global = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, global_object) as i32),
-                );
-                let cells = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    ctx,
-                    Offset32::new(std::mem::offset_of!(JitCallContext, global_value_cells) as i32),
-                );
-                let name_imm = self.builder.ins().iconst(types::I64, *name as i64);
-                let probe = self.builder.create_block();
-                let fast = self.builder.create_block();
-                let slow = self.builder.create_block();
-                let merge = self.builder.create_block();
-                let has_global = self.builder.ins().icmp_imm_u(IntCC::NotEqual, global, 0);
-                let has_global_64 = self.bint(has_global);
-                self.builder
-                    .ins()
-                    .brif(has_global_64, probe, &[], slow, &[]);
-                self.builder.switch_to_block(probe);
-                let live_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    global,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
-                );
-                let live_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    global,
-                    Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
-                );
-                let cell = self.builder.ins().iadd_imm_s(
-                    cells,
-                    ((*name as usize & (GLOBAL_CELLS - 1)) * std::mem::size_of::<GlobalValueCell>())
-                        as i64,
-                );
-                let cell_name = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, name) as i32),
-                );
-                let cell_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, global_id) as i32),
-                );
-                let cell_gen = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, generation) as i32),
-                );
-                let cell_slot = self.builder.ins().load(
-                    types::I32,
-                    MemFlagsData::new(),
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, slot) as i32),
-                );
-                let name_ok = self
-                    .builder
-                    .ins()
-                    .icmp_imm_u(IntCC::Equal, cell_name, *name as i64);
-                let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, live_id);
-                let gen_ok = self.builder.ins().icmp(IntCC::Equal, cell_gen, live_gen);
-                // A load-only cell (its slot never resolved) stays valid for
-                // reads but cannot serve the store's vector write.
-                let cell_slot_64 = self.builder.ins().uextend(types::I64, cell_slot);
-                let slot_ok =
-                    self.builder
-                        .ins()
-                        .icmp_imm_u(IntCC::NotEqual, cell_slot_64, u32::MAX as i64);
-                let name_id_ok = self.builder.ins().band(name_ok, id_ok);
-                let name_id_gen_ok = self.builder.ins().band(name_id_ok, gen_ok);
-                let ok = self.builder.ins().band(name_id_gen_ok, slot_ok);
-                self.builder.ins().brif(ok, fast, &[], slow, &[]);
-                // The fast path: update the cached value, then write the
-                // property vector through the validated slot.
-                self.builder.switch_to_block(fast);
-                self.builder.ins().store(
-                    MemFlagsData::new(),
-                    value,
-                    cell,
-                    Offset32::new(std::mem::offset_of!(GlobalValueCell, value) as i32),
-                );
-                let _stored = self.call_slow(
-                    self.sig_set_name,
-                    Helper::SetGlobalSlot,
-                    &[name_imm, cell_slot_64, value],
-                )?;
-                self.builder.ins().jump(merge, &[]);
-                // The slow path: re-resolve through the runtime (which also
-                // mirrors the cell for the next read).
-                self.builder.switch_to_block(slow);
-                let _stored =
-                    self.call_slow(self.sig_update, Helper::SetGlobal, &[name_imm, value])?;
-                self.builder.ins().jump(merge, &[]);
-                self.builder.seal_block(merge);
-                self.builder.switch_to_block(merge);
+                self.emit_global_store(*name, value)?;
                 // The interpreter's `FusedStoreGlobal` also sets the statement
                 // completion (a statement-position `x = v` on a declared
                 // global); `StoreGlobal` does not — its result is popped by a
@@ -8683,6 +8689,30 @@ impl<'a> Lowerer<'a> {
             Step::CreateArguments { .. } => {
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                 let _res = self.call_slow(self.sig_step, Helper::CreateArguments, &[step_imm])?;
+                self.fall_through(index);
+            }
+            // The certified script's sync point (`Compiler::script_sync_point`):
+            // the flush/reload pair loops fused into one step each, so a
+            // top-level loop that calls something does not pay a dispatch per
+            // declared name. The compiled code re-expands them into exactly the
+            // unfused `LoadLocal`+`StoreGlobal` / `LoadGlobal`+`InitLocal`
+            // per-name sequences, so the fused form costs the interpreter less
+            // and machine code the same.
+            Step::ScriptGlobalFlush { pairs } => {
+                for &(slot, name) in pairs.iter() {
+                    let value = self.load_slot(slot);
+                    if self.slot_is_lexical(slot) {
+                        self.emit_tdz_check(value)?;
+                    }
+                    self.emit_global_store(name, value)?;
+                }
+                self.fall_through(index);
+            }
+            Step::ScriptGlobalReload { pairs } => {
+                for &(slot, name) in pairs.iter() {
+                    let value = self.emit_global_read(name)?;
+                    self.store_slot(slot, value);
+                }
                 self.fall_through(index);
             }
             // `typeof` of a value operand (Cut 60): a pure helper — pops the

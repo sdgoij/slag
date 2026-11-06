@@ -1058,6 +1058,24 @@ pub enum Step {
     StoreGlobal {
         name: crux::AtomId,
     },
+    /// A certified script's sync-point flush (see
+    /// [`Compiler::script_sync_point`]): write each assigned slot back to its
+    /// global.
+    ///
+    /// This fuses the `LoadLocal` + `StoreGlobal` pair per name into one
+    /// dispatch. A sync point sits inside the hot loop of any top-level script
+    /// that calls something, so the pairs cost several dispatches per
+    /// iteration; the fused step preserves the pair order (slot order) so an
+    /// accessor on a global runs in the same sequence.
+    ScriptGlobalFlush {
+        pairs: Box<[(usize, crux::AtomId)]>,
+    },
+    /// The reload half of a sync point: read each declared name back into its
+    /// frame slot (the callee may have assigned any of them through the global
+    /// object), the `LoadGlobal` + `InitLocal` pair per name in one dispatch.
+    ScriptGlobalReload {
+        pairs: Box<[(usize, crux::AtomId)]>,
+    },
     /// Resolve the target of a following `StoreIdent` before the RHS
     /// evaluates (spec 13.15.3 steps 1, 5): a `with` binding the RHS deletes
     /// must still be the PutValue target. The certified-body fast path skips
@@ -5036,7 +5054,7 @@ impl Vm {
     /// branch is fully predictable on both paths (the base is `None` for
     /// every non-leaf body).
     #[inline(always)]
-    fn frame_get(&self, slot: usize) -> &Value {
+    pub(crate) fn frame_get(&self, slot: usize) -> &Value {
         let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
             Some(base) => &self.stack[base + slot],
@@ -8865,6 +8883,30 @@ impl Vm {
                 Step::StoreGlobal { name } => {
                     let value = self.pop();
                     self.store_global_value(agent, *name, value)?;
+                }
+                Step::ScriptGlobalFlush { pairs } => {
+                    // The fused `LoadLocal` + `StoreGlobal` pair per name: the
+                    // slot is read with `LoadLocal`'s TDZ check, then written to
+                    // the global in slot order (an accessor on one of the names
+                    // runs in the same sequence the unfused pairs gave it).
+                    for &(slot, name) in pairs.iter() {
+                        let value = *self.frame_get(slot);
+                        if value.is_uninitialized() {
+                            return Err(JsError::new(
+                                ErrorKind::ReferenceError,
+                                "Cannot access a binding before initialization".into(),
+                            ));
+                        }
+                        self.store_global_value(agent, name, value)?;
+                    }
+                }
+                Step::ScriptGlobalReload { pairs } => {
+                    // The fused `LoadGlobal` + `InitLocal` pair per name, in the
+                    // same slot order.
+                    for &(slot, name) in pairs.iter() {
+                        let value = self.load_global_value(agent, name)?;
+                        *self.frame_get_mut(slot) = value;
+                    }
                 }
                 Step::ResolveIdentStore { name } => {
                     // The certified store's target: resolve it before the RHS
@@ -24560,9 +24602,10 @@ impl Compiler {
             pairs.sort_unstable();
             pairs
         };
-        for (slot, name) in pairs {
-            self.emit(Step::LoadLocal { slot });
-            self.emit(Step::StoreGlobal { name });
+        if !pairs.is_empty() {
+            self.emit(Step::ScriptGlobalFlush {
+                pairs: pairs.into_boxed_slice(),
+            });
         }
     }
 
@@ -24571,9 +24614,10 @@ impl Compiler {
     /// potentially stale after a sync point.
     fn emit_script_global_reload(&mut self) {
         let pairs = self.script_slot_pairs();
-        for (slot, name) in pairs {
-            self.emit(Step::LoadGlobal { name });
-            self.emit(Step::InitLocal { slot });
+        if !pairs.is_empty() {
+            self.emit(Step::ScriptGlobalReload {
+                pairs: pairs.into_boxed_slice(),
+            });
         }
     }
 
