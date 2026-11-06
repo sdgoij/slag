@@ -21,6 +21,7 @@
 #include "include/v8-isolate.h"
 #include "include/v8-local-handle.h"
 #include "include/v8-message.h"
+#include "include/v8-microtask-queue.h"
 #include "include/v8-object.h"
 #include "include/v8-platform.h"
 #include "include/v8-primitive.h"

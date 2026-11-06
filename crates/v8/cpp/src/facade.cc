@@ -3375,8 +3375,62 @@ void ObjectTemplate::SetHandler(
   has_indexed_handler_ = true;
 }
 
+MicrotaskQueue* MicrotaskQueue::New(Isolate* isolate, MicrotasksPolicy policy) {
+  if (isolate == nullptr) return nullptr;
+  /* No engine queue yet: this engine mints one per realm, and the context that
+   * binds this queue is what asks for it (`Context::New`). V8 can mint here
+   * because its queues belong to the isolate. */
+  return new MicrotaskQueue(-1, policy);
+}
+
+MicrotaskQueue::~MicrotaskQueue() {
+  SlagContext* slag = CurrentSlagContext();
+  if (slag != nullptr && id_ >= 0) slag_microtask_queue_release(slag, id_);
+}
+
+void MicrotaskQueue::AddMicrotasksCompletedCallback(
+    MicrotasksCompletedCallbackWithData callback, void* data) {
+  if (callback == nullptr) return;
+  completed_.emplace_back(callback, data);
+}
+
+void MicrotaskQueue::RemoveMicrotasksCompletedCallback(
+    MicrotasksCompletedCallbackWithData callback, void* data) {
+  for (auto entry = completed_.begin(); entry != completed_.end(); ++entry) {
+    if (entry->first == callback && entry->second == data) {
+      completed_.erase(entry);
+      return;
+    }
+  }
+}
+
+void MicrotaskQueue::PerformCheckpoint(Isolate* isolate) {
+  if (isolate == nullptr || running_) return;
+  SlagContext* slag = CurrentSlagContext();
+  if (slag == nullptr) return;
+  running_ = true;
+  /* A bound host queue drains only itself; an unbound one is the context's
+   * default, and V8's default queue is what the engine's own drain runs. */
+  if (id_ >= 0) {
+    slag_microtask_queue_run(slag, id_);
+  } else {
+    slag_drain_jobs(slag);
+  }
+  running_ = false;
+  /* V8 fires the completed callbacks whether or not anything ran, and a
+   * callback that adds another must not invalidate this walk. */
+  const auto callbacks = completed_;
+  for (const auto& entry : callbacks) entry.first(isolate, entry.second);
+}
+
 Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
                             Local<ObjectTemplate> global_template) {
+  return New(isolate, nullptr, global_template, nullptr);
+}
+
+Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
+                            Local<ObjectTemplate> global_template,
+                            MicrotaskQueue* microtask_queue) {
   if (isolate == nullptr) return Local<Context>();
   SlagContext* slag = slag_context_new(isolate->slag_);
   if (slag == nullptr) return Local<Context>();
@@ -3385,6 +3439,30 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
   context->slag_ = slag;
   context->isolate_ = isolate;
   slag_watch_collections(slag, isolate, &CollectionObserver);
+
+  /* V8 binds a queue at construction, and a null one means the isolate's
+   * default. A host queue is bound here — and gets its engine id here, because
+   * the id names a queue on this context's agent — but a context made without
+   * one keeps the engine's default queue: attaching a host queue to every
+   * realm would move every run's microtasks out of the queue
+   * `PumpMessageLoop` drains. */
+  MicrotaskQueue* queue = microtask_queue;
+  bool owns_queue = false;
+  if (queue == nullptr) {
+    queue = new MicrotaskQueue(-1, isolate->GetMicrotasksPolicy());
+    owns_queue = true;
+  } else {
+    if (queue->id_ < 0) {
+      const int32_t id = slag_microtask_queue_new(
+          slag, static_cast<int32_t>(queue->GetMicrotasksPolicy()));
+      if (id >= 0) queue->id_ = id;
+    }
+    if (queue->id_ >= 0) {
+      slag_context_set_microtask_queue(slag, static_cast<uint32_t>(queue->id_));
+    }
+  }
+  context->microtask_queue_ = queue;
+  context->owns_microtask_queue_ = owns_queue;
 
   if (!global_template.IsEmpty()) {
     auto* tmpl = reinterpret_cast<ObjectTemplate*>(
@@ -3415,6 +3493,10 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
 Context::~Context() {
   ClearAllSlots();
   UseDefaultSecurityToken();
+  if (owns_microtask_queue_ && microtask_queue_ != nullptr) {
+    delete microtask_queue_;
+    microtask_queue_ = nullptr;
+  }
   if (slag_ != nullptr) slag_context_free(slag_);
 }
 

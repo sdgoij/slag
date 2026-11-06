@@ -349,6 +349,12 @@ int64_t slag_inspector_call_id(const uint8_t* message, size_t len);
 /* Drain the job queues. 1 when a job was queued, 0 when none was, -1 with a
  * pending error when a job threw. */
 int32_t slag_drain_jobs(SlagContext* context);
+
+/* Host microtask queues (v8::MicrotaskQueue). Ids are never reused. */
+int32_t slag_microtask_queue_new(SlagContext* context, int32_t policy);
+void slag_microtask_queue_release(SlagContext* context, uint32_t id);
+int32_t slag_context_set_microtask_queue(SlagContext* context, uint32_t id);
+int32_t slag_microtask_queue_run(SlagContext* context, uint32_t id);
 void slag_script_free(SlagScript* script);
 int32_t slag_register_fn(SlagContext* context, const uint8_t* name, size_t name_len,
                          slag_host_fn callback, void* data);

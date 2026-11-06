@@ -2161,6 +2161,89 @@ pub unsafe extern "C" fn slag_drain_jobs(context: *mut SlagContext) -> i32 {
     }
 }
 
+/// The engine's policy for a V8 `MicrotasksPolicy` code (`kExplicit` 0,
+/// `kScoped` 1, `kAuto` 2). This engine has no scoped mode, so 1 behaves as 0 —
+/// the same reading the facade's `MicrotasksScope` already records.
+fn microtasks_policy_of(code: i32) -> slag::api::MicrotasksPolicy {
+    if code == 2 {
+        slag::api::MicrotasksPolicy::Auto
+    } else {
+        slag::api::MicrotasksPolicy::Explicit
+    }
+}
+
+/// A queue the host drains itself (`v8::MicrotaskQueue::New`): answers the queue
+/// id, or -1 when there is no context to own it. This engine keeps queues per
+/// realm, so the host queue is created against the current context rather than
+/// the isolate V8 would bind it to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_microtask_queue_new(context: *mut SlagContext, policy: i32) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return -1;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        return -1;
+    };
+    engine.new_microtask_queue(microtasks_policy_of(policy)) as i32
+}
+
+/// Release a host queue, which is what dropping its `v8::MicrotaskQueue` does:
+/// what it still holds is dropped and the realm's later jobs take the default
+/// queue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_microtask_queue_release(context: *mut SlagContext, id: u32) {
+    let Some(context) = context.as_mut() else {
+        return;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        return;
+    };
+    engine.release_microtask_queue(id);
+}
+
+/// Attach a host queue to this context's realm
+/// (`v8::ContextOptions::microtask_queue`): its promise jobs go there from now
+/// on. Answers 0 on success and -1 with a pending error otherwise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_context_set_microtask_queue(
+    context: *mut SlagContext,
+    id: u32,
+) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return -1;
+    };
+    let result = match context.context.try_borrow() {
+        Ok(engine) => engine.set_microtask_queue(id),
+        Err(_) => return -1,
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            -1
+        }
+    }
+}
+
+/// Run one queue's jobs to completion (`v8::MicrotaskQueue::PerformCheckpoint`).
+/// Answers 0 on success and -1 with a pending error when a job threw.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_microtask_queue_run(context: *mut SlagContext, id: u32) -> i32 {
+    let Some(context) = context.as_mut() else {
+        return -1;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        return -1;
+    };
+    match engine.run_microtask_queue(id) {
+        Ok(()) => 0,
+        Err(error) => {
+            record(context, error);
+            -1
+        }
+    }
+}
+
 /// Why a parked run stopped (`SlagPause::reason`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -68,3 +68,7 @@ target_include_directories(header-surface PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 # `Primitive`/`Numeric` node, and `Maybe`'s `Just`/`Nothing`.
 add_executable(value-basics tests/value_basics.cc)
 target_link_libraries(value-basics PRIVATE v8_facade)
+
+# `v8::MicrotaskQueue`: a host queue a context's realm sends its jobs to.
+add_executable(microtasks tests/microtasks.cc)
+target_link_libraries(microtasks PRIVATE v8_facade)

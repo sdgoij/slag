@@ -1848,6 +1848,32 @@ impl Context {
         !self.agent.job_queues_empty()
     }
 
+    /// Give this context's realm its own microtask queue
+    /// (`v8::ContextOptions::microtask_queue`). The id is a host queue's
+    /// (`Agent::new_microtask_queue`), so this context's promise jobs stop going
+    /// to the isolate's default queue and the host drains them itself.
+    pub fn set_microtask_queue(&self, id: u32) -> Result<(), JsError> {
+        let realm = self.agent.current_realm()?;
+        realm.microtask_queue.set(Some(id));
+        Ok(())
+    }
+
+    /// A queue the host drains itself (`v8::MicrotaskQueue::New`).
+    pub fn new_microtask_queue(&mut self, policy: crate::api::MicrotasksPolicy) -> u32 {
+        self.agent.new_microtask_queue(policy)
+    }
+
+    /// Release a host queue (`v8::MicrotaskQueue`'s destructor).
+    pub fn release_microtask_queue(&mut self, id: u32) {
+        self.agent.release_microtask_queue(id);
+    }
+
+    /// Run one queue's jobs to completion (`v8::MicrotaskQueue::PerformCheckpoint`):
+    /// only that queue, leaving the isolate's other jobs where they are.
+    pub fn run_microtask_queue(&mut self, id: u32) -> Result<(), JsError> {
+        self.agent.run_microtask_queue(id)
+    }
+
     /// Evaluate a Script WITHOUT draining the job queues. Pending microtasks
     /// and timers stay queued until the caller runs [`Context::run_jobs`]; a
     /// host binding that stringifies the completion before the drain avoids

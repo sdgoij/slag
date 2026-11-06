@@ -92,6 +92,71 @@ enum WriteOptions {
  * close. */
 enum class MicrotasksPolicy { kExplicit = 0, kScoped = 1, kAuto = 2 };
 
+/* A host-visible microtask queue (`v8::MicrotaskQueue`).
+ *
+ * V8 15 derives this from `cppgc::GarbageCollected` — the collector frees a
+ * queue no context references — so the faithful shape waits for cppgc
+ * (`.notes/browser.md` §5). This one is an ordinary object the embedder owns:
+ * `New` hands out a queue, its destructor releases the engine's queue, and a
+ * `Context` deletes the one it made for itself. That is V8's own ownership rule
+ * stated in `v8-microtask-queue.h`: the embedder keeps the queue alive until the
+ * contexts using it are gone.
+ *
+ * A queue attached to a context (`Context::New`'s last argument) takes that
+ * realm's promise jobs, so only `PerformCheckpoint` runs them — which is what
+ * Blink's `bindings/core/v8` does with the pointer it gets from
+ * `Context::GetMicrotaskQueue()`.
+ *
+ * Not here yet: the two `EnqueueMicrotask` overloads. A host function queued as
+ * a microtask must stay rooted until it runs, and the engine's job queue holds
+ * closures it cannot trace (`.notes/barrier-uaf.md`), so that needs a rooted
+ * host-job entry point rather than a wrapper. */
+class MicrotaskQueue {
+ public:
+  using MicrotasksCompletedCallbackWithData = void (*)(Isolate*, void*);
+
+  /* The queue is created before any context exists in the order a host uses
+   * (Blink builds its isolate's queue, then its contexts), so the engine id is
+   * minted when a context binds it (`Context::New`). */
+  static MicrotaskQueue* New(Isolate* isolate,
+                             MicrotasksPolicy policy = MicrotasksPolicy::kAuto);
+  virtual ~MicrotaskQueue();
+
+  /* Fires after every checkpoint, including one that ran nothing — V8's
+   * contract, and what a host uses to detect an empty drain. */
+  virtual void AddMicrotasksCompletedCallback(
+      MicrotasksCompletedCallbackWithData callback, void* data = nullptr);
+  virtual void RemoveMicrotasksCompletedCallback(
+      MicrotasksCompletedCallbackWithData callback, void* data = nullptr);
+
+  virtual void PerformCheckpoint(Isolate* isolate);
+  virtual bool IsRunningMicrotasks() const { return running_; }
+  virtual int GetMicrotasksScopeDepth() const { return scope_depth_; }
+
+  /* The policy the queue was created with. This engine reads a queue's policy
+   * once, at creation, so setting it later is recorded here and not passed on. */
+  virtual void SetMicrotasksPolicy(MicrotasksPolicy policy) { policy_ = policy; }
+  virtual MicrotasksPolicy GetMicrotasksPolicy() const { return policy_; }
+
+  MicrotaskQueue(const MicrotaskQueue&) = delete;
+  MicrotaskQueue& operator=(const MicrotaskQueue&) = delete;
+
+ protected:
+  explicit MicrotaskQueue(int32_t id, MicrotasksPolicy policy)
+      : id_(id), policy_(policy) {}
+
+ private:
+  int32_t id_ = -1;
+  MicrotasksPolicy policy_ = MicrotasksPolicy::kAuto;
+  bool running_ = false;
+  int scope_depth_ = 0;
+  std::vector<std::pair<MicrotasksCompletedCallbackWithData, void*>> completed_;
+
+  /* The id is the engine's handle on this queue: a `Context` is what attaches
+   * it, and the facade's ABI takes it, so both read it directly. */
+  friend class Context;
+};
+
 class Platform {
  public:
   virtual ~Platform() = default;
@@ -1809,7 +1874,17 @@ class Context {
   static Local<Context> New(
       Isolate* isolate, std::nullptr_t = nullptr,
       Local<ObjectTemplate> global_template = Local<ObjectTemplate>());
+  /* With a host microtask queue (`v8::ContextOptions::microtask_queue`): that
+   * realm's promise jobs go to `microtask_queue`, so the host drains them. A
+   * null queue is the default, which `GetMicrotaskQueue` creates. */
+  static Local<Context> New(Isolate* isolate, std::nullptr_t,
+                            Local<ObjectTemplate> global_template,
+                            MicrotaskQueue* microtask_queue);
   ~Context();
+
+  /* This context's microtask queue (`v8::Context::GetMicrotaskQueue`). Never
+   * null: a context made without one made its own. */
+  MicrotaskQueue* GetMicrotaskQueue() const { return microtask_queue_; }
 
   Local<Object> Global() const;
 
@@ -1914,6 +1989,10 @@ class Context {
   Isolate* isolate_ = nullptr;
   std::vector<void*> pointer_slots_;
   std::vector<uint64_t> value_slots_;
+  /* The queue this context's microtasks go to, and whether this context owns
+   * it: a queue the host passed in is the host's to keep alive. */
+  MicrotaskQueue* microtask_queue_ = nullptr;
+  bool owns_microtask_queue_ = false;
   /* Retained while set; zero means "the isolate's default". */
   uint64_t security_token_ = 0;
 
