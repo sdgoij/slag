@@ -11162,6 +11162,28 @@ impl<'a> Lowerer<'a> {
                 let result = self.pop();
                 self.set_acc_bits(result);
             }
+            LeafOp::CallFastIdent {
+                name,
+                argc,
+                env_constant: _,
+                span: _,
+            } => {
+                // The environment-callee form: `[..., a1..aN]` with the callee
+                // from the same inline read `Step::CallFastIdent` compiles to
+                // (`emit_ident_read` — the warmed global cell, else the env
+                // walk) and `undefined` as the receiver, with the register
+                // run's continuation rule.
+                let sp = self.builder.use_var(self.sp_var);
+                let args_ptr = self.builder.ins().iadd_imm_s(sp, -((*argc as i64) * 8));
+                let callee = self.emit_ident_read(*name)?;
+                let this = self.builder.ins().iconst(types::I64, self.undef_bits);
+                let argc_imm = self.builder.ins().iconst(types::I64, i64::from(*argc));
+                self.emit_call(
+                    step, callee, this, args_ptr, argc_imm, args_ptr, false, false,
+                )?;
+                let result = self.pop();
+                self.set_acc_bits(result);
+            }
             LeafOp::BinRemConst { divisor } => {
                 // A proven-integral `% <const>`: the spec's `fmod` is the
                 // truncated integer remainder, so an `srem` is exact for

@@ -17486,3 +17486,79 @@ out-of-range counts, the four relationals) — identical results.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79, jit == jitless == the previous commit.
+
+## LANDED (2026-11-06): a whole-body register program, and calls that suspend
+
+`.notes/whole-body-register-lane.md` scoped this for `fib` and predicted -15%.
+What landed is the first two of its three pieces plus the third, and `fib` is
+-11% instructions / -9% wall (`njit/bs` 6.10 -> 5.38):
+
+- **`LeafOp::CallFastIdent`** — the environment-callee call a script global's
+  callee takes from inside a function body. Only the whole-body lowering emits
+  it: a segmented loop-body run is JIT-compiled, and the JIT would have to grow
+  an environment-callee register form to keep compiling those runs.
+- **`lower_whole_body` / `CompiledBody::reg_ops`** — every step of a certified,
+  handler-free, environment-free body lowered into ONE register program, which
+  the interpreter's driver runs (`run_body_segment`) instead of a dispatch per
+  step. The body's `steps` stay intact (the JIT, the handler table and
+  `--print-bytecode` are built on them), so this is a new lane, not a step
+  rewrite. Branches lower: `Step::Jump`/`JumpIfFalse` become `LeafOp::Jump`/
+  `JumpIfFalsy` over OP indices, patched in a second pass through a
+  step-index -> op-index map (`fib`'s 13 steps are 15 ops).
+- **Suspend/resume across a call** — a run has no driver, so a call op records
+  its resume op (`Vm::reg_resume`) and stops; the driver performs the call on
+  its same-stack lane and re-enters the program, popping the result into `acc`.
+  The record rides a `VmScratch`, so the nested certified lane saves/clears/
+  restores it for free, and it is cleared on every path that abandons the run
+  (an abrupt frame pop, an error routed at the driver, the leaf lane's in-place
+  completion, `Vm::reset`/`clean_after_leaf`).
+
+The join discipline is the part worth keeping: the compiler emits
+`LoadLocal; Jump(ret)` to share a `return` epilogue, so a branch CAN carry one
+live value — which the single-accumulator model holds only in `acc`. A branch
+materializes its one live operand into `acc` and records that its target
+expects exactly that; the target's ops are generated from the fall-through
+path, so `expected`/`arrived` must agree, and anything richer (a value on the
+machine stack, two live operands, a `JumpIfFalse` with a live shadow) refuses
+the body. The jump-target map is taken AFTER the arrival canonicalization, or
+the branch would enter past the load and re-execute the fall-through's.
+
+`fib`'s program then showed two lowering costs worth fixing on their own:
+
+- **`BinImmLocal` fell to `apply_binary` for a relational** (`n < 2` is a
+  frame-slot + immediate compare, the hot op of every activation).
+  `reg_bin_imm` now shares `imm_binary_inline` with `Step::BinaryImm`, as
+  `BinImm` already did. `fib` 5.38B -> 5.06B Ir.
+- **A computed last argument was spilled to a scratch frame slot** before being
+  pushed (`fib(n - 1)`: `StoreReg scratch; PushReg scratch` — two ops and a
+  frame slot per call). `spill_for_call` skips the spill when the accumulator is
+  the last operand and every operand ahead of it is a frame slot (`PushReg`
+  leaves `acc` alone). `fib` frame 4 -> 2 slots, 13 -> 11 ops per recursive
+  activation, 5.06B -> 4.75B Ir.
+
+Measured (`--jitless`, callgrind, `tools/brimstone/suite/fib.js` = `fib(30)`,
+2,692,537 activations) against the parent:
+
+- `fib`: 5,351.5M -> 4,761.8M Ir (**-11.0%**), 370 -> 338 ms; `njit/bs` 6.10 -> 5.38.
+- `capture` 2,048.3M -> 2,052.4M, `local` 2,098.3M -> 2,102.5M (+0.2%, the
+  extra op arm in the leaf executor), `sieve`/`method` flat, `fn_array` +0.5%,
+  `capture2` +0.35%. Everything else within noise.
+- Brimstone comparison (7 rounds): `local` 1.79 -> 1.51, `sieve` 1.51 -> 1.47,
+  `closures` 2.36 -> 2.30, `fn_object` 1.97 -> 1.89, `capture2` 1.57 -> 1.53,
+  `capture` 1.18 -> 1.16; no row worse beyond wall-clock noise.
+
+**A state leak the sweeps caught, and that only a sweep could.** The first cut
+left `Vm::reset`/`clean_after_leaf` unaware of `reg_resume`. A record orphaned
+by an abandoned run then survived Vm pooling, and the next body with a register
+program resumed at a stale op index — `built-ins` failed 4 ShadowRealm
+fixtures (`wrappedGenerator()` returned `undefined` instead of throwing, because
+the resumed program skipped the wrap check). The `language`/`annexB` sweeps and
+every unit test were green; only the cross-realm fixtures exercised a pooled Vm
+taking a `reg_ops` body after an abandoned suspension. Resetting the record in
+both reset paths (and clearing it on the error-routing and leaf-lane
+completion-error paths) restored 23821/23821. A new `Vm` field is pool state:
+name it in `reset` and `clean_after_leaf`, not only in `Vm::new`.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79, jit == jitless == the previous commit.

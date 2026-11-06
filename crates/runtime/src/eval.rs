@@ -5788,6 +5788,48 @@ mod tests {
         );
     }
 
+    /// The whole-body register program: the recursive `fib` shape — a branch,
+    /// an environment-callee call, and a `return` epilogue shared by two
+    /// statements — runs as ONE register program instead of a dispatch per
+    /// step, and each call suspends to the driver's same-stack lane rather
+    /// than nesting an activation.
+    #[test]
+    fn a_branching_recursive_body_runs_as_one_register_program() {
+        use crate::ir::LeafOp;
+
+        let source = "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }";
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.run_script(source).unwrap();
+        let ir = compiled_body_of(&mut agent, "fib");
+        let Some(ops) = ir.reg_ops.as_deref() else {
+            panic!(
+                "the recursive fib body must lower to one register program:\n{}",
+                crate::ir::debug_body_to_string(&ir)
+            );
+        };
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, LeafOp::CallFastIdent { .. })),
+            "the recursive call must run on the register lane"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, LeafOp::JumpIfFalsy(_))),
+            "the ternary's branch must be inside the program"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, LeafOp::Jump(_))),
+            "the shared return epilogue is a jump with a live value"
+        );
+        for (n, want) in [(0, 0.0), (1, 1.0), (2, 1.0), (10, 55.0), (16, 987.0)] {
+            assert_eq!(
+                run(&format!("{source} fib({n})")).unwrap(),
+                Value::Number(want),
+                "fib({n})"
+            );
+        }
+    }
+
     /// A hoisted invariant read used in the loop's arithmetic takes the int32
     /// loop-accumulator plan (`s = (s + o.step) | 0`): the read-guard's exact
     /// int32 check seeds the provenance pass, so the RMW tail fuses into

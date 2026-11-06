@@ -1710,6 +1710,20 @@ pub enum LeafOp {
         direct_eval: bool,
         span: crux::Span,
     },
+    /// acc = `name(argc stack values)` — the register form of
+    /// `Step::CallFastIdent`: the callee resolves through the environment
+    /// (a script global's callee from inside a function body takes this
+    /// shape), the receiver is `undefined`. `env_constant` mirrors the
+    /// body's own flag for the warmed global-value-cell read; a segmented
+    /// loop-body run does not know it yet and passes `false` (the full
+    /// resolve, never a wrong binding). Same completion discipline as
+    /// [`LeafOp::CallFastSlot`].
+    CallFastIdent {
+        name: crux::AtomId,
+        argc: u8,
+        env_constant: bool,
+        span: crux::Span,
+    },
     /// acc = pop() op acc — the spilled left operand combined with the
     /// accumulator right operand (a body that spilled the first operand of
     /// a binary while computing the second).
@@ -2018,6 +2032,13 @@ pub struct CompiledBody {
     /// touches only `acc`, the frame segment, and the env fields, so its
     /// inline run is both faster to dispatch and cheaper to save/restore.
     pub leaf_ops: Option<Box<[LeafOp]>>,
+    /// The register form of a NON-leaf certified body, when every step lowered
+    /// (`None` = run the step path). The interpreter runs it as one program
+    /// (`run_body_segment`) instead of dispatching every step, and a call op
+    /// suspends to the driver instead of nesting. The body's `steps` stay
+    /// intact: the JIT, `--print-bytecode`, and the handler table are built on
+    /// them, and a body with handlers is never lowered here.
+    pub reg_ops: Option<Box<[LeafOp]>>,
     /// The certified top-level fast path (script-level bindings): the
     /// declared `var`/function names a script reads and writes directly on
     /// the global object, skipping the env-chain walk. `None` = the
@@ -2424,6 +2445,14 @@ impl CompiledBody {
 impl Trace for CompiledBody {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.steps.trace(visit);
+        // The whole-body program's constants are the same `Value`s its steps
+        // carry, but trace them where the program actually lives: a run holds
+        // no other edge to the op array.
+        if let Some(ops) = self.reg_ops.as_deref() {
+            for op in ops {
+                trace_leaf_op_heaps(op, visit);
+            }
+        }
         // A call site retains its first callee as a `Value` so the callee
         // function (and thus its box) stays alive: compiled `Op::GuardCallee`
         // code cannot be cleared the way the leaf caches are, so the retained
@@ -3968,6 +3997,10 @@ pub(crate) struct VmScratch {
     /// (`certified_call_inline`); restore must reset it to the caller's base
     /// even when the depth did not change.
     env_swapped: bool,
+    /// The caller's suspended register-program resume point (see
+    /// `Vm::reg_resume`). A nested run must not observe it — a stale op index
+    /// would resume the callee's program at the caller's position.
+    reg_resume: Option<u32>,
 }
 
 impl VmScratch {
@@ -4342,6 +4375,13 @@ pub struct Vm {
     /// frame popped. `None` whenever a step is dispatching, and always `None`
     /// on a Vm that is idle or between bodies.
     pending_call: Option<PendingCall>,
+    /// Where a register program resumes after a call op withdrew an
+    /// activation: the op index to re-enter at, recorded when the run
+    /// suspends and consumed by the next entry. It rides a `VmScratch` like
+    /// the other per-activation registers, so a nested run on this Vm (the
+    /// certified-callee lane) neither observes nor clobbers the caller's
+    /// record, and the same-stack frame's pop restores it.
+    reg_resume: Option<u32>,
     /// Cut 45: the next body of a JIT tail-call chain — a compiled body's
     /// `tail_call` helper replaced the frame (via `tail_prepare_ordinary`)
     /// and stashed the callee's body here; `run_compiled_body` loops on it
@@ -4622,6 +4662,7 @@ impl Vm {
             args_base_stack: Vec::new(),
             call_args: Vec::new(),
             pending_call: None,
+            reg_resume: None,
             tail_replaced: None,
             current_function: None,
             current_new_target: None,
@@ -4662,6 +4703,7 @@ impl Vm {
             control_saved,
             env_len: self.env_stack.len(),
             env_swapped: false,
+            reg_resume: self.reg_resume.take(),
         };
         self.ip = 0;
         self.acc = Value::Undefined;
@@ -4859,6 +4901,7 @@ impl Vm {
         self.switch_disc_set = scratch.switch_disc_set;
         self.chain_short = scratch.chain_short;
         self.globals_unshadowed = scratch.globals_unshadowed;
+        self.reg_resume = scratch.reg_resume;
         // A nested run's pushes above these cursors are dropped (the lane
         // returns its result through the entry's return value, not the shared
         // stack), so an error path inside it cannot leave a stale entry for
@@ -4975,6 +5018,7 @@ impl Vm {
         self.args_base_stack.clear();
         self.call_args.clear();
         self.pending_call = None;
+        self.reg_resume = None;
         self.current_function = None;
         self.current_new_target = None;
         self.saved_control.clear();
@@ -5007,6 +5051,7 @@ impl Vm {
         self.array_index_stack.clear();
         self.call_args.clear();
         self.pending_call = None;
+        self.reg_resume = None;
         self.leaf_frame_base = None;
         self.leaf_frame_offset = 0;
         self.global = None;
@@ -8245,11 +8290,53 @@ impl Vm {
         }
         self.restore_scratch(scratch);
         agent.roots.execution_context_stack.pop();
+        if result.is_none() {
+            // An abrupt callee exit abandons the caller's register program:
+            // the error routes against a step (a handler target or the
+            // caller's own error path), so the restored resume op would only
+            // be misread by an unrelated run.
+            self.reg_resume = None;
+        }
         if let Some(value) = result {
             self.stack.truncate(arg_start - below);
             self.stack.push(value);
         }
         caller
+    }
+
+    /// Run one segment of the current body and hand its outcome to the driver:
+    /// the body's whole-body register program when it has one (`reg_ops`), else
+    /// the step dispatcher. Both speak the driver's outcome vocabulary, so the
+    /// call/frame/tail-call handling is shared — a register program's call op
+    /// withdraws to the same `VmOutcome::Call` a call step does.
+    fn run_body_segment(
+        &mut self,
+        agent: &mut Agent,
+        body: &CompiledBody,
+    ) -> Result<VmOutcome, JsError> {
+        let Some(ops) = body.reg_ops.as_deref() else {
+            return self.run_inner_inner(agent, body);
+        };
+        let start = self.reg_resume.take();
+        if start.is_some() {
+            // The driver landed the withdrawn call's result on the stack,
+            // where the call op leaves it in `acc`. The depth is therefore the
+            // program's entry depth (nothing but the call site can be above
+            // it: the ops keep live operands in the shadow, not the stack).
+            self.acc = self.pop();
+        }
+        let stack_len = self.stack.len();
+        match self.run_leaf_ops::<true>(agent, ops, start.unwrap_or(0) as usize) {
+            Ok(_completion) if self.reg_resume.is_some() => Ok(VmOutcome::Call),
+            Ok(completion) => {
+                self.stack.truncate(stack_len);
+                Ok(VmOutcome::Completed(completion))
+            }
+            Err(error) => {
+                self.stack.truncate(stack_len);
+                Err(error)
+            }
+        }
     }
 
     fn run_inner_impl(
@@ -8277,6 +8364,10 @@ impl Vm {
             loop {
                 let body = current.get();
                 if let Some(error) = pending_error.take() {
+                    // The error unwinds the caller's segment (a handler resumes
+                    // at a step, not inside a register program), so a
+                    // suspended run's resume point is dead.
+                    self.reg_resume = None;
                     match self.route_step_error(agent, body, error) {
                         Ok(Some(outcome)) => return Ok(outcome),
                         Ok(None) => continue,
@@ -8293,7 +8384,7 @@ impl Vm {
                         }
                     }
                 }
-                let outcome = match self.run_inner_inner(agent, body) {
+                let outcome = match self.run_body_segment(agent, body) {
                     Ok(VmOutcome::TailCall(next)) => {
                         current = CurrentBody::Owned(next);
                         // The tracked body must follow the tail call (the
@@ -11405,12 +11496,32 @@ impl Vm {
                     // machinery owns the loop's completion — but a throwing
                     // op (TDZ, a setter, a coercion) propagates after the
                     // truncate, like a throwing leaf.
+                    //
+                    // A call op inside the run withdraws the activation and
+                    // hands it to the driver, so the call takes the same
+                    // driver lane a call STEP takes (rather than the nested
+                    // activation `complete_call` would run); the recorded op
+                    // resumes the run when the frame pops.
+                    let start = self.reg_resume.take();
+                    if start.is_some() {
+                        // The driver landed the call's result on the stack,
+                        // where the call op would have left it in `acc`.
+                        self.acc = self.pop();
+                    }
                     let stack_len = self.stack.len();
-                    let outcome = self.run_leaf_ops(agent, ops);
-                    self.stack.truncate(stack_len);
-                    match outcome {
-                        Ok(_) => {}
-                        Err(error) => return Err(error),
+                    match self.run_leaf_ops::<true>(agent, ops, start.unwrap_or(0) as usize) {
+                        Ok(_) if self.reg_resume.is_some() => {
+                            // Re-enter this step on resume: the same-stack
+                            // frame's scratch restores the ip, and the record
+                            // resumes the ops at its op.
+                            self.ip -= 1;
+                            return Ok(VmOutcome::Call);
+                        }
+                        Ok(_) => self.stack.truncate(stack_len),
+                        Err(error) => {
+                            self.stack.truncate(stack_len);
+                            return Err(error);
+                        }
                     }
                 }
                 Step::PushAcc => {
@@ -13323,7 +13434,25 @@ impl Vm {
         // handler coverage, iterator close, and disposal with the caller's
         // body and the restored `ip`. `run_inner`'s own error machinery
         // would run those against the leaf's empty stacks/tables.
-        let outcome = self.run_inner_inner(agent, ir);
+        //
+        // A leaf's own loop body can lower to a register run that CALLS OUT
+        // (`s += a.m(i)` inside the loop), and a run hands such a call to a
+        // driver instead of nesting it. The leaf lane owns no same-stack
+        // frame and no driver loop, so it performs the withdrawal here and
+        // re-enters the step that owns the run (the run's recorded op
+        // resumes it).
+        let mut outcome = self.run_inner_inner(agent, ir);
+        while matches!(outcome, Ok(VmOutcome::Call)) {
+            let Some(pending) = self.pending_call.take() else {
+                break;
+            };
+            if let Err(error) = self.complete_call(agent, pending) {
+                self.reg_resume = None;
+                outcome = Err(error);
+                break;
+            }
+            outcome = self.run_inner_inner(agent, ir);
+        }
         self.ip = caller_ip;
         self.leaf_frame_base = caller_leaf_frame_base;
         self.stack.truncate(frame_base);
@@ -13453,7 +13582,7 @@ impl Vm {
             debug_assert!(!ir.leaf_uses_env);
             (None, None)
         };
-        let outcome = self.run_leaf_ops(agent, ops);
+        let outcome = self.run_leaf_ops::<false>(agent, ops, 0);
         self.leaf_frame_base = caller_leaf_frame_base;
         self.leaf_frame_offset = caller_leaf_frame_offset;
         // An aliased frame lives in the caller's argument region, which the
@@ -13510,16 +13639,39 @@ impl Vm {
         })
     }
 
-    /// The register dispatch loop. The frame segment starts at
-    /// `stack[frame_base]` (slot `slot` lives at `frame_base + slot`); `acc`
+    /// Record where a register program must resume: the caller sees the record
+    /// and hands the withdrawn call to the driver. The completion
+    /// `run_leaf_ops` returns alongside it is meaningless.
+    #[inline(always)]
+    fn suspend_register_run(&mut self, pc: usize) {
+        debug_assert!(u32::try_from(pc).is_ok());
+        debug_assert!(self.reg_resume.is_none());
+        self.reg_resume = Some(pc as u32);
+    }
+
+    /// The register dispatch loop, entered at `start`. The frame segment starts
+    /// at `stack[frame_base]` (slot `slot` lives at `frame_base + slot`); `acc`
     /// is the implicit result register, read and written by every op. Every
     /// op mirrors the equivalent step's semantics exactly (including the
     /// `Step::BinaryImm` number-number inline). A lowering always ends in
     /// `ReturnAcc`; the fall-off default completes `Empty` like the step
     /// path's end-of-steps completion.
+    ///
+    /// A call op does not perform its call: it withdraws the activation onto
+    /// the Vm (`pending_call`), records the op to resume at
+    /// ([`Self::suspend_register_run`]), and stops the run, so the driver
+    /// performs the call with its dispatch frame popped (the same-stack lane)
+    /// and re-enters the program afterwards. The resume entry must have already
+    /// consumed the call's result — the caller pops it into `acc`, which is
+    /// where the call op leaves it.
     #[inline(always)]
-    fn run_leaf_ops(&mut self, agent: &mut Agent, ops: &[LeafOp]) -> Result<Completion, JsError> {
-        let mut pc = 0;
+    fn run_leaf_ops<const SUSPENDING: bool>(
+        &mut self,
+        agent: &mut Agent,
+        ops: &[LeafOp],
+        start: usize,
+    ) -> Result<Completion, JsError> {
+        let mut pc = start;
         while let Some(op) = ops.get(pc) {
             pc += 1;
             match op {
@@ -13645,22 +13797,10 @@ impl Vm {
                             _ => None,
                         }
                     });
-                    let value = if let Some(value) = smi_value {
-                        value
-                    } else if let Some(num) = self.acc.as_number() {
-                        match imm_binary_inline(*op, num, *imm) {
-                            Some(value) => value,
-                            None => crate::expr::apply_binary(
-                                agent,
-                                *op,
-                                &self.acc,
-                                &Value::Number(*imm),
-                            )?,
-                        }
-                    } else {
-                        crate::expr::apply_binary(agent, *op, &self.acc, &Value::Number(*imm))?
+                    self.acc = match smi_value {
+                        Some(value) => value,
+                        None => reg_bin_imm(agent, *op, &self.acc, *imm)?,
                     };
-                    self.acc = value;
                 }
                 LeafOp::BinConst { op, value } => {
                     // `x + (1)` compiles to Push(1)/Binary, not BinaryImm;
@@ -13680,7 +13820,7 @@ impl Vm {
                         ));
                     }
                     let left = *self.frame_get(*slot);
-                    self.acc = Self::binary_inline(agent, *op, &left, &Value::Number(*imm))?;
+                    self.acc = reg_bin_imm(agent, *op, &left, *imm)?;
                 }
                 LeafOp::BinCtxReg {
                     op,
@@ -13944,11 +14084,14 @@ impl Vm {
                 } => {
                     self.set_site(agent, *span);
                     self.do_call_fast_slot(agent, *callee_slot, None, *argc as usize)?;
-                    // A run owns no resume point: a withdrawn activation is
-                    // performed here, because the driver's protocol
-                    // (`VmOutcome::Call`) resumes at the next STEP and would
-                    // skip the rest of this run.
-                    if let Some(pending) = self.pending_call.take() {
+                    if SUSPENDING {
+                        if self.pending_call.is_some() {
+                            self.suspend_register_run(pc);
+                            return Ok(Completion::Empty);
+                        }
+                    } else if let Some(pending) = self.pending_call.take() {
+                        // Unreachable: a leaf body has no call step, so its
+                        // ops have no call op.
                         self.complete_call(agent, pending)?;
                     }
                     self.acc = self.pop();
@@ -13960,7 +14103,34 @@ impl Vm {
                 } => {
                     self.set_site(agent, *span);
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
-                    if let Some(pending) = self.pending_call.take() {
+                    if SUSPENDING {
+                        if self.pending_call.is_some() {
+                            self.suspend_register_run(pc);
+                            return Ok(Completion::Empty);
+                        }
+                    } else if let Some(pending) = self.pending_call.take() {
+                        // Unreachable: a leaf body has no call step, so its
+                        // ops have no call op.
+                        self.complete_call(agent, pending)?;
+                    }
+                    self.acc = self.pop();
+                }
+                LeafOp::CallFastIdent {
+                    name,
+                    argc,
+                    env_constant,
+                    span,
+                } => {
+                    self.set_site(agent, *span);
+                    self.do_call_fast_ident(agent, *name, *argc as usize, *env_constant)?;
+                    if SUSPENDING {
+                        if self.pending_call.is_some() {
+                            self.suspend_register_run(pc);
+                            return Ok(Completion::Empty);
+                        }
+                    } else if let Some(pending) = self.pending_call.take() {
+                        // Unreachable: a leaf body has no call step, so its
+                        // ops have no call op.
                         self.complete_call(agent, pending)?;
                     }
                     self.acc = self.pop();
@@ -17210,6 +17380,22 @@ fn imm_binary_inline(op: BinaryOp, left: f64, imm: f64) -> Option<Value> {
         }
         _ => return None,
     })
+}
+
+/// `left op imm` for the register lane's immediate ops: the number-number
+/// inline (the arithmetic, the numeric relationals, and the bitwise forms),
+/// falling back to the general evaluator — the `Step::BinaryImm` inline, shared
+/// so the two lanes cannot drift (`fib`'s `n < 2` is a register `BinImmLocal`,
+/// and a relational the inline does not answer pays an out-of-line call on
+/// every evaluation).
+#[inline(always)]
+fn reg_bin_imm(agent: &mut Agent, op: BinaryOp, left: &Value, imm: f64) -> Result<Value, JsError> {
+    if let Some(num) = left.as_number()
+        && let Some(value) = imm_binary_inline(op, num, imm)
+    {
+        return Ok(value);
+    }
+    crate::expr::apply_binary(agent, op, left, &Value::Number(imm))
 }
 
 /// Split an array/object element into its target and optional default
@@ -26674,7 +26860,8 @@ fn run_acc_is_number(ops: &[LeafOp], upto: usize, proven: &HashSet<usize>) -> bo
             | LeafOp::GetMemberNameLocal { .. }
             | LeafOp::GetMemberComputedLocal { .. }
             | LeafOp::CallFastSlot { .. }
-            | LeafOp::CallFast { .. } => false,
+            | LeafOp::CallFast { .. }
+            | LeafOp::CallFastIdent { .. } => false,
             _ => known,
         };
     }
@@ -27096,6 +27283,26 @@ fn spill_live_acc(scope: &mut ScopeInfo, ops: &mut Vec<LeafOp>, stack: &mut [Reg
     true
 }
 
+/// Spill the live accumulator in front of a register-lane call's operand
+/// materialization — unless it is the LAST operand and every operand ahead of
+/// it is a frame slot. `PushReg` leaves the accumulator alone, so those operands
+/// materialize without disturbing the value the trailing `PushAcc` still has to
+/// push; every other operand form loads through the accumulator and would
+/// clobber it (a call's `this`/callee pair, as in `a.m()(x)`). The spill is not
+/// free — a frame slot plus a store and a reload per call — and a computed
+/// call's argument IS the accumulator (`fib(n - 1)`), so this is the hot shape.
+/// Anything else spills as before.
+fn spill_for_call(scope: &mut ScopeInfo, ops: &mut Vec<LeafOp>, stack: &mut [RegOperand]) -> bool {
+    let safe = matches!(stack.last(), Some(RegOperand::Acc))
+        && stack[..stack.len() - 1]
+            .iter()
+            .all(|operand| matches!(operand, RegOperand::Reg { .. }));
+    if safe {
+        return true;
+    }
+    spill_live_acc(scope, ops, stack)
+}
+
 /// Materialize a shadow operand onto the machine stack — a register-lane
 /// call's `this`, callee, or argument slot. A frame slot pushes directly
 /// (`PushReg` leaves the accumulator alone); every other re-readable operand
@@ -27161,10 +27368,21 @@ fn lower_step(
     stack: &mut Vec<RegOperand>,
     counter_reads: &mut usize,
     // Whether a `LoadContextSlot` at depth > 0 may lower to the outer-context
-    // ops. Only the whole-body leaf lowering allows it: its ops run on the
+    // ops. Only the whole-body forms allow it: their ops run on the
     // interpreter's register executor (`RunRegBody` ops are also compiled by
     // the JIT, which has no outer-context form).
     allow_outer: bool,
+    // Whether the lowering covers the WHOLE body (the `leaf_ops`/`reg_ops`
+    // forms) rather than one straight-line segment of a loop body. A whole
+    // body may be entered mid-way by a jump, so a `return` that is not the
+    // last step is reachable from elsewhere and still lowers; and only a
+    // whole body knows the final environment-callee call shape (`reg_ops`
+    // is interpreter-only, so the JIT never sees that op).
+    whole_body: bool,
+    // The body's `env_constant` verdict (see `Step::CallFastIdent`). A
+    // segmented loop-body run is lowered mid-body, before the verdict is
+    // final, so it passes `false` — the full resolve, never a wrong binding.
+    env_constant: bool,
 ) -> Option<()> {
     match step {
         Step::Push(value) => stack.push(RegOperand::Const(*value)),
@@ -27884,7 +28102,7 @@ fn lower_step(
             // argument the single-accumulator model cannot materialize (a
             // post-increment write-back, an already spilled value) keeps the
             // step path.
-            if !spill_live_acc(scope, ops, stack) {
+            if !spill_for_call(scope, ops, stack) {
                 return None;
             }
             let start = stack.len().checked_sub(*argc as usize)?;
@@ -27910,7 +28128,7 @@ fn lower_step(
             // Every operand is materialized in source order, so the callee and
             // receiver arrive where the step path put them. Same spill rule
             // and same operand limits as `CallFastSlot`.
-            if !spill_live_acc(scope, ops, stack) {
+            if !spill_for_call(scope, ops, stack) {
                 return None;
             }
             let start = stack.len().checked_sub(*argc as usize + 2)?;
@@ -27927,6 +28145,32 @@ fn lower_step(
             });
             stack.push(RegOperand::Acc);
         }
+        Step::CallFastIdent { name, argc, span } => {
+            // The environment-callee call: only the whole-body program admits
+            // it. A segmented loop body keeps it on the step path, because the
+            // JIT compiles those ops and has no environment-callee register
+            // form of its own.
+            if !whole_body {
+                return None;
+            }
+            if !spill_for_call(scope, ops, stack) {
+                return None;
+            }
+            let start = stack.len().checked_sub(*argc as usize)?;
+            let args = stack.split_off(start);
+            for arg in &args {
+                if !push_operand(ops, arg) {
+                    return None;
+                }
+            }
+            ops.push(LeafOp::CallFastIdent {
+                name: *name,
+                argc: *argc,
+                env_constant,
+                span: *span,
+            });
+            stack.push(RegOperand::Acc);
+        }
         // A statement's completion is only read at the body's end, where
         // the register path's `Empty` maps identically to the step path's
         // `Normal` for leaf calls and constructs — nothing to emit. The
@@ -27938,9 +28182,11 @@ fn lower_step(
         | Step::ResetCompletion
         | Step::NormalizeCompletion => {}
         Step::Return => {
-            // A leaf body's `return` is its last statement; dead code
-            // after it (hoisted-var initializers) keeps the step path.
-            if index + 1 != total {
+            // A leaf body's `return` is its last statement; dead code after
+            // it (hoisted-var initializers) keeps the step path. A whole-body
+            // program's branch can reach a `return` that is not last, and the
+            // statements after it are reachable only by such a branch.
+            if !whole_body && index + 1 != total {
                 return None;
             }
             let value = stack.pop()?;
@@ -28021,6 +28267,8 @@ fn lower_leaf_ops_segmented(
                 &mut ops,
                 &mut stack,
                 &mut counter_reads,
+                false,
+                false,
                 false,
             )
             .is_none()
@@ -28103,6 +28351,8 @@ fn lower_leaf_ops(steps: &[Step], scope: &mut ScopeInfo) -> Option<Box<[LeafOp]>
             &mut stack,
             &mut counter_reads,
             true,
+            false,
+            false,
         )?;
     }
     match ops.last() {
@@ -28123,6 +28373,164 @@ fn lower_leaf_ops(steps: &[Step], scope: &mut ScopeInfo) -> Option<Box<[LeafOp]>
     }
     if !stack.is_empty() {
         return None;
+    }
+    Some(ops.into_boxed_slice())
+}
+
+/// What a step carries into its execution from the branch that jumps to it: no
+/// live operand, the one value in the accumulator, or a state the
+/// single-accumulator model cannot describe at a join.
+#[derive(Clone, Copy, PartialEq)]
+enum RegJoin {
+    Empty,
+    Acc,
+    Mixed,
+}
+
+fn reg_join_of(stack: &[RegOperand]) -> RegJoin {
+    match stack {
+        [] => RegJoin::Empty,
+        [RegOperand::Acc] => RegJoin::Acc,
+        _ => RegJoin::Mixed,
+    }
+}
+
+/// Move the shadow's single live operand into the accumulator (a no-op when it
+/// is already there), so a branch and its target agree on the state they carry
+/// across the join. `false` for any other shadow.
+fn join_into_acc(ops: &mut Vec<LeafOp>, stack: &mut Vec<RegOperand>) -> bool {
+    if stack.len() != 1 {
+        return false;
+    }
+    let value = stack.pop().expect("a one-entry shadow has its entry");
+    if !load_operand(ops, value) {
+        return false;
+    }
+    stack.push(RegOperand::Acc);
+    true
+}
+
+/// Lower a whole certified body — branches included — into ONE register
+/// program: the interpreter's fast lane for a body that calls out (`fib`'s
+/// `n < 2 ? n : fib(n - 1) + fib(n - 2)` dispatches 13 steps per activation
+/// today). Every step must lower; otherwise the body keeps the step path, so a
+/// half-lowered program can never run.
+///
+/// `Step::Jump`/`Step::JumpIfFalse` become [`LeafOp::Jump`]/
+/// [`LeafOp::JumpIfFalsy`] over OP indices: the forward pass records where each
+/// step's ops begin, then the jump targets are patched (a step emits zero, one
+/// or more ops, so a step index is not an op index).
+///
+/// A branch can also carry a live value to a shared epilogue — the compiler
+/// emits `LoadLocal; Jump(ret)` on the way to another statement's `Return` —
+/// and the register model can only carry it in the accumulator. Such a branch
+/// loads its one live operand into `acc` and records that its target expects
+/// exactly that; the target's ops are generated from the fall-through path, so
+/// the two must agree (`expected` vs `arrived`). Anything richer — a value on
+/// the machine stack, or two live operands — refuses the body.
+fn lower_whole_body(
+    steps: &[Step],
+    scope: &mut ScopeInfo,
+    env_constant: bool,
+) -> Option<Box<[LeafOp]>> {
+    let mut ops = Vec::new();
+    let mut stack: Vec<RegOperand> = Vec::new();
+    let mut counter_reads = 0;
+    // Where each step's ops begin (a jump's STEP target resolves through it).
+    let mut entry = vec![0usize; steps.len()];
+    // The live state a branch promises its target, and the state the linear
+    // fall-through path actually brings there.
+    let mut expected: Vec<Option<RegJoin>> = vec![None; steps.len()];
+    let mut arrived: Vec<RegJoin> = vec![RegJoin::Empty; steps.len()];
+    // `(op index of the placeholder branch, step target, conditional)`.
+    let mut fixups: Vec<(usize, usize, bool)> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        match expected[index] {
+            Some(RegJoin::Empty) => {
+                if !stack.is_empty() {
+                    return None;
+                }
+            }
+            Some(RegJoin::Acc) => {
+                if !join_into_acc(&mut ops, &mut stack) {
+                    return None;
+                }
+            }
+            Some(RegJoin::Mixed) | None => {}
+        }
+        // AFTER the join canonicalization: a branch already holds the joined
+        // value in the accumulator, so it must enter past the load the
+        // fall-through path needs.
+        entry[index] = ops.len();
+        arrived[index] = reg_join_of(&stack);
+        let (live, target) = match step {
+            Step::Jump(target) => {
+                let live = match reg_join_of(&stack) {
+                    RegJoin::Empty => RegJoin::Empty,
+                    RegJoin::Acc => RegJoin::Acc,
+                    RegJoin::Mixed => {
+                        if !join_into_acc(&mut ops, &mut stack) {
+                            return None;
+                        }
+                        RegJoin::Acc
+                    }
+                };
+                fixups.push((ops.len(), *target, false));
+                ops.push(LeafOp::Jump(usize::MAX));
+                // Nothing falls through an unconditional jump: the rest of the
+                // linear scan is reachable only through some branch, which
+                // establishes the state its target expects.
+                stack.clear();
+                (live, *target)
+            }
+            Step::JumpIfFalse(target) => {
+                // The branch tests the accumulator. The target's ops come from
+                // the fall-through path, which therefore must arrive with
+                // nothing live — `fib`'s `if (n < 2)` pops the condition and
+                // leaves the shadow empty, so the two agree.
+                let condition = stack.pop()?;
+                if !stack.is_empty() || !load_operand(&mut ops, condition) {
+                    return None;
+                }
+                fixups.push((ops.len(), *target, true));
+                ops.push(LeafOp::JumpIfFalsy(usize::MAX));
+                (RegJoin::Empty, *target)
+            }
+            step => {
+                lower_step(
+                    step,
+                    index,
+                    steps.len(),
+                    steps.get(index + 1),
+                    scope,
+                    &mut ops,
+                    &mut stack,
+                    &mut counter_reads,
+                    true,
+                    true,
+                    env_constant,
+                )?;
+                continue;
+            }
+        };
+        if target <= index {
+            if arrived[target] != live {
+                return None;
+            }
+        } else if let Some(slot) = expected.get_mut(target) {
+            match slot {
+                Some(want) if *want != live => return None,
+                _ => *slot = Some(live),
+            }
+        }
+    }
+    for (at, target, conditional) in fixups {
+        let to = entry.get(target).copied().unwrap_or(ops.len());
+        ops[at] = if conditional {
+            LeafOp::JumpIfFalsy(to)
+        } else {
+            LeafOp::Jump(to)
+        };
     }
     Some(ops.into_boxed_slice())
 }
@@ -28311,6 +28719,31 @@ pub fn compile_body(
     } else {
         None
     };
+    // The interpreter's whole-body register program: a certified body that
+    // branches and calls out (the recursive `fib` shape) runs as ONE register
+    // program instead of a step dispatch per step. A body with handlers keeps
+    // the step path — the handler table addresses step indices, and a program
+    // has none — as does anything the op set cannot express, and a body that
+    // reads an environment (the ops would resolve it against the activation's
+    // `body_context`/`lexical_env`, which only the leaf lane installs for
+    // itself).
+    let reg_ops = if !leaf
+        && compiler.scope.is_some()
+        && env_constant
+        && compiler.handlers.is_empty()
+        && !function.is_async
+        && !function.is_generator
+    {
+        let (steps, scope) = (&compiler.steps, &mut compiler.scope);
+        lower_whole_body(steps, scope.as_mut().expect("checked above"), env_constant).filter(
+            |ops| {
+                !ops.iter()
+                    .any(|op| leaf_op_reads_context(op) || leaf_op_reads_per_iter(op))
+            },
+        )
+    } else {
+        None
+    };
     let has_loop = body_has_loop(&compiler.steps);
     let has_call_apply = body_has_call_apply(&compiler.steps);
     let has_call_intrinsic = body_has_call_intrinsic(&compiler.steps);
@@ -28327,6 +28760,7 @@ pub fn compile_body(
             leaf_needs_env,
             leaf_uses_env,
             leaf_ops,
+            reg_ops,
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
@@ -28417,6 +28851,7 @@ pub fn compile_statements(
         leaf_needs_env: false,
         leaf_uses_env: false,
         leaf_ops: None,
+        reg_ops: None,
         script_globals: compiler.script_globals,
         jit_info: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),

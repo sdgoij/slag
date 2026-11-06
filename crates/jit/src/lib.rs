@@ -625,6 +625,7 @@ mod tests {
             leaf_needs_env: false,
             leaf_uses_env: false,
             leaf_ops: None,
+            reg_ops: None,
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
