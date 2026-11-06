@@ -790,6 +790,12 @@ pub(crate) struct AgentRoots {
     /// the Cut 27 lesson.
     pub(crate) slot_leaf_cells:
         RefCell<Box<[Option<crate::ir::SlotLeafCell>; crate::ir::SLOT_LEAF_CELLS]>>,
+    /// The call sites' negative leaf verdicts (see
+    /// [`crate::ir::NotLeafCell`]): same index space as
+    /// `slot_leaf_cells`, but a separate table so the positive cell's hot
+    /// path stays one payload compare.
+    pub(crate) not_leaf_cells:
+        Box<[Cell<Option<crate::ir::NotLeafCell>>; crate::ir::SLOT_LEAF_CELLS]>,
     /// Part B, B5.4: cached constructor boilerplate maps — (function id,
     /// prototype id, generation) → the final shape its body's `this.*`
     /// stores transition to, so every construct after the first starts the
@@ -1337,6 +1343,7 @@ impl AgentRoots {
             array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            not_leaf_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             same_stack_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             enum_key_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
@@ -1540,6 +1547,11 @@ impl Trace for AgentRoots {
         }
         for cell in self.slot_leaf_cells.borrow().iter().flatten() {
             cell.trace(visit);
+        }
+        for cell in self.not_leaf_cells.iter() {
+            if let Some(cell) = cell.get() {
+                cell.trace(visit);
+            }
         }
         for (_, entry) in self.leaf_cache.borrow().iter().flatten() {
             if let Some(entry) = entry {

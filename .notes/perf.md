@@ -17312,3 +17312,15 @@ Verified: `cargo clippy --workspace --all-targets -- -D warnings`, fmt,
 `cargo test --workspace` (all green), test262 language 23726/23726 +
 annexB 1086/1086 + built-ins 23821/23821, corpus 79/79 identical in jit and
 jitless.
+
+## LANDED (2026-11-06): a call site caches its callee's negative leaf verdict
+
+`fib`'s recursive call is a `CallFastIdent`: `do_call_fast_ident` misses the value-callee leaf cell (the callee is not a leaf, so nothing is ever stored), then `fast_call_core` re-probes — `can_inline_leaf`, the kind check, and `leaf_lookup` (a direct-mapped hit on the *negative* record, ~70 Ir) — only to fall through to the general path. Every non-leaf call paid that probe.
+
+The site now caches the verdict itself in `AgentRoots::not_leaf_cells` — a `Cell<Option<NotLeafCell>>` table in the same index space as `slot_leaf_cells`, holding the payload and a strong `callee` (so a recycled address cannot match a stale entry). `fast_call_core` records it after the leaf probe fails for an `EcmaScript` callee, and the three call lanes consult it on a leaf-cell miss; a hit passes `leaf_known_not` so the core skips the probe. Sound because `leaf_inline` is final for an id: `set_compiled` computes it before `register_ecma_function` publishes the record, and ids are never reused (the same argument `leaf_lookup`'s own negative cell rests on).
+
+`fib` 415 -> 398 ms (-4%, interleaved min of 15-31); `method` 219 -> 211 (-3.7%); `sieve`/`arith`/`array`/`object`/`fn_*` unchanged within noise.
+
+**Two measurement traps met on the way.** (1) The first cut instead made `SlotLeafCell::entry` an `Option<LeafEntry>` and restructured the two hot lanes around it; `local` regressed 8% even though its callee is a leaf and the change is off its hot path. (2) Even after restoring every hot function to its original source (the compiled `do_call_fast_slot` is 4 bytes different, and `local`'s instruction count is *lower*), `local` still measured +4% against the sibling build. An inert perturbation — `GLOBAL_CELLS` 256 -> 512, which `local` cannot observe — moved it -4.3% with `fib` at 0.998, proving the swing is binary layout, not the change. Keep the negative table *separate* from the positive cell so the hot path stays one payload compare; do not re-merge them.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins 23821/23821; corpus 79/79 identical in jit and jitless.

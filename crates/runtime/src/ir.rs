@@ -3445,6 +3445,25 @@ pub(crate) struct SlotLeafCell {
     pub entry: LeafEntry,
 }
 
+/// A call site's negative leaf verdict: this exact callee is not
+/// leaf-inlineable (a non-leaf `EcmaScript` body, a builtin, a bound
+/// function). Kept in its own table so the positive cell's hot path is
+/// untouched; the verdict is a property of the function record, and ids are
+/// never reused. The held `callee` pins the payload, so a recycled address
+/// cannot match a stale entry.
+#[derive(Clone, Copy)]
+pub(crate) struct NotLeafCell {
+    pub payload: u64,
+    #[allow(dead_code)]
+    pub callee: Value,
+}
+
+impl Trace for NotLeafCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.callee.trace(visit);
+    }
+}
+
 impl Trace for SlotLeafCell {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.callee.trace(visit);
@@ -3465,6 +3484,7 @@ pub(crate) const SLOT_LEAF_CELLS: usize = 256;
 /// call. `Global` (a stable global callee, validated by the global
 /// object's generation), `Slot` (a frame-slot callee, validated by its
 /// heap payload), or none (`CallFast`'s `[this, callee]` stack shape).
+#[derive(Clone, Copy)]
 pub(crate) enum LeafCacheSite {
     Global { name: crux::AtomId },
     Slot { index: usize, callee: Value },
@@ -5243,6 +5263,16 @@ impl Vm {
     fn value_leaf_index(payload: u64) -> usize {
         const HALF: usize = SLOT_LEAF_CELLS / 2;
         HALF + ((payload.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (HALF - 1))
+    }
+
+    /// Whether cache site `index` holds a negative leaf verdict for this exact
+    /// callee payload (see [`NotLeafCell`]).
+    #[inline]
+    fn callee_known_not_leaf(agent: &Agent, index: usize, payload: u64) -> bool {
+        matches!(
+            agent.roots.not_leaf_cells[index].get(),
+            Some(cell) if cell.payload == payload
+        )
     }
 
     /// Resolve and cache the global-object slot for a declared top-level
@@ -14597,6 +14627,8 @@ impl Vm {
             {
                 return self.run_leaf_entry(agent, argc, this, entry, 2);
             }
+            // A cached negative verdict: skip the probe in the shared core.
+            let leaf_known_not = Self::callee_known_not_leaf(agent, index, payload);
             return self.fast_call_core(
                 agent,
                 argc,
@@ -14605,6 +14637,7 @@ impl Vm {
                 this,
                 2,
                 LeafCacheSite::Slot { index, callee },
+                leaf_known_not,
             );
         }
         // The shared core: `below` values under the argument region (2 for
@@ -14618,6 +14651,7 @@ impl Vm {
             this,
             2,
             LeafCacheSite::None,
+            false,
         )
     }
 
@@ -15495,6 +15529,7 @@ impl Vm {
             Value::Undefined,
             0,
             LeafCacheSite::Global { name },
+            false,
         )
     }
 
@@ -15571,6 +15606,7 @@ impl Vm {
                 index: slot & (SLOT_LEAF_CELLS - 1),
                 callee,
             },
+            false,
         )
     }
 
@@ -15585,6 +15621,7 @@ impl Vm {
         env_constant: bool,
     ) -> Result<(), JsError> {
         let callee = self.load_ident_value(agent, name, env_constant)?;
+        let mut leaf_known_not = false;
         if let Some(payload) = callee.heap_payload() {
             let index = Self::value_leaf_index(payload);
             let cached = {
@@ -15601,6 +15638,7 @@ impl Vm {
             {
                 return self.run_leaf_entry(agent, argc, Value::Undefined, entry, 0);
             }
+            leaf_known_not = Self::callee_known_not_leaf(agent, index, payload);
         }
         // Anything else takes the general path, which is written for the
         // canonical `[.., this, callee, a1..aN]` layout: build it around the
@@ -15611,6 +15649,20 @@ impl Vm {
             .copy_within(arg_start..arg_start + argc, arg_start + 2);
         self.stack[arg_start] = Value::Undefined;
         self.stack[arg_start + 1] = callee;
+        if leaf_known_not {
+            // The callee's negative verdict is already known: skip the leaf
+            // probe in the shared core.
+            return self.fast_call_core(
+                agent,
+                argc,
+                false,
+                callee,
+                Value::Undefined,
+                2,
+                LeafCacheSite::None,
+                true,
+            );
+        }
         self.do_call_fast(agent, argc, false)
     }
 
@@ -16131,6 +16183,9 @@ impl Vm {
         this: Value,
         below: usize,
         leaf_cache: LeafCacheSite,
+        // The call site already holds a negative leaf verdict for this callee:
+        // skip the probe below (the caller cached it in the slot-callee cell).
+        leaf_known_not: bool,
     ) -> Result<(), JsError> {
         // A termination request stops the next call. Every arm below starts
         // new execution — the leaf inline, a registered builtin's handler —
@@ -16146,7 +16201,8 @@ impl Vm {
         // checks are the cheap ones first; the record lookup is what the
         // general path pays anyway. A leaf is never eval (a builtin) and
         // always callable, so the eval/type checks below are skipped.
-        if self.can_inline_leaf()
+        if !leaf_known_not
+            && self.can_inline_leaf()
             && let ValueKind::Function(function) = callee.kind()
             && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
             // The leaf runs with the caller's realm current: cross-realm
@@ -16203,6 +16259,20 @@ impl Vm {
                 return Ok(());
             }
             return self.run_inline_leaf(agent, argc, this, entry, below, None);
+        }
+        // Cache a definitive negative leaf verdict at this call site: an
+        // EcmaScript callee whose record is not leaf-inlineable can never
+        // become one (the record is immutable once compiled and function ids
+        // are never reused), so the next call through this site skips the
+        // probe. Kept out of the positive cell so its hot path is untouched.
+        if !leaf_known_not
+            && let LeafCacheSite::Slot { index, callee } = leaf_cache
+            && let Some(payload) = callee.heap_payload()
+            && let ValueKind::Function(function) = callee.kind()
+            && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+            && agent.leaf_lookup(function.id()).is_none()
+        {
+            agent.roots.not_leaf_cells[index].set(Some(NotLeafCell { payload, callee }));
         }
         let args = &self.stack[arg_start..n];
         // Registered-builtin fast path: an installed builtin (Map/Set/
