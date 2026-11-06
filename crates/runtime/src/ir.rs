@@ -4040,7 +4040,10 @@ struct InlineCallFrame {
     current_function: Option<Value>,
     current_new_target: Option<Value>,
     strict: bool,
-    call_args: Vec<Value>,
+    /// The caller's `call_args`, saved only when it was non-empty: only a
+    /// body with an `arguments` slot ever fills it, so the common frame
+    /// otherwise paid a `Vec` move (and a drop of the callee's) per call.
+    call_args: Option<Vec<Value>>,
     nested_frame: Option<*mut Value>,
     leaf_frame_base: Option<usize>,
     leaf_frame_offset: usize,
@@ -4059,7 +4062,9 @@ impl Trace for InlineCallFrame {
         self.body_context.trace(visit);
         self.current_function.trace(visit);
         self.current_new_target.trace(visit);
-        self.call_args.trace(visit);
+        if let Some(call_args) = &self.call_args {
+            call_args.trace(visit);
+        }
     }
 }
 
@@ -4603,6 +4608,10 @@ impl Vm {
     /// puts the caller's back.
     #[inline]
     pub(crate) fn save_scratch(&mut self) -> VmScratch {
+        // Read the caller's control verdict BEFORE the literal: taking it out
+        // afterwards forces a second copy of the whole ~168-byte struct on
+        // every call.
+        let control_saved = self.has_control_state();
         let scratch = VmScratch {
             ip: self.ip,
             acc: self.acc,
@@ -4619,7 +4628,7 @@ impl Vm {
             array_index_len: self.array_index_stack.len(),
             var_ref_len: self.var_ref_stack.len(),
             class_len: self.class_stack.len(),
-            control_saved: false,
+            control_saved,
             env_len: self.env_stack.len(),
             env_swapped: false,
         };
@@ -4640,12 +4649,9 @@ impl Vm {
         // on the `Vm` (traced), not in a Rust local, because an env holds live
         // GC values and a nested run may allocate. The move is outlined into a
         // cold helper so this hot path stays small enough to inline.
-        let control_saved = self.has_control_state();
         if control_saved {
             self.save_control_state();
         }
-        let mut scratch = scratch;
-        scratch.control_saved = control_saved;
         scratch
     }
 
@@ -8116,6 +8122,8 @@ impl Vm {
             };
             self.stack[base + slot] = value;
         }
+        let caller_call_args =
+            (!self.call_args.is_empty()).then(|| std::mem::take(&mut self.call_args));
         self.inline_calls.push(InlineCallFrame {
             scratch,
             lexical_env: self.lexical_env,
@@ -8123,7 +8131,7 @@ impl Vm {
             current_function: self.current_function,
             current_new_target: self.current_new_target,
             strict: self.strict,
-            call_args: std::mem::take(&mut self.call_args),
+            call_args: caller_call_args,
             nested_frame: self.nested_frame,
             leaf_frame_base: self.leaf_frame_base,
             leaf_frame_offset: self.leaf_frame_offset,
@@ -8188,7 +8196,12 @@ impl Vm {
         self.current_function = current_function;
         self.current_new_target = current_new_target;
         self.strict = strict;
-        self.call_args = call_args;
+        match call_args {
+            Some(call_args) => self.call_args = call_args,
+            // The caller had none: drop whatever the callee's `arguments` slot
+            // left behind (the `Vec` is kept for reuse).
+            None => self.call_args.clear(),
+        }
         self.nested_frame = nested_frame;
         self.leaf_frame_base = leaf_frame_base;
         self.leaf_frame_offset = leaf_frame_offset;
@@ -9140,6 +9153,14 @@ impl Vm {
                             BinaryOp::Div => Value::Number(num / *imm),
                             BinaryOp::Rem => Value::Number(num % *imm),
                             BinaryOp::Exp => Value::Number(num.powf(*imm)),
+                            // A relational on two Numbers is the plain f64
+                            // comparison, NaN included (the general evaluator
+                            // reaches the same answer through ToPrimitive and
+                            // a call, which `n < 2` in a hot body cannot afford).
+                            BinaryOp::LessThan => Value::Boolean(num < *imm),
+                            BinaryOp::LessEqual => Value::Boolean(num <= *imm),
+                            BinaryOp::GreaterThan => Value::Boolean(num > *imm),
+                            BinaryOp::GreaterEqual => Value::Boolean(num >= *imm),
                             _ => {
                                 crate::expr::apply_binary(agent, *op, &left, &Value::Number(*imm))?
                             }
@@ -11143,7 +11164,7 @@ impl Vm {
                 }
                 Step::JumpIfFalse(target) => {
                     let value = self.pop();
-                    if !crux::convert::to_boolean(&value) {
+                    if !truthy(&value) {
                         self.ip = *target;
                     }
                 }
@@ -11487,13 +11508,13 @@ impl Vm {
                 }
                 Step::JumpIfTrue(target) => {
                     let value = self.pop();
-                    if crux::convert::to_boolean(&value) {
+                    if truthy(&value) {
                         self.ip = *target;
                     }
                 }
                 Step::JumpIfFalseKeep(target) => {
                     let value = self.pop();
-                    if !crux::convert::to_boolean(&value) {
+                    if !truthy(&value) {
                         self.stack.push(value);
                         self.ip = *target;
                     } else {
@@ -11504,7 +11525,7 @@ impl Vm {
                 }
                 Step::JumpIfTrueKeep(target) => {
                     let value = self.pop();
-                    if crux::convert::to_boolean(&value) {
+                    if truthy(&value) {
                         self.stack.push(value);
                         self.ip = *target;
                     } else {
@@ -17111,6 +17132,17 @@ enum ThrowAction {
 
 pub(crate) fn is_nullish(value: &Value) -> bool {
     matches!(value.kind(), ValueKind::Undefined | ValueKind::Null)
+}
+
+/// `ToBoolean` with a boolean operand answered inline. A comparison's result is
+/// already a Boolean, so the conditional jumps — the common case — skip the
+/// out-of-line `crux::convert::to_boolean`.
+#[inline]
+fn truthy(value: &Value) -> bool {
+    match value.kind() {
+        ValueKind::Boolean(b) => b,
+        _ => crux::convert::to_boolean(value),
+    }
 }
 
 /// Split an array/object element into its target and optional default

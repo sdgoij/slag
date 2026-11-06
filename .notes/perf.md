@@ -17373,3 +17373,42 @@ mode you are claiming, not just next to the baseline.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace (40 suites, green); test262 language 23726/23726, annexB 1086/1086,
 built-ins 23821/23821; corpus 79/79, jit == jitless == the pre-change binary.
+
+## LANDED (2026-11-06): three per-call copies and one out-of-line compare
+
+Callgrind on `fib` (150,049 activations, 2248 Ir each) put ~700 Ir in the call
+machinery. Four of its items were pure overhead:
+
+- **`save_scratch` copied the whole 168-byte `VmScratch` twice.** The struct was
+  built with `control_saved: false`, then `has_control_state()` ran, then
+  `let mut scratch = scratch; scratch.control_saved = control_saved;` copied all
+  21 words to patch one bool (~19 Ir/call). The verdict is now read before the
+  literal.
+- **`InlineCallFrame::call_args` is `Option<Vec<Value>>`.** Only a body with an
+  `arguments` slot ever fills `Vm::call_args`, but the frame took the `Vec`
+  (`mem::take`) and the pop reassigned it — a `Vec` move plus a drop of the
+  callee's (~8 Ir/call). The pop `clear()`s when the caller had none, so the
+  callee's `arguments` vector cannot leak into the caller.
+- **The conditional jumps answer a Boolean inline** (`truthy`): a comparison's
+  result is already a `Boolean`, so `if (… < …)` was paying an out-of-line
+  `crux::convert::to_boolean` call (~11 Ir) to re-derive it.
+- **`Step::BinaryImm`'s number-number inline now covers the four relationals.**
+  `n < 2` in `fib` fell to `apply_binary` → `abstract_relational` (~51 Ir for a
+  plain f64 compare).
+
+`fib` 337.3M -> 321.1M Ir (**-4.8%**, callgrind) and 407 -> 374 ms (--jitless,
+interleaved min of 21, -8%). Against `bs`: `fib` njit/bs 6.35 -> 6.1.
+
+**The same arms inside `binary_inline` cost `local`.** Adding the four
+relationals to `binary_inline` — which is `#[inline(always)]` and inlined into
+every register op — measured `local` +6%. Reverting only that half did not
+recover it, and callgrind settles why: `local`'s instruction count is identical
+to the byte (2,098,379,123 -> 2,098,260,704, -0.006%) while its wall clock moved
++9%. That is the documented binary-layout sensitivity of this row, not work.
+Check the instruction count before believing a single-row wall-clock delta on
+`local`; the relational arms were still left out of `binary_inline`, because
+there the size cost is real and the win is `fib`-only.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79, jit == jitless == the previous commit.
