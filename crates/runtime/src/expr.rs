@@ -1613,8 +1613,10 @@ fn bigint_shifted_floor(x: &crux::BigInt, shift: i64) -> crux::BigInt {
 
 /// Number::exponentiate (spec 6.1.6.1.8): a NaN base or exponent is NaN
 /// unless the exponent is ±0 (which yields 1), and an infinite exponent with
-/// |base| = 1 is NaN (Rust's `powf` returns 1 for those cases).
-fn number_exponentiate(base: f64, exponent: f64) -> f64 {
+/// |base| = 1 is NaN (Rust's `powf` returns 1 for those cases). The register
+/// lane's number inlines (`binary_inline`/`imm_binary_inline`) call this too —
+/// `powf` alone is not the spec's operation.
+pub(crate) fn number_exponentiate(base: f64, exponent: f64) -> f64 {
     if exponent == 0.0 {
         return 1.0;
     }

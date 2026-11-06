@@ -14408,7 +14408,11 @@ impl Vm {
                 BinaryOp::Mul => return Ok(Value::Number(left * right)),
                 BinaryOp::Div => return Ok(Value::Number(left / right)),
                 BinaryOp::Rem => return Ok(Value::Number(left % right)),
-                BinaryOp::Exp => return Ok(Value::Number(left.powf(right))),
+                // Not `powf`: the spec's `|base| = 1` with an infinite
+                // exponent is NaN (and `1 ** NaN` is NaN, `NaN ** 0` is 1).
+                BinaryOp::Exp => {
+                    return Ok(Value::Number(crate::expr::number_exponentiate(left, right)));
+                }
                 _ => {}
             }
         }
@@ -17484,7 +17488,7 @@ fn imm_binary_inline(op: BinaryOp, left: f64, imm: f64) -> Option<Value> {
         BinaryOp::Mul => Value::Number(left * imm),
         BinaryOp::Div => Value::Number(left / imm),
         BinaryOp::Rem => Value::Number(left % imm),
-        BinaryOp::Exp => Value::Number(left.powf(imm)),
+        BinaryOp::Exp => Value::Number(crate::expr::number_exponentiate(left, imm)),
         // Two Numbers: `Abstract Relational Comparison` is the plain f64
         // comparison (NaN included — every relational is false).
         BinaryOp::LessThan => Value::Boolean(left < imm),

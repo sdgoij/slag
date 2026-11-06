@@ -17863,3 +17863,31 @@ executor cost — not a single removable piece.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79 identical in both modes and under `--gc-stress`.
+
+## FIXED (2026-11-06): the number inlines call Number::exponentiate, not `powf`
+
+The two `--jitless` conformance failures this session kept hitting
+(`expressions/exponentiation/applying-the-exp-operator_A7/A8`) were not
+conformance gaps but a divergence between the interpreter's inline arithmetic
+and the helper path: `binary_inline`'s and `imm_binary_inline`'s `Exp` arms
+called `f64::powf` directly, and IEEE `pow` disagrees with spec 6.1.6.1.8 in
+three places — `|base| = 1` with an infinite exponent is NaN (IEEE: 1),
+`1 ** NaN` is NaN (IEEE: 1), and `NaN ** 0` is 1 (both agree, but only the
+helper handled the ordering). The JIT was unaffected because it does not
+inline `Exp` (cranelift has no `fpow`), which is why the default-mode sweeps
+were green and only `--jitless` disagreed.
+
+Both arms now call `expr::number_exponentiate` (the same function
+`apply_binary` uses), so the inline and general paths can no longer drift. The
+`1e999` case matters for the immediate form: a Number literal exponent can be
++Infinity, so `x ** 1e999` reached `imm_binary_inline` with an infinite imm.
+
+Instruction counts are unchanged on every suite row (`fib` 4,691.8M vs
+4,691.9M, `arith` and `local` identical): `powf` was already an out-of-line
+call, and the arm only runs for `**`.
+
+`--jitless` language is now 23726/23726 (was 23724 with those two failures);
+default-mode language/annexB/built-ins 23726/1086/23821; corpus 79/79 identical
+in both modes. Pinned by `eval::tests::the_number_exponentiate_inlines_keep_the_specials`,
+which drives `Step::Binary`, `BinaryImm`, the register `BinConst` arm, and
+`Math.pow` through both the specials and the cases that were always right.

@@ -7755,4 +7755,53 @@ mod tests {
         let value = agent.run_script("x + 1").unwrap();
         assert_eq!(value, Value::Number(42.0));
     }
+
+    #[test]
+    fn the_number_exponentiate_inlines_keep_the_specials() {
+        // `Number::exponentiate` differs from IEEE `powf`: an infinite
+        // exponent with |base| = 1 is NaN, `1 ** NaN` is NaN, and `NaN ** 0`
+        // is 1. The interpreter's number inlines (`binary_inline` for
+        // `Step::Binary`/the register combines, `imm_binary_inline` for
+        // `BinaryImm`/`BinImm`) called `powf` directly, so `--jitless`
+        // disagreed with the helper path (and the JIT) on all three.
+        let number = |source: &str| {
+            run(source)
+                .unwrap_or_else(|error| panic!("{source}: {error}"))
+                .as_number()
+                .unwrap_or_else(|| panic!("{source}: not a Number"))
+        };
+        // Two numbers through `binary_inline`.
+        assert!(number("1 ** Infinity").is_nan(), "1 ** Infinity");
+        assert!(number("(-1) ** Infinity").is_nan(), "(-1) ** Infinity");
+        assert!(number("(-1) ** -Infinity").is_nan(), "(-1) ** -Infinity");
+        assert!(number("1 ** NaN").is_nan(), "1 ** NaN");
+        assert_eq!(number("NaN ** 0"), 1.0, "NaN ** 0");
+        // A Number literal exponent reaches `imm_binary_inline` (a `1e999`
+        // literal is +Infinity).
+        assert!(
+            number("function f(x) { return x ** 1e999; } f(1)").is_nan(),
+            "x ** 1e999 with x = 1"
+        );
+        assert!(
+            number("function f(x) { return x ** 1e999; } f(-1)").is_nan(),
+            "x ** 1e999 with x = -1"
+        );
+        assert_eq!(
+            number("function f(x) { return x ** 1e999; } f(2)"),
+            f64::INFINITY,
+            "x ** 1e999 with x = 2"
+        );
+        // A constant base reaches the register lane's `BinConst` arm.
+        assert!(
+            number("function g() { return 1 ** 1e999; } g()").is_nan(),
+            "1 ** 1e999"
+        );
+        // The cases that were always right stay right.
+        assert_eq!(number("2 ** 10"), 1024.0);
+        assert_eq!(number("2 ** Infinity"), f64::INFINITY);
+        assert_eq!(number("0.5 ** Infinity"), 0.0);
+        assert_eq!(number("0.5 ** -Infinity"), f64::INFINITY);
+        assert!(number("(-2) ** 0.5").is_nan());
+        assert!(number("Math.pow(1, Infinity)").is_nan());
+    }
 }
