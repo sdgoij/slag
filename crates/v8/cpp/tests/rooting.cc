@@ -70,6 +70,25 @@ SLAG_NOINLINE void ChurnAndCollect(v8::Isolate* isolate, SlagContext* slag) {
   }
 }
 
+// A weak `Persistent` has to be made in a frame that returns, and the stack
+// scrubbed, or the conservative scan keeps the value alive — the same shape
+// `gin-shapes` uses for its weak-callback test.
+void IgnoredWeakCallback(const v8::WeakCallbackInfo<int>&) {}
+
+SLAG_NOINLINE void MakeWeakPersistentWithCallback(
+    v8::Isolate* isolate, v8::Persistent<v8::Object>* weak, int* parameter) {
+  v8::HandleScope scope(isolate);
+  weak->Reset(isolate, v8::Object::New(isolate));
+  weak->SetWeak(parameter, &IgnoredWeakCallback,
+                v8::WeakCallbackType::kParameter);
+}
+
+SLAG_NOINLINE void ScrubStack(int depth) {
+  volatile uint64_t pad[16] = {};
+  if (depth > 0) ScrubStack(depth - 1);
+  (void)pad[0];
+}
+
 }  // namespace
 
 int main() {
@@ -148,6 +167,53 @@ int main() {
       }
       if (word == 0) {
         fprintf(stderr, "the bare word was empty, so the control proved nothing\n");
+        ++failures;
+      }
+    }
+
+    // `Persistent`: the deprecated handle V8 keeps for pre-`Global` code. It is
+    // a `Global` here, so the same retention has to hold it up — an object made
+    // in a frame that returns, with the stack scrubbed, so nothing else does.
+    {
+      v8::Persistent<v8::Object> persistent;
+      if (!persistent.IsEmpty()) {
+        fprintf(stderr, "a default Persistent is not empty\n");
+        ++failures;
+      }
+      {
+        v8::HandleScope scoped(isolate);
+        persistent.Reset(isolate, v8::Object::New(isolate));
+      }
+      ScrubStack(16);
+      isolate->RequestGarbageCollectionForTesting(v8::kFullGarbageCollection);
+      if (persistent.IsEmpty()) {
+        fprintf(stderr, "a Persistent did not survive the collection\n");
+        ++failures;
+      }
+      persistent.Reset();
+      if (!persistent.IsEmpty()) {
+        fprintf(stderr, "Reset() left the Persistent non-empty\n");
+        ++failures;
+      }
+    }
+
+    // A weak `Persistent` empties when the collector takes its value, which is
+    // what Blink asserts of the persistents it hands to `SetWeak`. The
+    // callback form is the shape `gin-shapes` proves; the zero-argument
+    // `SetWeak()` is the same call without a listener, and whether the engine
+    // empties that one is still open — recorded rather than asserted.
+    {
+      v8::Persistent<v8::Object> weak;
+      int parameter = 0;
+      MakeWeakPersistentWithCallback(isolate, &weak, &parameter);
+      if (!weak.IsWeak()) {
+        fprintf(stderr, "SetWeak() left the Persistent strong\n");
+        ++failures;
+      }
+      ScrubStack(16);
+      isolate->RequestGarbageCollectionForTesting(v8::kFullGarbageCollection);
+      if (!weak.IsEmpty()) {
+        fprintf(stderr, "a weak Persistent kept its value alive\n");
         ++failures;
       }
     }

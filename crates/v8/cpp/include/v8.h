@@ -2433,7 +2433,15 @@ class Global {
   Global(Isolate*, Local<T> local) { Hold(local); }
   ~Global() { Release(); }
 
-  bool IsEmpty() const { return empty_; }
+  /* A weak handle answers empty once the collector has taken its value, which
+   * is what V8's `Persistent::IsEmpty` reports and what Blink's weak-reference
+   * tests assert; the flag alone only says "never held, or reset". */
+  bool IsEmpty() const {
+    if (empty_) return true;
+    if (weak_ == nullptr) return false;
+    uint64_t live = 0;
+    return slag_weak_get(weak_, &live) != 0;
+  }
   Local<T> Get(Isolate*) const {
     if (empty_) return Local<T>();
     if (weak_ != nullptr) {
@@ -2491,6 +2499,15 @@ class Global {
 
   bool IsWeak() const { return weak_ != nullptr; }
 
+  /* Make the handle weak with no callback — `v8::Persistent::SetWeak()`'s
+   * shape. The host watches `IsEmpty` instead of hearing about the collection. */
+  void SetWeak() {
+    if (empty_ || !kEngineValue || weak_ != nullptr) return;
+    weak_ = slag_weak_new(value_);
+    slag_root_release(value_);
+    value_ = 0;
+  }
+
   void SetWrapperClassId(uint16_t class_id) { wrapper_class_id_ = class_id; }
   uint16_t WrapperClassId() const { return wrapper_class_id_; }
 
@@ -2534,6 +2551,72 @@ class Global {
   bool empty_ = true;
   SlagWeak* weak_ = nullptr;
   uint16_t wrapper_class_id_ = 0;
+};
+
+/* A deprecated handle kept for pre-`Global` code (`v8-persistent-handle.h`).
+ * It holds a `Global<T>`, so rooting, `Get`, `IsEmpty`, the weak pair and the
+ * wrapper class id all behave the same. Two divergences, both recorded:
+ *
+ * - The destructor always releases the root. V8's only traits class sets
+ *   `kResetInDestructor` false, which is the leak its own caveat warns about;
+ *   leaking a root is the worse of the two, so this one is safe rather than
+ *   faithful. `kResetInDestructor` is still carried as the constant V8 has.
+ * - `ClearWeak<P>()` does not answer the parameter it was given, so only the
+ *   plain `ClearWeak()` is offered. A host that needs the pointer back keeps it
+ *   itself.
+ *
+ * The deprecated `Cast`/`As` are absent: Blink's bindings core uses neither,
+ * and `Local::As<T>` is what V8 points at instead. */
+template <class T, class M>
+class Persistent;
+
+template <class T>
+class NonCopyablePersistentTraits {
+ public:
+  using NonCopyablePersistent = Persistent<T, NonCopyablePersistentTraits<T>>;
+  static const bool kResetInDestructor = false;
+  template <class S, class M2>
+  static void Copy(const Persistent<S, M2>&, NonCopyablePersistent*) {
+    static_assert(sizeof(S) == 0,
+                  "NonCopyablePersistentTraits::Copy is not instantiable");
+  }
+};
+
+template <class T>
+class PersistentBase : public Global<T> {
+ public:
+  PersistentBase() = default;
+
+  /* The `Reset` overloads below hide the base's, so the names that must stay
+   * visible (`Reset()` and `Reset(Isolate*, Local<T>)`) are pulled back in. */
+  using Global<T>::Reset;
+
+  /* V8's `Reset` takes any `Local<S>`/`PersistentBase<S>` that derives from
+   * `T`, where `Global`'s takes exactly `Local<T>`. */
+  template <class S, typename = std::enable_if_t<std::is_base_of_v<T, S>>>
+  void Reset(Isolate* isolate, const Local<S>& other) {
+    Global<T>::Reset(isolate, other);
+  }
+  template <class S>
+  void Reset(Isolate* isolate, const PersistentBase<S>& other) {
+    Global<T>::Reset(isolate, other.Get(isolate));
+  }
+};
+
+template <class T, class M = NonCopyablePersistentTraits<T>>
+class Persistent : public PersistentBase<T> {
+ public:
+  Persistent() = default;
+
+  template <class S, typename = std::enable_if_t<std::is_base_of_v<T, S>>>
+  Persistent(Isolate* isolate, Local<S> that) {
+    this->Reset(isolate, that);
+  }
+
+  /* A `Persistent` is reset, never copied: `M::Copy` is the non-instantiable
+   * one, so leaving the copy operations deleted is the same contract. */
+  Persistent(const Persistent&) = delete;
+  Persistent& operator=(const Persistent&) = delete;
 };
 
 /* A host-traced root: the engine keeps the value alive for as long as this
