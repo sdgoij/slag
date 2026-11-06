@@ -351,6 +351,91 @@ pub unsafe extern "C" fn custom_trace_log_callback(_log_type: c_int, text: *cons
     let _ = std::io::Write::write_all(&mut out, b"\n");
 }
 
+/// The two winmm calls raylib makes through `__declspec(dllimport)`, resolved
+/// through `winmm.dll` instead of `winmm.lib`.
+///
+/// raylib's frame limiter wants 1ms `Sleep` granularity
+/// (`SUPPORT_WINMM_HIGHRES_TIMER`), so its objects call
+/// `timeBeginPeriod`/`timeEndPeriod` -- the `__imp_` slots below -- and the
+/// CLI's sampler calls the same pair. Answering them from `winmm.lib` is what
+/// fails: the SDK's copy exports a plain `PlaySound` beside the
+/// `PlaySoundA`/`PlaySoundW` pair, and raylib exports its own `PlaySound` for
+/// its audio API, so any link that pulls winmm in reports `LNK2005: PlaySound
+/// already defined in winmm.lib`. These two calls are the build's whole winmm
+/// import surface (raylib's GLFW and miniaudio reach multimedia through
+/// `LoadLibrary`), so defining them here leaves the library nothing to resolve.
+///
+/// Every raylib-linked binary pulls this rlib in ahead of the native libraries,
+/// which is what lets one definition serve the CLI, the `slag` examples, and
+/// embedders alike.
+#[cfg(windows)]
+mod winmm {
+    use std::ffi::{CStr, c_char, c_void};
+    use std::sync::OnceLock;
+
+    type Handle = *mut c_void;
+
+    /// `UINT WINAPI timeBeginPeriod(UINT)`, and the same shape for
+    /// `timeEndPeriod`.
+    type TimerProc = unsafe extern "system" fn(u32) -> u32;
+
+    /// `TIMERR_NOCANDO`, what winmm returns when it cannot honor the request.
+    const TIMERR_NOCANDO: u32 = 97;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryA(name: *const c_char) -> Handle;
+        fn GetProcAddress(module: Handle, name: *const c_char) -> *mut c_void;
+    }
+
+    /// Resolves `name` from `winmm.dll`, loading the module once.
+    fn timer_proc(name: &CStr) -> Option<TimerProc> {
+        // Held as an integer so the module handle can live in a `static`; a raw
+        // pointer is neither `Send` nor `Sync`.
+        static DLL: OnceLock<usize> = OnceLock::new();
+        // SAFETY: `winmm.dll` is a system library whose handle outlives the
+        // process, both names are NUL-terminated, and the entry points resolved
+        // here are the `UINT timeXPeriod(UINT)` pair `TimerProc` describes.
+        unsafe {
+            let module = *DLL.get_or_init(|| LoadLibraryA(c"winmm.dll".as_ptr()) as usize);
+            if module == 0 {
+                return None;
+            }
+            let proc = GetProcAddress(module as Handle, name.as_ptr());
+            if proc.is_null() {
+                return None;
+            }
+            Some(std::mem::transmute::<*mut c_void, TimerProc>(proc))
+        }
+    }
+
+    /// `timeBeginPeriod`: raises the process's timer resolution to `period` ms.
+    /// Exported by name because the CLI's sampler declares it and links no
+    /// `winmm.lib` of its own in a raylib build.
+    #[allow(non_snake_case)]
+    #[unsafe(no_mangle)]
+    pub extern "system" fn timeBeginPeriod(period: u32) -> u32 {
+        timer_proc(c"timeBeginPeriod").map_or(TIMERR_NOCANDO, |begin| unsafe { begin(period) })
+    }
+
+    /// `timeEndPeriod`: gives back a resolution `timeBeginPeriod` raised.
+    #[allow(non_snake_case)]
+    #[unsafe(no_mangle)]
+    pub extern "system" fn timeEndPeriod(period: u32) -> u32 {
+        timer_proc(c"timeEndPeriod").map_or(TIMERR_NOCANDO, |end| unsafe { end(period) })
+    }
+
+    // The slots raylib's imported calls load and jump through, named as the
+    // import library names them (`call qword ptr [__imp_timeBeginPeriod]`).
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    static __imp_timeBeginPeriod: TimerProc = timeBeginPeriod;
+
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    static __imp_timeEndPeriod: TimerProc = timeEndPeriod;
+}
+
 fn thread_error() -> JsError {
     JsError::new(
         ErrorKind::TypeError,
@@ -4498,5 +4583,14 @@ mod tests {
         std::fs::remove_file(&outside).unwrap();
         std::fs::remove_dir(&root).unwrap();
         *ASSET_ACCESS.lock().unwrap() = AssetAccess::EmbeddedOnly;
+    }
+
+    /// `TIMERR_NOERROR` means winmm was loaded and answered; `TIMERR_NOCANDO`,
+    /// the shim's fallback, is what a broken resolution would return.
+    #[cfg(windows)]
+    #[test]
+    fn winmm_timer_resolution_resolves() {
+        assert_eq!(super::winmm::timeBeginPeriod(1), 0);
+        assert_eq!(super::winmm::timeEndPeriod(1), 0);
     }
 }

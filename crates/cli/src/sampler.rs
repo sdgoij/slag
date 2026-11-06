@@ -96,7 +96,21 @@ mod imp {
         fn GetModuleFileNameW(module: Handle, name: *mut u16, size: u32) -> u32;
     }
 
+    // The SDK's `winmm.lib` exports a plain `PlaySound` beside the
+    // `PlaySoundA`/`PlaySoundW` pair, and raylib exports its own `PlaySound`,
+    // so a binary that links both fails with `LNK2005: PlaySound already
+    // defined in winmm.lib`. With the `raylib` feature on, `runtime::raylib`
+    // answers these two calls (and raylib's own `__imp_` slots) from
+    // `winmm.dll`, which leaves the import library nothing to resolve; without
+    // it there is no collision and the import stays.
+    #[cfg(not(feature = "raylib"))]
     #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+        fn timeEndPeriod(period: u32) -> u32;
+    }
+
+    #[cfg(feature = "raylib")]
     unsafe extern "system" {
         fn timeBeginPeriod(period: u32) -> u32;
         fn timeEndPeriod(period: u32) -> u32;
