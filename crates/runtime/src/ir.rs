@@ -5506,6 +5506,24 @@ impl Vm {
         Some(cell.value)
     }
 
+    /// [`Self::try_global_cell_read`] restricted to a global-object DATA
+    /// property (a `var`/function/undeclared binding), refusing a declarative
+    /// one. The script-global slot mirror (`ScriptGlobalFlush`/`Reload`) writes
+    /// and reads exactly the names a slotified script declared as `var`s, which
+    /// only ever bind on the global object — so a declarative cell for the same
+    /// name would be a different binding and must not answer.
+    fn try_global_var_cell_read(&mut self, agent: &mut Agent, name: crux::AtomId) -> Option<Value> {
+        let cell = agent.roots.global_value_cells[Self::global_cell_index(name)].get();
+        if cell.name != name || cell.declarative != 0 {
+            return None;
+        }
+        let global = self.global_object(agent).ok()?;
+        if cell.global_id != global.id() || cell.generation != global.generation() {
+            return None;
+        }
+        Some(cell.value)
+    }
+
     /// Whether EVERY name of [`CompiledBody::ident_names`] resolves at the
     /// global environment record from `env` — the precondition for serving a
     /// body's `LoadIdent` reads from the global-value cell.
@@ -9032,14 +9050,36 @@ impl Vm {
                                 "Cannot access a binding before initialization".into(),
                             ));
                         }
+                        // The sync runs around every call in a top-level loop,
+                        // and the common iteration writes back what the global
+                        // still holds. The global-value cell only ever caches a
+                        // writable data property, so an identical value means
+                        // the store, its write barrier and both cell mirrors
+                        // are all unobservable — skip them. A strict body keeps
+                        // the store: a strict-mode assignment to a non-writable
+                        // global throws whatever the value is.
+                        if !self.strict
+                            && let Some(current) = self.try_global_var_cell_read(agent, name)
+                            && current.bits() == value.bits()
+                        {
+                            continue;
+                        }
                         self.store_global_value(agent, name, value)?;
                     }
                 }
                 Step::ScriptGlobalReload { pairs } => {
                     // The fused `LoadGlobal` + `InitLocal` pair per name, in the
-                    // same slot order.
+                    // same slot order. The names are this script's own declared
+                    // `var`s, which live on the global object for the run, so
+                    // the generation-validated value cell answers them — every
+                    // write to a global data property either bumps the global's
+                    // generation or mirrors the cell, which is the invariant
+                    // `LoadIdent` already reads by.
                     for &(slot, name) in pairs.iter() {
-                        let value = self.load_global_value(agent, name)?;
+                        let value = match self.try_global_var_cell_read(agent, name) {
+                            Some(value) => value,
+                            None => self.load_global_value(agent, name)?,
+                        };
                         *self.frame_get_mut(slot) = value;
                     }
                 }

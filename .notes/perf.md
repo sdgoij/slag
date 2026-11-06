@@ -17562,3 +17562,50 @@ name it in `reset` and `clean_after_leaf`, not only in `Vm::new`.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79, jit == jitless == the previous commit.
+
+## LANDED (2026-11-06): the script-global sync stops writing back what is already there
+
+`method` is a top-level loop calling `p.get()`, and a top-level script's `var`s
+are frame slots that must be mirrored onto the global object around every call
+the compiler cannot prove harmless (`ScriptGlobalFlush`/`ScriptGlobalReload`).
+The fusion in `402d0c8` made that one step per half, but the *work* stayed: per
+iteration, four `store_global_value` calls (property write + write barrier +
+global-value cell mirror + member-value cell refresh) and four
+`load_global_value` calls (property-vector re-read + re-record). In the
+callgrind profile those two helpers plus the cell reads were ~1,257M of the
+row's 3,580.2M — **35% of it** — because the frame slot and the global it
+mirrors hold the same value on every iteration that does not assign.
+
+Two probes now stand in for the work, both against the generation-validated
+global-value cell (`try_global_var_cell_read` = `try_global_cell_read` with
+`declarative == 0`, so a declarative binding of the same name cannot answer):
+
+- **Flush:** a data-property write of the value the property already holds is
+  unobservable — the barrier and both cell mirrors included — so it is skipped.
+  A strict body keeps the store: a strict-mode assignment to a non-writable
+  global throws whatever the value is.
+- **Reload:** the cell answers the read directly. The names are this script's
+  own `var`s, which live on the global object for the run, and every write to a
+  global data property either bumps the global's generation or mirrors the cell
+  — the invariant `LoadIdent` already reads by (`JsObject::set_key` bumps, the
+  fast slot writes mirror).
+
+`method` 3,580.2M -> 3,024.3M instructions (**-15.5%**), 189 -> 163 ms
+(**-14%**), `njit/bs` 2.52 -> 2.12. Every other row is instruction-identical
+(`arith`, `fn_array`, `fn_object`, `closures` all match to the instruction) and
+wall-clock equal within noise at 9 rounds; the earlier 5-round run's
+`array`/`fn_array`/`arith` deltas were layout noise, which 9 rounds retired.
+
+Why not widen the register lane instead (the plan's next step): a census of the
+first step that refuses whole-body lowering (a temporary probe in `lower_step`'s
+catch-all) over the corpus and the brimstone suite says the remaining blockers
+are loop machinery and literal construction — `LoadIdent` 17, `BuilderBind` 14,
+`FunctionDeclInit` 12, `ArrayFast` 12, `ObjectFast` 9 — i.e. bodies whose loops
+already run on register segments and whose per-iteration dispatch the whole-body
+program cannot improve much (the fast-loop head is one fused step). `sieve`'s
+`LoadIdent` is followed by `Construct`/`FastLoop*`, `fn_object`'s `ArrayBegin`
+by `FastLoop*`.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79 in both modes, results identical to the parent.
