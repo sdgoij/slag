@@ -17778,3 +17778,59 @@ must be NaN; `binary_inline`'s `Exp` returns Rust's `powf`, which is 1) and
 they reproduce identically on the parent binary, so they are a pre-existing
 interpreter-only divergence, not this slice. Corpus 79/79, results identical to
 the parent in both modes.
+
+## LANDED (2026-11-06): the leaf-inline argument buffer is not zeroed
+
+Profiling the call rows (`local`, 2M calls of an 11-op leaf) put ~7% of the
+row's cycles in 16-byte zero stores inside `do_call_fast_slot` and another
+2% in the argument `memcpy`. The source: `run_inline_leaf` materialized
+`[Value::Undefined; FAST_CALL_MAX_ARGS]`, and `FAST_CALL_MAX_ARGS` is 64 — so
+every inlined leaf call wrote **512 bytes** it then read zero or two entries
+of (`argc` is capped at 2 for the fast call forms).
+
+The buffer is only ever read at `[0..argc)` (`setup_frame` and
+`run_leaf_regs` address arguments through `get`), so it is now
+`MaybeUninit` and `copy_args_to_uninit` copies just the argument prefix. The
+uninitialized tail is sound because the collector's conservative stack scan
+only ever *adds* roots: a word becomes a root candidate only when it equals a
+live box's address exactly, so a stale word can retain a live object, never
+free one or walk a bogus header. (This is not the JIT's `[Value; N]` buffer
+rule — that one is *precisely* traced through `jit_roots`, so every slot there
+must hold a valid Value.)
+
+Interleaved at 9 rounds, in `--jitless`, against the parent (cycles /
+instructions / wall ms):
+
+- `capture2` 201.5M -> 170.4M (**-15.4%**), 1,192.3M -> 1,144.2M (-4.0%),
+  64 -> 58.
+- `capture` 325.2M -> 295.6M (**-9.1%**), -2.3%, 106 -> 95.
+- `method` 509.8M -> 480.2M (**-5.8%**), -0.5%, 171 -> 161.
+- `local` 343.6M -> 325.4M (**-5.3%**), 2,112.3M -> 2,058.3M (-2.6%), 117 -> 110.
+- `closures` 263.3M -> 256.6M (**-2.6%**), -1.7%, 87 -> 83.
+- `fn_object`, `object`, `arith`, `fib`, `sieve`, `fn_forin` are
+  instruction-identical to the parent (they take no leaf-inline call, so the
+  change is provably inert there) and equal in wall clock; `arith`'s cycles
+  move -2.9% and `sieve`'s +4.5% in opposite directions across rounds, which
+  is the layout noise those rows are known for.
+
+`njit/bs`: `capture2` 1.48 -> 1.25, `capture` 1.15 -> 1.07, `local` 1.90 ->
+1.67, `method` 2.21 -> 2.04, `closures` 2.32 -> 2.21. JIT mode is neutral
+within noise (`capture2` -5%, the rest within ±2%), and the corpus is
+result-identical in both modes — including under `--gc-stress`, which is the
+net for an uninitialized buffer.
+
+Same session, the register-op cost, for whoever looks next: on `local` a leaf
+register op costs ~56 instructions and ~10 cycles, split by `perf annotate`
+(prof profile + `addr2line`) into 22% dispatch (`ops.get` bounds check + tag
+load + jump table), ~15% the `binary_inline` tag checks and `checked_add`, and
+~8% `frame_get`'s three-way frame match and bounds-checked slot index. That is
+the whole shape of the remaining gap on `local`/`capture*` — its loop body is
+already `RunRegBody { [CallFastSlot, BinStoreReg] }` — so it is a per-op code
+question, and the three failed attempts recorded above say a bigger or
+branchier executor loses on cycles.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821 (and `--jitless` annexB/built-ins the same, language 23724/23726
+with the two pre-existing `Exp` fixtures); corpus 79/79 identical to the
+parent in both modes and under `--gc-stress`.

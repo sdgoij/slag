@@ -16074,8 +16074,11 @@ impl Vm {
         // routes any count through `do_call_fast` too — so a count beyond the
         // small stack buffer falls back to a function-scoped Vec (mirrors the
         // construct path's Cow, minus the borrow-lifetime dance: the leaf run
-        // below borrows the chosen buffer, so both must outlive it).
-        let mut args_buf = [Value::Undefined; FAST_CALL_MAX_ARGS];
+        // below borrows the chosen buffer, so both must outlive it). Only the
+        // copied prefix is ever read, so the buffer stays uninitialized (see
+        // `copy_args_to_uninit`).
+        let mut args_buf: std::mem::MaybeUninit<[Value; FAST_CALL_MAX_ARGS]> =
+            std::mem::MaybeUninit::uninit();
         let args_owned: Vec<Value>;
         let completion = if let Some(ops) = ir.leaf_ops.as_deref() {
             // Cut 35 slice 23: at a fused call-store site, a register leaf
@@ -16110,9 +16113,8 @@ impl Vm {
                 if let Some(base) = arg_base {
                     LeafFrame::Alias(base)
                 } else {
-                    let args: &[Value] = if argc <= args_buf.len() {
-                        args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-                        &args_buf[..argc]
+                    let args: &[Value] = if argc <= FAST_CALL_MAX_ARGS {
+                        Self::copy_args_to_uninit(&mut args_buf, &self.stack[arg_start..n])
                     } else {
                         args_owned = self.stack[arg_start..n].to_vec();
                         &args_owned[..]
@@ -16131,9 +16133,8 @@ impl Vm {
             }
             let n = self.stack.len();
             let arg_start = n - argc;
-            let args: &[Value] = if argc <= args_buf.len() {
-                args_buf[..argc].clone_from_slice(&self.stack[arg_start..n]);
-                &args_buf[..argc]
+            let args: &[Value] = if argc <= FAST_CALL_MAX_ARGS {
+                Self::copy_args_to_uninit(&mut args_buf, &self.stack[arg_start..n])
             } else {
                 args_owned = self.stack[arg_start..n].to_vec();
                 &args_owned[..]
@@ -16144,6 +16145,33 @@ impl Vm {
         self.stack.truncate(pre_call - below);
         self.stack.push(result);
         Ok(())
+    }
+
+    /// The leaf-inline argument buffer: copy `src` into the head of `buf` and
+    /// return it. Only that prefix is ever read (`setup_frame` and
+    /// `run_leaf_regs` address arguments through `get`), so the rest of `buf`
+    /// stays uninitialized: zeroing all `FAST_CALL_MAX_ARGS` (64) entries
+    /// wrote 512 bytes per inlined call, which cost more than the callee's
+    /// whole body on the small-callee rows.
+    ///
+    /// An uninitialized word in the buffer is sound because the collector's
+    /// conservative stack scan only ever *adds* roots: a word is a candidate
+    /// only when it equals a live box's address exactly, so a stale word can
+    /// retain a live object, never free one or walk a bogus header.
+    #[inline]
+    fn copy_args_to_uninit<'a>(
+        buf: &'a mut std::mem::MaybeUninit<[Value; FAST_CALL_MAX_ARGS]>,
+        src: &[Value],
+    ) -> &'a [Value] {
+        debug_assert!(src.len() <= FAST_CALL_MAX_ARGS);
+        // SAFETY: the copy stays inside the `[Value; FAST_CALL_MAX_ARGS]`
+        // buffer (asserted above) and the returned slice covers exactly the
+        // bytes it wrote.
+        unsafe {
+            let ptr = buf.as_mut_ptr().cast::<Value>();
+            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
+            std::slice::from_raw_parts(ptr, src.len())
+        }
     }
 
     /// Run an already-resolved leaf entry at a call site whose `[this, callee,
