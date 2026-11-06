@@ -6007,13 +6007,12 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn the_internal_field_slot_costs_no_arena_bytes() {
-        // The payload grew 424 -> 432 B. With the 16-byte `GcHeader` that is
-        // 440 -> 448 before rounding to the 16-byte class, so both land in the
-        // 448-byte class and an object that never carries host fields allocates
-        // exactly as it did before. The realm field fit in the padding this
-        // layout already had. A field that pushed the payload past 432 would
-        // move every object up a class, which is what this guards.
-        assert_eq!(std::mem::size_of::<JsObject>(), 432);
+        // The realm field is the payload's last addition; on the audit
+        // baseline's layout the payload is 424 B. With the 16-byte `GcHeader`
+        // that is 440, which rounds to the arena's 448-byte class. A field
+        // that pushed the payload past 432 would move every object up a class,
+        // which is what this guards.
+        assert_eq!(std::mem::size_of::<JsObject>(), 424);
     }
 
     #[test]
