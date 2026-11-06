@@ -2181,6 +2181,29 @@ fn emit_leaf_op(
             );
             acc
         }
+        // The named member read-modify-write (`o.x op= v`): the read, the
+        // combine, and the store the three register ops performed, as the
+        // same three IR ops over one captured receiver. The accumulator keeps
+        // the combined value, like the register ops it replaces.
+        LeafOp::CompoundMemberNameLocal {
+            object_slot,
+            name,
+            op,
+            rhs,
+        } => {
+            let object = emit_frame_load(builder, block, *object_slot);
+            let old = emit_named_read(builder, block, object, *name);
+            let right = emit_reg_operand(builder, block, rhs, counter)?;
+            let next = bin(builder, binary_op(*op)?, old, right);
+            builder.emit_void(
+                block,
+                Op::MemberStore,
+                &[object, next],
+                Op::MemberStore.default_effects(),
+                Imm::Atom(*name),
+            );
+            next
+        }
         // The computed register-body store (`o[k] = v`): the object is a frame
         // slot, the key and value direct operands. Effect-only; the accumulator
         // is unchanged.

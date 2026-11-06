@@ -10985,6 +10985,35 @@ impl<'a> Lowerer<'a> {
                 let value = self.acc_bits();
                 self.emit_validated_member_store(object, value, *name)?;
             }
+            LeafOp::CompoundMemberNameLocal {
+                object_slot,
+                name,
+                op,
+                rhs,
+            } => {
+                // The read, the combine, and the store the three register ops
+                // this collapses perform, in that order: the receiver is
+                // captured once, before the read (the step path captured the
+                // reference before the RHS evaluated).
+                let object = self.load_slot(*object_slot);
+                let old = self.emit_member_cell_read(object, *name)?;
+                let (right, right_known) = match rhs {
+                    RegOperand::Const(value) => match value.as_number() {
+                        Some(n) => (BinForm::Num(self.builder.ins().f64const(n)), true),
+                        None => (
+                            BinForm::Bits(self.const_bits(value, step, op_index, 7)?),
+                            false,
+                        ),
+                    },
+                    rhs => (
+                        BinForm::Bits(self.leaf_operand(step, op_index, 7, rhs)?),
+                        false,
+                    ),
+                };
+                self.emit_acc_binary(*op, BinForm::Bits(old), right, false, right_known)?;
+                let value = self.acc_bits();
+                self.emit_validated_member_store(object, value, *name)?;
+            }
             LeafOp::StoreMemberComputed { key, value } => {
                 let object = self.acc_bits();
                 let key = self.leaf_operand(step, op_index, 3, key)?;

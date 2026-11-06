@@ -3653,6 +3653,38 @@ mod tests {
     }
 
     #[test]
+    fn a_member_rmw_string_rhs_survives_per_allocation_collection() {
+        // The fused register-lane member read-modify-write
+        // (`o.x = o.x + <const>`) carries its RHS as a register operand. A
+        // heap-valued one (a string literal) has no step left to root it once
+        // the run replaces the statement's steps, so the body must trace the
+        // op's constant — otherwise the per-allocation collector sweeps the
+        // box out from under the concat.
+        let mut context = Context::new().unwrap();
+        context.set_gc_stress(true);
+        assert_eq!(
+            context
+                .eval("function f(o, n) { for (var i = 0; i < n; i++) { o.x = o.x + '!'; } return o.x; } f({ x: 'a' }, 200).length")
+                .unwrap()
+                .as_number(),
+            Some(201.0)
+        );
+        // The same shape with a setter that observes its receiver: the fused
+        // op reads and writes the one object it captured before the read.
+        assert_eq!(
+            context
+                .eval(
+                    "function g(o, n) { for (var i = 0; i < n; i++) { o.x = o.x + 2; } } \
+                     var hits = 0; var o = { get x() { return 1; }, set x(v) { hits = hits + v; } }; \
+                     g(o, 3); hits"
+                )
+                .unwrap()
+                .as_number(),
+            Some(9.0)
+        );
+    }
+
+    #[test]
     fn a_realm_round_trips_through_the_embed_snapshot() {
         // `write_snapshot` carries no host-callback table, so the console and
         // the timers `Context::new` installs have to be out of the realm first;

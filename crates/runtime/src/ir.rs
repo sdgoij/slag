@@ -1421,6 +1421,7 @@ fn trace_leaf_op_heaps(op: &LeafOp, visit: &mut dyn FnMut(GcAny)) {
             operand(key, visit);
             operand(rhs, visit);
         }
+        LeafOp::CompoundMemberNameLocal { rhs, .. } => operand(rhs, visit),
         LeafOp::UpdateMemberComputedLocal { key, .. } => operand(key, visit),
         LeafOp::GetMemberComputed { key, .. } | LeafOp::GetMemberComputedLocal { key, .. } => {
             operand(key, visit);
@@ -1580,6 +1581,22 @@ pub enum LeafOp {
     StoreMemberNameLocal {
         object_slot: usize,
         name: crux::AtomId,
+    },
+    /// One member read-modify-write on a frame-slot object: `o.x op= v` and
+    /// the explicit `o.x = o.x <bop> v` both lower to `[GetMemberNameLocal,
+    /// Bin*, StoreMemberNameLocal]`, which this op collapses into one
+    /// dispatch. The receiver is captured before the read (the step path
+    /// captures the reference before the RHS evaluates) and reused for the
+    /// store, which is sound because a `tdz=false` frame slot cannot be
+    /// written by user code — a getter cannot reach the body's own frame —
+    /// so the read and the write observe the same object. `op` is the
+    /// already-resolved binary combine (so `o.x = o.x < 5` fuses too) and
+    /// `rhs` a stable operand (`Reg`/`Const`, never a second computed value).
+    CompoundMemberNameLocal {
+        object_slot: usize,
+        name: crux::AtomId,
+        op: BinaryOp,
+        rhs: RegOperand,
     },
     /// Write `value` onto the object in the accumulator under the computed
     /// `key` (the plain-assign computed member store, `Step::AssignMemberComputed`
@@ -13972,6 +13989,37 @@ impl Vm {
                     if is_nullish(&object) {
                         return Err(nullish_error("Cannot set properties of null"));
                     }
+                    let value = self.acc;
+                    if !Self::warm_store_put(agent, &object, *name, value) {
+                        self.assign_member(
+                            agent,
+                            object,
+                            PropertyKeyName::Name(*name),
+                            None,
+                            value,
+                            AssignOp::Assign,
+                        )?;
+                    }
+                }
+                LeafOp::CompoundMemberNameLocal {
+                    object_slot,
+                    name,
+                    op,
+                    rhs,
+                } => {
+                    // The read, the combine, and the store of the three ops
+                    // this collapses: the receiver is captured once, before
+                    // the read, and the store reuses it.
+                    let object = *self.frame_get(*object_slot);
+                    let old = match Self::cell_object(&object) {
+                        Some(cell) => match Self::member_cell_warm_probe(agent, &cell, *name) {
+                            Some(value) => value,
+                            None => self.get_member_name(agent, object, *name)?,
+                        },
+                        None => self.get_member_name(agent, object, *name)?,
+                    };
+                    let rhs = self.leaf_operand_value(agent, rhs)?;
+                    self.acc = Self::binary_inline(agent, *op, &old, &rhs)?;
                     let value = self.acc;
                     if !Self::warm_store_put(agent, &object, *name, value) {
                         self.assign_member(
@@ -26809,6 +26857,9 @@ fn leaf_op_touches_slot(op: &LeafOp, slot: usize) -> bool {
             rhs,
             ..
         } => *object_slot == slot || operand(key) || operand(rhs),
+        LeafOp::CompoundMemberNameLocal {
+            object_slot, rhs, ..
+        } => *object_slot == slot || operand(rhs),
         LeafOp::UpdateMemberComputedLocal {
             object_slot, key, ..
         } => *object_slot == slot || operand(key),
@@ -26903,6 +26954,7 @@ fn run_acc_is_number(ops: &[LeafOp], upto: usize, proven: &HashSet<usize>) -> bo
             | LeafOp::GetMemberComputed { .. }
             | LeafOp::GetMemberNameLocal { .. }
             | LeafOp::GetMemberComputedLocal { .. }
+            | LeafOp::CompoundMemberNameLocal { .. }
             | LeafOp::CallFastSlot { .. }
             | LeafOp::CallFast { .. }
             | LeafOp::CallFastIdent { .. } => false,
@@ -27181,6 +27233,7 @@ fn leaf_op_has_heap_const(op: &LeafOp) -> bool {
         LeafOp::StoreMemberComputedSlot { key, value, .. } => operand(key) || operand(value),
         LeafOp::StoreMemberComputedLocal { key, .. } => operand(key),
         LeafOp::CompoundMemberComputedLocal { key, rhs, .. } => operand(key) || operand(rhs),
+        LeafOp::CompoundMemberNameLocal { rhs, .. } => operand(rhs),
         LeafOp::UpdateMemberComputedLocal { key, .. } => operand(key),
         LeafOp::GetMemberComputed { key, .. } | LeafOp::GetMemberComputedLocal { key, .. } => {
             operand(key)
@@ -27365,6 +27418,60 @@ fn push_operand(ops: &mut Vec<LeafOp>, operand: &RegOperand) -> bool {
         return false;
     }
     ops.push(LeafOp::PushAcc);
+    true
+}
+
+/// Collapse the `[GetMemberNameLocal, Bin*]` tail a member store of the
+/// accumulator can absorb into one [`LeafOp::CompoundMemberNameLocal`]: the
+/// read must name the store's own frame slot and property, so the three ops
+/// are exactly one member read-modify-write (`o.x op= v`, `o.x = o.x <bop>
+/// v`). The store already reads its object late for a `tdz=false` slot, so no
+/// user code can write the slot between the read and the write, and the RHS
+/// is a pure operand for the same reason. `false` when the tail is not that
+/// shape (the caller then emits the store op alone).
+///
+/// The two absorbed ops belong to EARLIER steps, so a whole-body lowering must
+/// not call this: it indexes jump targets by the ops a step's lowering started
+/// at, and removing those ops would leave a branch entering past them.
+/// Straight-line runs have no interior jump target, so they are safe.
+fn fuse_member_name_rmw(ops: &mut Vec<LeafOp>, object_slot: usize, name: crux::AtomId) -> bool {
+    if ops.len() < 2 {
+        return false;
+    }
+    let (op, rhs) = match &ops[ops.len() - 1] {
+        LeafOp::BinImm { op, imm } => (*op, RegOperand::Const(Value::Number(*imm))),
+        LeafOp::BinConst { op, value } => (*op, RegOperand::Const(*value)),
+        LeafOp::BinReg {
+            op,
+            slot,
+            tdz: false,
+        } => (
+            *op,
+            RegOperand::Reg {
+                slot: *slot,
+                tdz: false,
+            },
+        ),
+        _ => return false,
+    };
+    let same_slot_and_name = matches!(
+        ops[ops.len() - 2],
+        LeafOp::GetMemberNameLocal {
+            object_slot: read_slot,
+            tdz: false,
+            name: read_name,
+        } if read_slot == object_slot && read_name == name
+    );
+    if !same_slot_and_name {
+        return false;
+    }
+    ops.truncate(ops.len() - 2);
+    ops.push(LeafOp::CompoundMemberNameLocal {
+        object_slot,
+        name,
+        op,
+        rhs,
+    });
     true
 }
 
@@ -27776,10 +27883,12 @@ fn lower_step(
                         let RegOperand::Reg { slot, tdz: false } = object else {
                             return None;
                         };
-                        ops.push(LeafOp::StoreMemberNameLocal {
-                            object_slot: slot,
-                            name: *name,
-                        });
+                        if whole_body || !fuse_member_name_rmw(ops, slot, *name) {
+                            ops.push(LeafOp::StoreMemberNameLocal {
+                                object_slot: slot,
+                                name: *name,
+                            });
+                        }
                     } else {
                         // A direct operand value: load the object into the
                         // accumulator and store (the loop Counter resolves
@@ -27852,10 +27961,12 @@ fn lower_step(
                         }
                         _ => return None,
                     }
-                    ops.push(LeafOp::StoreMemberNameLocal {
-                        object_slot,
-                        name: *name,
-                    });
+                    if whole_body || !fuse_member_name_rmw(ops, object_slot, *name) {
+                        ops.push(LeafOp::StoreMemberNameLocal {
+                            object_slot,
+                            name: *name,
+                        });
+                    }
                 }
                 // The logical assigns (`&&=`, `||=`, `??=`) short-circuit on
                 // the old value and may skip the write — no register form.
@@ -28411,6 +28522,7 @@ fn lower_leaf_ops(steps: &[Step], scope: &mut ScopeInfo) -> Option<Box<[LeafOp]>
         | Some(LeafOp::StoreMemberComputedSlot { .. })
         | Some(LeafOp::StoreMemberComputedLocal { .. })
         | Some(LeafOp::CompoundMemberComputedLocal { .. })
+        | Some(LeafOp::CompoundMemberNameLocal { .. })
         | Some(LeafOp::UpdateMemberComputedLocal { .. })
         | None => {}
         _ => return None,

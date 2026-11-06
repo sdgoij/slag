@@ -17714,3 +17714,67 @@ Ten ops per iteration become eight, which is the only thing that has moved these
 rows this session — plus the new arm is one `LeafOp` the JIT's exhaustive
 `emit_leaf_op` match will demand, and `CompoundMemberComputedLocal` is the
 template.
+
+## LANDED (2026-11-06): a named member read-modify-write is one register op
+
+The op-count direction the rejected dense-read inline pointed at. `fn_object`'s
+`o.a = o.a + 1` lowered to three register ops — `GetMemberNameLocal`,
+`BinImm`, `StoreMemberNameLocal` — where the step path's evaluation order
+(reference captured, RHS read, value stored) is exactly one operation. The
+store now looks at the run's tail (`fuse_member_name_rmw`): when the ops
+adjacent to it are a read of the SAME frame slot and property followed by a
+`BinImm`/`BinConst`/`BinReg`, they collapse into
+`LeafOp::CompoundMemberNameLocal { object_slot, name, op, rhs }`, which
+captures the receiver once, probes the member cell, applies the binary, and
+writes through the warm store. `o.x += 1` and `o.x = o.x + 1` emit the same
+tail, so both shapes fuse from the two places that emit the named store.
+
+Soundness is the computed counterpart's (`CompoundMemberComputedLocal`): the
+receiver is a `tdz=false` frame slot, which no user code can write — a getter
+run by the read has no handle on the body's frame — so capturing it once is
+the step path's captured reference, and the RHS is a pure operand
+(`Reg`/`Const`) whose load is unobservable between the read and the write. A
+`BinAccPop`/`BinLeftReg` tail is NOT fused: there the member read is the right
+operand, so the fused op's operand order would be wrong. `cargo test`'s
+lowering test now asserts the fused op directly (the shape is the check — the
+earlier `FusedCompoundLocal` lesson is that a byte-identical op list means the
+fusion never fired).
+
+The whole-body lane refuses it (`whole_body`): that lowering indexes jump
+targets by the op a step's lowering started at, and the two absorbed ops belong
+to earlier steps, so a branch could enter past them. Straight-line leaf and
+loop-body runs have no interior jump target and take the fusion.
+
+- `fn_object` 1,354.9M -> 1,260.9M instructions (**-6.9%**), 204.3M -> 199.2M
+  cycles (**-2.5%**), 68 -> 67 ms, `njit/bs` 1.89 -> 1.80 (eight ops per
+  iteration instead of ten).
+- `object` (the same shape in a top-level loop) 1,385.9M -> 1,290.8M
+  (**-6.9%**), 231.5M -> 222.6M cycles (**-3.8%**), 74 -> 72 ms, `njit/bs`
+  1.32 -> 1.27.
+- `array` cycles -1.7%, `fn_array` -0.8%; `sieve`/`method`/`fib` are flat
+  (their instruction deltas are layout: +0.15%, -0.06%, and the suite's `bs`
+  side wobbles ±10%).
+
+Instructions move further than cycles, as expected for a dispatch the executor
+was not bottlenecked on; the cycles are what the row was worth. JIT mode is
+neutral-or-better (`object` -4.9%, `fn_object`/`fn_array`/`array` equal) and
+the optimizing tier still lifts the body: the new op has arms in
+`emit_leaf_op`, the lift's `emit_leaf_op`, `load_const` (field 7),
+`trace_leaf_op_heaps`, `leaf_op_has_heap_const`, `leaf_op_touches_slot` and
+`run_acc_is_number` — `JIT_DUMP_CLIF=1` shows zero `opt bail` and
+`JIT_DUMP_IR=1` still produces the body's IR.
+
+Not taken: the same fusion for `o.x++` (an `UpdateAcc` + store pair, one op
+fewer rather than two) — no measured row has it — and the computed tail
+(`GetMemberComputedLocal` + `Bin*`), which is the separate slice the plan
+lists next.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821 in the default mode. `--jitless` annexB 1086/1086 and built-ins
+23821/23821; `--jitless` language 23724/23726 — the two failures are
+`expressions/exponentiation/applying-the-exp-operator_A7/A8` (`1 ** Infinity`
+must be NaN; `binary_inline`'s `Exp` returns Rust's `powf`, which is 1) and
+they reproduce identically on the parent binary, so they are a pre-existing
+interpreter-only divergence, not this slice. Corpus 79/79, results identical to
+the parent in both modes.

@@ -4039,11 +4039,11 @@ mod tests {
         // A member RMW in a certified loop (`o.x += 1`) and a plain member
         // store of a computed value (`o.x = o.x + 1`) previously kept the
         // whole statement on the step path (the compound step, the `Dup`,
-        // and the Acc-value store all lacked register forms). Now the whole
-        // body lowers to one register run: the read (`GetMemberNameLocal`),
-        // the combine (BinConst/BinImm/BinReg/... on the cached old value),
-        // and the store (`StoreMemberNameLocal`, which reads the object
-        // from its frame slot at store time).
+        // and the Acc-value store all lacked register forms). The read
+        // (`GetMemberNameLocal`), the combine, and the store
+        // (`StoreMemberNameLocal`) now collapse into ONE
+        // `CompoundMemberNameLocal` per statement, since the read names the
+        // store's own slot and property.
         fn register_runs(
             agent: &mut Agent,
             src: &str,
@@ -4070,28 +4070,27 @@ mod tests {
         assert_eq!(compound.len(), 1, "the o.x += 1 body must lower");
         let ops = &compound[0];
         assert!(
-            ops.iter()
-                .any(|op| matches!(op, crate::ir::LeafOp::GetMemberNameLocal { .. })),
-            "the run must read the old value"
-        );
-        assert!(
             ops.iter().any(|op| matches!(
                 op,
-                crate::ir::LeafOp::BinConst {
+                crate::ir::LeafOp::CompoundMemberNameLocal {
+                    object_slot: 0,
                     op: syntax::ast::BinaryOp::Add,
+                    rhs: crate::ir::RegOperand::Const(_),
                     ..
                 }
             )),
-            "the run must combine the old value with the RHS"
+            "the run must fuse the o.x += 1 read-modify-write: {ops:?}"
         );
         assert!(
-            ops.iter().any(|op| matches!(
+            !ops.iter().any(|op| matches!(
                 op,
-                crate::ir::LeafOp::StoreMemberNameLocal { object_slot: 0, .. }
+                crate::ir::LeafOp::GetMemberNameLocal { .. }
+                    | crate::ir::LeafOp::StoreMemberNameLocal { .. }
             )),
-            "the run must store the result onto the slot object's member"
+            "the fused statement must leave no separate read/store: {ops:?}"
         );
-        // `o.x += i` (the loop counter RHS spills the cached old value).
+        // `o.x += i` (the loop counter RHS spills the cached old value, so
+        // the tail is a `BinAccPop` and stays unfused).
         let counter_rhs = register_runs(
             &mut agent,
             "function g(o, n) { for (var i = 0; i < n; i++) { o.x += i; } return o.x; }",
@@ -4114,9 +4113,14 @@ mod tests {
         assert!(
             computed[0].iter().any(|op| matches!(
                 op,
-                crate::ir::LeafOp::StoreMemberNameLocal { object_slot: 0, .. }
+                crate::ir::LeafOp::CompoundMemberNameLocal {
+                    object_slot: 0,
+                    op: syntax::ast::BinaryOp::Add,
+                    ..
+                }
             )),
-            "the computed-value store must target the slot object"
+            "the computed-value store must fuse with its read: {:?}",
+            computed[0]
         );
     }
 

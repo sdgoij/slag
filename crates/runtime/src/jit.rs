@@ -4925,6 +4925,7 @@ extern "C" fn load_const(ctx: *mut c_void, step: u64, op: u64, field: u64) -> u6
         (crate::ir::LeafOp::CompoundMemberComputedLocal { rhs, .. }, 5) => reg_const(rhs),
         (crate::ir::LeafOp::CompoundMemberComputedLocal { key, .. }, 6) => reg_const(key),
         (crate::ir::LeafOp::UpdateMemberComputedLocal { key, .. }, 5) => reg_const(key),
+        (crate::ir::LeafOp::CompoundMemberNameLocal { rhs, .. }, 7) => reg_const(rhs),
         _ => unreachable!("load_const on a const-free op/field"),
     };
     value.bits()
