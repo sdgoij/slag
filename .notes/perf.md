@@ -17643,3 +17643,35 @@ session's look at the lane is one line: `LeafOp::JumpIfFalsy` now uses the
 crate-local `truthy` (a Boolean answered inline) instead of calling
 `crux::convert::to_boolean`, matching `Step::JumpIfFalse` — 1,010.2M -> 995.4M
 cycles on `fib` (-1.5%), instructions flat, wall within noise.
+
+## LANDED (2026-11-06): the vector-free store resolves its descriptor once, not twice
+
+`fn_object`'s inner loop is `var o = objs[i]; o.a = o.a + 1; s += o.b + o.c` — ten
+register ops and two step dispatches per iteration, and `perf record` put
+`warm_store_fallback` (8.8%), `Map::find` (5.9%) and `warm_store_put` (1.4%) on
+the one *store* against `member_cell_get_map` (9.5%) for the three reads. The
+receiver is a vector-free literal object, so the store's identity cell thrashes
+over the 1000-object working set and every store takes the deferred path, which
+resolved the same descriptor twice: once inside `deferred_field_write` (to
+write the field) and again in `map_store_field` (to record the shape cell's
+ordinal).
+
+`JsObject::deferred_field_write_field` returns the offset it wrote, so the
+recorder records that ordinal instead of re-resolving. `deferred_field_write`
+is the `is_some()` wrapper, so its callers are unchanged.
+
+`fn_object` 1,390.7M -> 1,359.0M instructions (**-2.3%**), 209.1M -> 204.7M
+cycles (-2.1%), 67 -> 65 ms; `object` (the same store shape in a top-level
+loop) 1,421.8M -> 1,385.8M (**-2.4%**), 77 -> 74 ms. Both directions agree at
+9 interleaved rounds.
+
+Not taken, and why: the deferred store could go further by probing the shape
+cell (`member_map_cells`) before the deferred path and writing the pinned field,
+which would remove the remaining `map.find` — but that table is shared with the
+read path and with `warm_store_map_put`, where `slot` means a *property-vector*
+slot rather than a field offset, so a write-side probe would have to first pin
+down whether the two ever differ. That is a separate investigation.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79 in both modes, results identical to the parent.

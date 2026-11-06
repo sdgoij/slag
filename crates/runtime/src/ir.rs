@@ -6977,7 +6977,7 @@ impl Vm {
         // falls through to the full [[Set]].
         if object.properties.borrow().is_empty() {
             let key = PropertyKey::String(name);
-            if object.deferred_field_write(&key, value) {
+            if let Some(field) = object.deferred_field_write_field(&key, value) {
                 let generation = object.generation();
                 let read_index = Self::member_cell_index(object.id(), name);
                 agent.roots.member_value_cells[read_index].set(MemberValueCell {
@@ -6990,21 +6990,21 @@ impl Vm {
                 // routes the next write through the inline deferred field
                 // update instead of the helper. A map id pins the descriptor
                 // layout; `clean` stays 0 (a write never verifies the chain).
-                if let Some((map_id, field)) = object.map_store_field(&key) {
-                    let shape_index = Self::member_map_cell_index(map_id, name);
+                // The field is the descriptor ordinal the write above just
+                // resolved — re-resolving it here would be a second
+                // `map.find` per store.
+                if let Some(map) = object.map.get() {
+                    let shape_index = Self::member_map_cell_index(map.id(), name);
                     let (proto_id, proto_gen) = Self::member_map_proto(object);
                     agent.member_map_cells[shape_index] = MemberMapCell {
-                        map_id,
+                        map_id: map.id(),
                         name,
                         slot: field,
                         clean: 0,
                         proto_id,
                         proto_gen,
                         writable: 1,
-                        count: object
-                            .map
-                            .get()
-                            .map_or(0, |map| map.descriptor_count() as u32),
+                        count: map.descriptor_count() as u32,
                     };
                 }
                 Self::refresh_global_read_cell(agent, object, name, value);

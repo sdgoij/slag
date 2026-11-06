@@ -3469,27 +3469,30 @@ impl JsObject {
     }
 
     pub fn deferred_field_write(&self, key: &PropertyKey, value: Value) -> bool {
+        self.deferred_field_write_field(key, value).is_some()
+    }
+
+    /// [`Self::deferred_field_write`] plus the field offset it wrote. A caller
+    /// that also RECORDS the store (the interpreter's warm-store cell needs the
+    /// descriptor ordinal) would otherwise re-resolve through `map.find` the
+    /// descriptor this call just resolved — two scans per store for a
+    /// vector-free store loop (`objs[i].a = ...`).
+    pub fn deferred_field_write_field(&self, key: &PropertyKey, value: Value) -> Option<usize> {
         if !self.props_deferred.get() {
-            return false;
+            return None;
         }
-        let Some(map) = self.map.get() else {
-            return false;
-        };
-        let Some(ord) = map.find(key) else {
-            return false;
-        };
-        let Some((_, offset, attrs)) = map.descriptor_at(ord) else {
-            return false;
-        };
+        let map = self.map.get()?;
+        let ord = map.find(key)?;
+        let (_, offset, attrs) = map.descriptor_at(ord)?;
         if offset >= INLINE_FIELDS
             || !attrs.writable()
             || self.in_fields[offset].get().is_uninitialized()
         {
-            return false;
+            return None;
         }
         crate::heap::write_barrier(self, value);
         self.in_fields[offset].set(value);
-        true
+        Some(offset)
     }
 
     /// Rebuild `properties` from the map descriptors and clear the
