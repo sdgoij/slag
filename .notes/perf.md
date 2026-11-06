@@ -17699,3 +17699,18 @@ and holds a ~40-arm match; an inline fast path that removes two outlined calls
 adds enough op-cache/icache pressure to cost more cycles than it saves, and
 instructions do not see it. Reduce the *op count* (a lowering fusion) rather
 than the cost of an op, and gate every executor change on `perf stat -e cycles`.
+
+The direction that lesson implies, for whoever takes the member rows next: cut
+the op COUNT. `fn_object`'s `o.a = o.a + 1` lowers to three ops —
+`GetMemberNameLocal { slot 4, a }`, `BinImm { Add, 1 }`, `StoreMemberNameLocal
+{ slot 4, a }` — and `BinStoreReg` already retro-inspects `ops.last()` to fuse
+its own pair, so the same trick applies here: at `Step::AssignMemberName { op:
+Assign }`, when the emitted tail is exactly that read + a pure binary and the
+value is the accumulator, replace the two ops with one
+`CompoundMemberNameLocal { object_slot, name, op, rhs }` (the named counterpart
+of the existing `CompoundMemberComputedLocal`, which already carries the
+soundness argument: adjacent pure ops, `tdz=false` slot, late-read contract).
+Ten ops per iteration become eight, which is the only thing that has moved these
+rows this session — plus the new arm is one `LeafOp` the JIT's exhaustive
+`emit_leaf_op` match will demand, and `CompoundMemberComputedLocal` is the
+template.
