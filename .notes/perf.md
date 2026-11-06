@@ -17675,3 +17675,27 @@ down whether the two ever differ. That is a separate investigation.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79 in both modes, results identical to the parent.
+
+## REJECTED (2026-11-06): the register lane's inlined dense element read
+
+`fn_object`'s `objs[i]` paid two outlined frames per read (`get_member_computed`
+5.3% + `array_element_get` 4.4% of cycles) plus a wasted element-cell record, so
+the register lane's `GetMemberComputed`/`GetMemberComputedLocal` got an inline
+dense fast path: canonical Number key, dense buffer, non-hole element, and the
+JIT-only cell record gated on `agent.jit_hook`.
+
+Instructions fell exactly as predicted and cycles rose anyway:
+
+- `fn_object` 1,354.8M -> 1,325.9M instructions (**-2.1%**), 204.1M -> 206.3M
+  cycles (**+1.1%**), 65 -> 66 ms.
+- `fn_array` 1,171.9M -> 1,144.0M (**-2.4%**), 167.4M -> 171.0M (**+2.1%**),
+  53 -> 55 ms (**+3.8%**).
+- `array` 1,203.8M -> 1,176.0M instructions, cycles +1.2%, wall flat.
+- `sieve` was the exception: cycles **-2.5%**, wall +1.3%.
+
+Third measurement of the same lesson, now with a name: **the register executor
+is code-size bound.** `run_leaf_ops` is `#[inline(always)]` into three callers
+and holds a ~40-arm match; an inline fast path that removes two outlined calls
+adds enough op-cache/icache pressure to cost more cycles than it saves, and
+instructions do not see it. Reduce the *op count* (a lowering fusion) rather
+than the cost of an op, and gate every executor change on `perf stat -e cycles`.
