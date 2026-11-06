@@ -14306,7 +14306,11 @@ impl Vm {
                 }
                 LeafOp::Jump(target) => pc = *target,
                 LeafOp::JumpIfFalsy(target) => {
-                    if !crux::convert::to_boolean(&self.acc) {
+                    // `truthy`, not `to_boolean`: a comparison's result is a
+                    // Boolean, and the cross-crate call for it is the one
+                    // outlined call this branch does not need (the step path's
+                    // `JumpIfFalse` already uses the same fast path).
+                    if !truthy(&self.acc) {
                         pc = *target;
                     }
                 }

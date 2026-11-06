@@ -17609,3 +17609,37 @@ by `FastLoop*`.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79 in both modes, results identical to the parent.
+
+## REJECTED (2026-11-06): the same-stack frame's control-state verdicts are not worth shaving
+
+The same-stack call lane ran `is_control_free` (~22 `is_empty()` checks, 2.8%
+of `fib`'s cycles) on every push and `clear_control_state` (~22 `clear()` calls,
+2.6%) on every pop. Both are constant for a body whose steps cannot populate
+those stacks, so the obvious move is a cached per-body verdict — a
+`CompiledBody::statically_control_free` gate (`!touches_semantic_control()` plus
+no `ListBegin`/`SaveCompletion`/`UsingInit`) plus a `callee_control_free` bit on
+`InlineCallFrame`, with `debug_assert!`s in the push and pop checking the verdict
+against the live stacks.
+
+**Measured, it loses.** Two variants on `fib` (`perf stat`, min of three):
+
+- both narrowings: 4,761.6M -> 4,726.5M instructions (-0.7%) but 1,010.2M ->
+  1,053.1M cycles (**+4.2%**) and 332 -> 353 ms (**+6.3%** wall, 9 rounds).
+- the callee bit alone (no caller parameter): 4,761.7M -> 5,064.5M instructions
+  (**+6.4%**).
+
+The profile confirms the calls really are gone (`is_control_free` and
+`clear_control_state` disappear, replaced by `statically_control_free` at
+0.2%), so the loss is the *lane's* own code shape: `try_push_inline_call` /
+`pop_inline_call` sit on an inlining cliff, and one extra parameter, one extra
+frame field or one more branch in the pop moves the driver's hot loop enough to
+cost more cycles than the ~90 removed instructions. Field-packing the new bool
+next to `strict` changed nothing, so it is not the frame size.
+
+The lesson: this lane must be changed with cycles measured, never instructions —
+a net instruction reduction of 0.7% rode with a 4% cycle regression, and the
+"obviously cheaper" simplification is what caused it. What did land from this
+session's look at the lane is one line: `LeafOp::JumpIfFalsy` now uses the
+crate-local `truthy` (a Boolean answered inline) instead of calling
+`crux::convert::to_boolean`, matching `Step::JumpIfFalse` — 1,010.2M -> 995.4M
+cycles on `fib` (-1.5%), instructions flat, wall within noise.
