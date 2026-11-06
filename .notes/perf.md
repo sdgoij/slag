@@ -17834,3 +17834,32 @@ Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 23821/23821 (and `--jitless` annexB/built-ins the same, language 23724/23726
 with the two pre-existing `Exp` fixtures); corpus 79/79 identical to the
 parent in both modes and under `--gc-stress`.
+
+## LANDED (2026-11-06): the same-stack frame is pushed, not resized over a fill
+
+`try_push_inline_call` carved the callee's frame with
+`self.stack.resize(base + frame_size, Value::Undefined)` and then wrote every
+slot in the fill loop, so each same-stack activation zero-filled its frame and
+immediately overwrote it (`Vec::resize` was 1.5% of `fib` and part of its
+2.6% `memcpy`). The loop pushes the slot values directly; `base` is the same
+stack length, so the frame layout and the `leaf_frame_base` it installs are
+unchanged.
+
+`fib` 4,769.7M -> 4,691.6M instructions (**-1.6%**), 1,004.0M -> 997.2M
+cycles (-0.7%); the corpus's `calls/recursive_fib` the same shape
+(4,774.9M -> 4,716.3M, -1.2%). Every leaf-lane row (`calls/direct_leaf`,
+`closure_capture`, `method_call`, `nested_loops`) is instruction-identical, so
+the change is inert outside the same-stack lane.
+
+`fib`'s profile after this (and after the whole-body register program) is
+`run_body_segment` 30.9%, the driver closure 22.0%, `pop_inline_call` 13.5%,
+`save_scratch` 4.5%, `fast_call_core` 3.4%, `do_call_fast_ident` 3.3%,
+`is_control_free` 3.2%, `ContextStack::push` 2.8%, `memcpy` 2.6%,
+`clear_control_state` 2.2%. What is left is the per-activation bookkeeping the
+design requires (one `ExecutionContext` per activation for the error trace,
+the scratch save/restore, the 14-field inline-call record) plus the per-op
+executor cost — not a single removable piece.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79 identical in both modes and under `--gc-stress`.

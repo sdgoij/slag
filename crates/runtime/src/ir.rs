@@ -8218,7 +8218,8 @@ impl Vm {
         };
         // Carve the callee's frame above the call site — the leaf/nested lane's
         // layout, so the callee's frame slots are a flat `vm.stack` segment.
-        self.stack.resize(base + scope.frame_size, Value::Undefined);
+        // Every slot is written, so the frame is pushed rather than resized
+        // over an `undefined` fill.
         for slot in 0..scope.frame_size {
             let value = if Some(slot) == scope.this_slot {
                 this_value
@@ -8231,7 +8232,7 @@ impl Vm {
             } else {
                 Value::Undefined
             };
-            self.stack[base + slot] = value;
+            self.stack.push(value);
         }
         let caller_call_args =
             (!self.call_args.is_empty()).then(|| std::mem::take(&mut self.call_args));
