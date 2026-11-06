@@ -28025,11 +28025,18 @@ fn lower_step(
             // A statement-position member update (`o.x++` / `o.x--`): the
             // cached old value (read by the preceding `GetMemberName`, live
             // in the accumulator) updates in place and stores back onto the
-            // frame-slot object. The result (old for postfix, new for
-            // prefix) is discarded at the statement boundary, so the form is
-            // identical for both; an expression-position update leaves its
-            // result unconsumed and the run machinery keeps it on the step
-            // path.
+            // frame-slot object. The result (old for postfix, new for prefix)
+            // is discarded at the statement boundary, so the form is
+            // identical for both. An expression-position update leaves its
+            // result as an operand — and this form pushes no result — so it
+            // must stay on the step path: lowering `a[o.x++] = v` here drops
+            // the key operand and misaligns the store (the object/key/value
+            // shift, which read `this.buffer` as the key and threw "Cannot
+            // set properties of null"). Gate on the statement boundary,
+            // exactly like `UpdateLocal`.
+            if !matches!(next, Some(Step::SetCompletion)) {
+                return None;
+            }
             let old = stack.pop()?;
             let object = stack.pop()?;
             if !matches!(old, RegOperand::Acc) {

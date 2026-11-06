@@ -1791,6 +1791,27 @@ mod tests {
         evaluate(source)
     }
 
+    #[test]
+    fn member_update_as_a_computed_store_key_keeps_the_index() {
+        // Regression: a certified body lowered `a[o.n++] = v` with the
+        // expression-position member update as its statement form, which
+        // pushes no result. The key operand vanished, so the store read
+        // misaligned operands (the object became the key) and threw
+        // "Cannot set properties of null". The discarded-value statement
+        // before it is what keeps the body on the register path here.
+        let value = run("class B { \
+               constructor() { this.buf = [0, 0, 0, 0]; this.n = 0; } \
+               noop() {} \
+               put(x) { this.noop(); this.buf[this.n++] = x; return this.buf[0] + ':' + this.n; } \
+             } \
+             var b = new B(); b.put(7);")
+        .unwrap();
+        assert_eq!(
+            value.as_string().map(|s| s.to_string()),
+            Some("7:1".to_string())
+        );
+    }
+
     /// Run `source` on a thread with a large native stack and check its
     /// completion value. The interpreter collapses only SELF tail calls:
     /// the mutual `even`/`odd` recursion below grows a fresh interpreter
