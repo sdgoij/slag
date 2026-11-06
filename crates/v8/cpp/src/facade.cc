@@ -1,6 +1,8 @@
 #include "include/slag_a0.h"
+#include "include/v8-platform.h"
 #include "include/v8.h"
 
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -554,6 +556,7 @@ void V8::Initialize() {}
 void V8::Dispose() {}
 void V8::DisposePlatform() {}
 void V8::SetFlagsFromCommandLine(int*, char**, bool) {}
+void V8::SetFlagsFromString(const char*) {}
 const char* V8::GetVersion() { return slag_version(); }
 
 namespace platform {
@@ -567,6 +570,17 @@ bool PumpMessageLoop(Platform*, Isolate* isolate) {
 }
 
 }  // namespace platform
+
+// A tracing controller's defaults are V8's own: the disabled category, which
+// every `TRACE_EVENT` macro reads to decide the event is off.
+const uint8_t* TracingController::GetCategoryGroupEnabled(const char*) {
+  static const uint8_t kDisabledCategory[] = {'\0'};
+  return kDisabledCategory;
+}
+
+const char* TracingController::GetCategoryGroupName(const uint8_t*) {
+  return "(disabled)";
+}
 
 bool Isolate::PumpMessages() {
   bool ran = false;
@@ -1089,7 +1103,7 @@ std::unique_ptr<BackingStore> ArrayBuffer::NewBackingStore(
       static_cast<uint8_t*>(data), byte_length, deleter, deleter_data, 0)));
 }
 
-size_t ArrayBuffer::ByteLength() const {
+size_t ArrayBufferBase::ByteLength() const {
   return slag_array_buffer_byte_length(CurrentSlagContext(), Raw(this));
 }
 
@@ -1147,10 +1161,6 @@ std::shared_ptr<BackingStore> SharedArrayBuffer::NewBackingStore(
     Isolate*, size_t byte_length) {
   return std::shared_ptr<BackingStore>(
       new BackingStore(slag_buffer_new(byte_length)));
-}
-
-size_t SharedArrayBuffer::ByteLength() const {
-  return slag_array_buffer_byte_length(CurrentSlagContext(), Raw(this));
 }
 
 void* SharedArrayBuffer::Data() const {
@@ -2314,8 +2324,114 @@ Local<Boolean> Boolean::New(Isolate*, bool value) {
   return Local<Boolean>::New(slag_boolean_new(value ? 1 : 0));
 }
 
+Local<Primitive> Undefined(Isolate*) { return Local<Primitive>::New(slag_undefined()); }
+
+Local<Primitive> Null(Isolate*) { return Local<Primitive>::New(slag_null()); }
+
+Local<Boolean> True(Isolate*) { return Local<Boolean>::New(slag_boolean_new(1)); }
+
+Local<Boolean> False(Isolate*) { return Local<Boolean>::New(slag_boolean_new(0)); }
+
 Local<Integer> Integer::New(Isolate*, int32_t value) {
   return Local<Integer>::New(slag_number_new(static_cast<double>(value)));
+}
+
+Local<Integer> Integer::NewFromUnsigned(Isolate*, uint32_t value) {
+  return Local<Integer>::New(slag_number_new(static_cast<double>(value)));
+}
+
+namespace {
+
+/* The spec's ToInt32 over a double (7.1.6 - 7.1.8): truncate toward zero, take
+ * the residue modulo 2^32, then read it as signed. Written out because a plain
+ * `static_cast<int32_t>` of an out-of-range double is undefined behaviour, and
+ * `Int32::Value()` may be reached by a host that skipped `IsInt32`. */
+int32_t ToInt32(double value) {
+  if (!std::isfinite(value)) return 0;
+  const double truncated = std::trunc(value);
+  double residue = std::fmod(truncated, 4294967296.0);
+  if (residue < 0) residue += 4294967296.0;
+  return residue >= 2147483648.0 ? static_cast<int32_t>(residue - 4294967296.0)
+                                 : static_cast<int32_t>(residue);
+}
+
+uint32_t ToUint32(double value) {
+  if (!std::isfinite(value)) return 0;
+  const double truncated = std::trunc(value);
+  double residue = std::fmod(truncated, 4294967296.0);
+  if (residue < 0) residue += 4294967296.0;
+  return static_cast<uint32_t>(residue);
+}
+
+int64_t ToInt64(double value) {
+  if (!std::isfinite(value)) return 0;
+  const double truncated = std::trunc(value);
+  /* Beyond the int64 range the spec's ToInteger goes on to "same sign as"
+   * infinity, and a double that large has no integer neighbours to name; the
+   * clamp is what the language itself answers there. */
+  if (truncated >= 9223372036854775808.0) return INT64_MAX;
+  if (truncated <= -9223372036854775808.0) return INT64_MIN;
+  return static_cast<int64_t>(truncated);
+}
+
+}  // namespace
+
+double Number::Value() const { return slag_value_to_number(Raw(this)); }
+
+int64_t Integer::Value() const { return ToInt64(slag_value_to_number(Raw(this))); }
+
+int32_t Int32::Value() const { return ToInt32(slag_value_to_number(Raw(this))); }
+
+uint32_t Uint32::Value() const {
+  return ToUint32(slag_value_to_number(Raw(this)));
+}
+
+Local<BigInt> BigInt::New(Isolate*, int64_t value) {
+  return Local<BigInt>::New(slag_bigint_new(value));
+}
+
+Local<BigInt> BigInt::NewFromUnsigned(Isolate*, uint64_t value) {
+  return Local<BigInt>::New(slag_bigint_new_from_unsigned(value));
+}
+
+MaybeLocal<BigInt> BigInt::NewFromWords(Local<Context> context, int sign_bit,
+                                        int word_count,
+                                        const uint64_t* words) {
+  if (context.IsEmpty()) return MaybeLocal<BigInt>();
+  auto* current =
+      reinterpret_cast<Context*>(static_cast<uintptr_t>(context.raw()));
+  uint64_t out = 0;
+  if (slag_bigint_new_from_words(current->slag(), sign_bit != 0 ? 1 : 0,
+                                 word_count, words, &out) != 0) {
+    return MaybeLocal<BigInt>();
+  }
+  return MaybeLocal<BigInt>(Local<BigInt>::New(out));
+}
+
+uint64_t BigInt::Uint64Value(bool* lossless) const {
+  int32_t exact = 0;
+  const uint64_t value = slag_bigint_uint64_value(Raw(this), &exact);
+  if (lossless != nullptr) *lossless = exact != 0;
+  return value;
+}
+
+int64_t BigInt::Int64Value(bool* lossless) const {
+  int32_t exact = 0;
+  const int64_t value = slag_bigint_int64_value(Raw(this), &exact);
+  if (lossless != nullptr) *lossless = exact != 0;
+  return value;
+}
+
+int BigInt::WordCount() const { return slag_bigint_word_count(Raw(this)); }
+
+void BigInt::ToWordsArray(int* sign_bit, int* word_count,
+                          uint64_t* words) const {
+  if (word_count == nullptr) return;
+  int32_t negative = 0;
+  int32_t count = *word_count;
+  slag_bigint_to_words(Raw(this), &negative, &count, words);
+  if (sign_bit != nullptr) *sign_bit = negative;
+  *word_count = count;
 }
 
 Maybe<uint32_t> Value::Uint32Value(Local<Context> context) const {

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "slag_a0.h"
+#include "v8-version.h"
 
 namespace v8 {
 
@@ -110,6 +111,10 @@ class V8 {
   static void Dispose();
   static void DisposePlatform();
   static void SetFlagsFromCommandLine(int* argc, char** argv, bool remove_flags);
+  /* V8's own flag parser. The facade holds no flags, so this accepts the
+   * string and does nothing, like `SetFlagsFromCommandLine` above; a host that
+   * passes `--jitless` to a facade that has no such switch is not misled. */
+  static void SetFlagsFromString(const char* str);
   static const char* GetVersion();
 };
 
@@ -212,6 +217,16 @@ class Maybe {
   T value_{};
   bool has_ = false;
 };
+
+template <class T>
+Maybe<T> Just(T value) {
+  return Maybe<T>(value);
+}
+
+template <class T>
+Maybe<T> Nothing() {
+  return Maybe<T>();
+}
 
 template <class T>
 class MaybeLocal {
@@ -586,7 +601,15 @@ using BackingStoreDeleterCallback = void (*)(void* data, size_t length,
  * buffer over a backing store, or the store behind an existing buffer. The
  * host's external-memory account is told about the bytes through
  * `Isolate::AdjustAmountOfExternalAllocatedMemory`, as in V8. */
-class ArrayBuffer : public Object {
+/* The base `ArrayBuffer` and `SharedArrayBuffer` share in V8 15. A typed
+ * array's `GetBuffer()` answers one of these, which is why a converter (Blink's
+ * `ThrowIfResizable`) takes a `Local<ArrayBufferBase>`. */
+class ArrayBufferBase : public Object {
+ public:
+  size_t ByteLength() const;
+};
+
+class ArrayBuffer : public ArrayBufferBase {
  public:
   /* The host's allocator for buffer bytes (`v8::ArrayBuffer::Allocator`). A
    * backing store the facade creates for an isolate with one of these draws its
@@ -618,7 +641,6 @@ class ArrayBuffer : public Object {
       void* data, size_t byte_length, BackingStoreDeleterCallback deleter,
       void* deleter_data);
 
-  size_t ByteLength() const;
   void* Data() const;
   std::shared_ptr<BackingStore> GetBackingStore() const;
 
@@ -631,7 +653,7 @@ class ArrayBuffer : public Object {
 };
 
 /* A JavaScript SharedArrayBuffer (`v8::SharedArrayBuffer`). */
-class SharedArrayBuffer : public Object {
+class SharedArrayBuffer : public ArrayBufferBase {
  public:
   static Local<SharedArrayBuffer> New(Isolate* isolate, size_t byte_length);
   static Local<SharedArrayBuffer> New(
@@ -639,7 +661,6 @@ class SharedArrayBuffer : public Object {
   static std::shared_ptr<BackingStore> NewBackingStore(Isolate* isolate,
                                                        size_t byte_length);
 
-  size_t ByteLength() const;
   void* Data() const;
   std::shared_ptr<BackingStore> GetBackingStore() const;
 };
@@ -837,20 +858,77 @@ class Promise : public Object {
   };
 };
 
-class Number : public Value {
+/* V8 15's intermediate node between `Value` and the value kinds a script can
+ * read directly (`.notes/chromium-facade.md` §11, A3). It carries no members;
+ * it exists so `Local<Primitive>` and the `Undefined`/`Null` factories below
+ * have the type a host's code names. */
+class Primitive : public Value {};
+
+/* `Numeric` is the `Primitive` that arithmetic applies to: `Number` (and its
+ * `Integer`) in this facade, `BigInt` when it lands. */
+class Numeric : public Primitive {};
+
+class Number : public Numeric {
  public:
+  double Value() const;
   static Local<Number> New(Isolate* isolate, double value);
 };
 
 /* A property key: a `String` or a `Symbol` (`v8::Name`). Nothing here makes a
  * symbol yet, but the type is what `GetRealNamedProperty` takes, and a string
  * is a name, so the hierarchy is the one a host's code assumes. */
-class Name : public Value {};
+class Name : public Primitive {};
 
 class Integer : public Number {
  public:
   static Local<Integer> New(Isolate* isolate, int32_t value);
+  static Local<Integer> NewFromUnsigned(Isolate* isolate, uint32_t value);
+  int64_t Value() const;
 };
+
+/* V8 15's `Int32`/`Uint32`: the `Integer` views a converter narrows to once
+ * `IsInt32`/`IsUint32` answered. They have no constructors of their own in V8
+ * either — `Integer::New`/`NewFromUnsigned` make them. `Value()` here is the
+ * spec's ToInt32/ToUint32 over the stored double, so a value outside the range
+ * wraps as the language says instead of being undefined behaviour as a raw
+ * C++ cast would be (V8 reaches a `CHECK` where the host broke the contract). */
+class Int32 : public Integer {
+ public:
+  int32_t Value() const;
+};
+
+class Uint32 : public Integer {
+ public:
+  uint32_t Value() const;
+};
+
+/* An arbitrary-precision integer (`v8::BigInt`) — the `Numeric` a converter
+ * reaches once `IsBigInt` answered. A magnitude crosses as 64-bit words, least
+ * significant first, which is V8's own spelling in `NewFromWords`/
+ * `ToWordsArray`. No `Cast` here for the same reason the other value kinds have
+ * none: the facade has no `v8::Data` to cast from. */
+class BigInt : public Numeric {
+ public:
+  static Local<BigInt> New(Isolate* isolate, int64_t value);
+  static Local<BigInt> NewFromUnsigned(Isolate* isolate, uint64_t value);
+  /* `(-1)^sign_bit * sum(words[i] * 2^(64 * i))`, words least significant
+   * first. Empty when the count is negative or the words are missing. */
+  static MaybeLocal<BigInt> NewFromWords(Local<Context> context, int sign_bit,
+                                         int word_count, const uint64_t* words);
+  /* The low 64 bits, two's complement for a negative value, and through
+   * `lossless` whether that is the exact value. */
+  uint64_t Uint64Value(bool* lossless = nullptr) const;
+  int64_t Int64Value(bool* lossless = nullptr) const;
+  int WordCount() const;
+  void ToWordsArray(int* sign_bit, int* word_count, uint64_t* words) const;
+};
+
+/* The four singletons, as V8 15 spells them: free functions over the isolate's
+ * read-only roots rather than `Value` members. `Undefined`/`Null` answer a
+ * `Local<Primitive>` and `True`/`False` a `Local<Boolean>`, which is the pair of
+ * types Blink's converters pass around. */
+Local<Primitive> Undefined(Isolate* isolate);
+Local<Primitive> Null(Isolate* isolate);
 
 class String : public Name {
  public:
@@ -909,10 +987,13 @@ class String : public Name {
 };
 
 /* A boolean value (`v8::Boolean`): the info a deleter answers through. */
-class Boolean : public Value {
+class Boolean : public Primitive {
  public:
   static Local<Boolean> New(Isolate* isolate, bool value);
 };
+
+Local<Boolean> True(Isolate* isolate);
+Local<Boolean> False(Isolate* isolate);
 
 /* A private name (`v8::Private`). V8's `Private` derives from `Data` and is used
  * only through the `Object::*Private` methods; the engine models a private name
@@ -1188,23 +1269,46 @@ class Source {
   Local<Value> name_;
 };
 
-/* How a compile reads its input (`v8::CompileOptions` and `NoCacheReason`).
- * `kConsumeCodeCache` and the reasons are accepted and ignored: this facade
+/* Whether a script is a classic script or a module (`v8::ScriptType`). */
+enum class ScriptType { kClassic, kModule };
+
+/* A profiler sample's embedder tag (`v8-embedder-state-scope.h`). Only the two
+ * values V8 reserves are named; a host defines its own above them. */
+enum class EmbedderStateTag : uint8_t {
+  EMPTY = 0,
+  OTHER = 1,
+};
+
+/* The compiler entry points that take a `Source` (`v8::ScriptCompiler`).
+ *
+ * `CompileOptions` and `NoCacheReason` are nested here because V8 nests them:
+ * a host writes `v8::ScriptCompiler::CompileOptions`, and a namespace-scope
+ * `v8::CompileOptions` would compile for the facade and fail for Blink.
+ * `kConsumeCodeCache` and the reasons are accepted and ignored — this facade
  * has no code cache yet. */
-enum CompileOptions {
-  kNoCompileOptions = 0,
-  kConsumeCodeCache = 1,
-  kEagerCompile = 2,
-};
-
-enum class NoCacheReason {
-  kNoCacheNoReason = 0,
-  kNoCacheBecauseCachingDisabled = 1,
-};
-
-/* The compiler entry points that take a `Source` (`v8::ScriptCompiler`). */
 class ScriptCompiler {
  public:
+  /* How a compile reads its input. */
+  enum CompileOptions {
+    kNoCompileOptions = 0,
+    kConsumeCodeCache = 1 << 0,
+    kEagerCompile = 1 << 1,
+    /* The compile-hint family: Blink passes these to say whether the source's
+     * magic comments are to be honoured and whether hint data is being
+     * produced or consumed. The engine has no hint pipeline, so they are
+     * accepted as advisory and have no effect — which is safe, because a hint
+     * only tells a compiler about work it may skip. */
+    kProduceCompileHints = 1 << 2,
+    kConsumeCompileHints = 1 << 3,
+    kFollowCompileHintsMagicComment = 1 << 4,
+    kFollowCompileHintsPerFunctionMagicComment = 1 << 5,
+  };
+
+  enum class NoCacheReason {
+    kNoCacheNoReason = 0,
+    kNoCacheBecauseCachingDisabled = 1,
+  };
+
   static MaybeLocal<Module> CompileModule(
       Isolate* isolate, Source* source,
       CompileOptions options = kNoCompileOptions,

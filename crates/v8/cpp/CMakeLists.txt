@@ -45,3 +45,26 @@ target_link_libraries(inspector PRIVATE v8_facade)
 # README's A1 section).
 add_executable(gin-shapes tests/gin_shapes.cc)
 target_link_libraries(gin-shapes PRIVATE v8_facade)
+
+# Stage 0 of the Chromium port: which of V8's public headers the facade
+# provides. No engine symbols, so it builds and runs before `slagc` exists.
+add_executable(surface-census tests/surface_census.cc)
+target_include_directories(surface-census PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(surface-census PRIVATE
+  SLAG_FACADE_INCLUDE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/include"
+  SLAG_V8_HEADER_LIST="${CMAKE_CURRENT_SOURCE_DIR}/tests/v8-headers.txt")
+
+# E2 of `.notes/browser.md` §9.5: a handle-scope `Local` across an out-of-line
+# collection, with the root-count and bare-word controls.
+add_executable(rooting tests/rooting.cc)
+target_link_libraries(rooting PRIVATE v8_facade)
+
+# Compile-only: every header the facade provides, included by the name a host
+# uses. No `main`, never runs.
+add_library(header-surface OBJECT tests/header_surface.cc)
+target_include_directories(header-surface PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# The value basics Blink's converters reach for first: the four singletons, the
+# `Primitive`/`Numeric` node, and `Maybe`'s `Just`/`Nothing`.
+add_executable(value-basics tests/value_basics.cc)
+target_link_libraries(value-basics PRIVATE v8_facade)

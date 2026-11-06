@@ -2386,6 +2386,128 @@ pub extern "C" fn slag_number_new(value: f64) -> u64 {
     JsValue::number(value).to_bits()
 }
 
+/// A BigInt from `value` (`v8::BigInt::New`).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_bigint_new(value: i64) -> u64 {
+    JsValue::bigint(crux::BigInt::from(value)).to_bits()
+}
+
+/// A BigInt from an unsigned magnitude (`v8::BigInt::NewFromUnsigned`).
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_bigint_new_from_unsigned(value: u64) -> u64 {
+    JsValue::bigint(crux::BigInt::from(value)).to_bits()
+}
+
+/// Build a BigInt from a sign and 64-bit magnitude words, least significant
+/// first (`v8::BigInt::NewFromWords`):
+/// `(-1)^negative * sum(words[i] * 2^(64 * i))`. Answers 0 and writes `out`, or
+/// -1 for a null `out`, a negative count, or a null `words` with a non-zero
+/// count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_bigint_new_from_words(
+    _context: *mut SlagContext,
+    negative: i32,
+    word_count: i32,
+    words: *const u64,
+    out: *mut u64,
+) -> i32 {
+    if out.is_null() || word_count < 0 {
+        return -1;
+    }
+    let count = word_count as usize;
+    let digits: &[u64] = if count == 0 {
+        &[]
+    } else if words.is_null() {
+        return -1;
+    } else {
+        std::slice::from_raw_parts(words, count)
+    };
+    *out = JsValue::bigint(crux::BigInt::from_u64_words(negative != 0, digits)).to_bits();
+    0
+}
+
+/// `v8::BigInt::Uint64Value`: the value's low 64 bits — two's complement for a
+/// negative value — and, through `lossless`, whether that is the exact value
+/// (false when it is negative or past 2^64).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_bigint_uint64_value(value: u64, lossless: *mut i32) -> u64 {
+    let Some(handle) = Value::from_bits(value).as_bigint() else {
+        if !lossless.is_null() {
+            *lossless = 0;
+        }
+        return 0;
+    };
+    let big: &crux::BigInt = &handle;
+    let exact = big.to_u64();
+    if !lossless.is_null() {
+        *lossless = i32::from(exact.is_some());
+    }
+    exact.unwrap_or_else(|| crux::bigint::as_uint_n(big, 64).to_u64().unwrap_or(0))
+}
+
+/// `v8::BigInt::Int64Value`: the value's low 64 bits as a signed integer, and
+/// through `lossless` whether that is the exact value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_bigint_int64_value(value: u64, lossless: *mut i32) -> i64 {
+    let Some(handle) = Value::from_bits(value).as_bigint() else {
+        if !lossless.is_null() {
+            *lossless = 0;
+        }
+        return 0;
+    };
+    let big: &crux::BigInt = &handle;
+    let wrapped = big.to_i64_wrapping();
+    if !lossless.is_null() {
+        *lossless = i32::from(crux::BigInt::from(wrapped) == *big);
+    }
+    wrapped
+}
+
+/// `v8::BigInt::WordCount`: the 64-bit words `ToWordsArray` would write. Zero is
+/// one word, which is how many digits V8 stores for it.
+#[unsafe(no_mangle)]
+pub extern "C" fn slag_bigint_word_count(value: u64) -> i32 {
+    match Value::from_bits(value).as_bigint() {
+        Some(handle) => {
+            let (_, digits) = handle.to_u64_words();
+            digits.len().max(1) as i32
+        }
+        None => 1,
+    }
+}
+
+/// `v8::BigInt::ToWordsArray`: write the sign, up to `*word_count` magnitude
+/// words (least significant first), and the full count back through
+/// `word_count`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_bigint_to_words(
+    value: u64,
+    negative: *mut i32,
+    word_count: *mut i32,
+    words: *mut u64,
+) {
+    if word_count.is_null() {
+        return;
+    }
+    let capacity = (*word_count).max(0) as usize;
+    let (is_negative, digits) = match Value::from_bits(value).as_bigint() {
+        Some(handle) => handle.to_u64_words(),
+        None => (false, Vec::new()),
+    };
+    if !negative.is_null() {
+        *negative = i32::from(is_negative);
+    }
+    if !words.is_null() {
+        for (index, digit) in digits.iter().take(capacity).enumerate() {
+            *words.add(index) = *digit;
+        }
+        if digits.is_empty() && capacity > 0 {
+            *words = 0;
+        }
+    }
+    *word_count = digits.len().max(1) as i32;
+}
+
 unsafe fn str_of_unchecked<'a>(ptr: *const u8, len: usize) -> &'a str {
     text(ptr, len).unwrap_or("")
 }

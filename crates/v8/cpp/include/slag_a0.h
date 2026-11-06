@@ -476,6 +476,19 @@ int32_t slag_set_clear(SlagContext* context, uint64_t set);
 int32_t slag_set_size(SlagContext* context, uint64_t set);
 int32_t slag_set_as_array(SlagContext* context, uint64_t set, uint64_t* out);
 uint64_t slag_number_new(double value);
+
+/* BigInt (v8::BigInt). Magnitudes cross as 64-bit words, least significant
+ * first, which is how V8's NewFromWords/ToWordsArray spell them. */
+uint64_t slag_bigint_new(int64_t value);
+uint64_t slag_bigint_new_from_unsigned(uint64_t value);
+int32_t slag_bigint_new_from_words(SlagContext* context, int32_t negative,
+                                   int32_t word_count, const uint64_t* words,
+                                   uint64_t* out);
+uint64_t slag_bigint_uint64_value(uint64_t value, int32_t* lossless);
+int64_t slag_bigint_int64_value(uint64_t value, int32_t* lossless);
+int32_t slag_bigint_word_count(uint64_t value);
+void slag_bigint_to_words(uint64_t value, int32_t* negative,
+                          int32_t* word_count, uint64_t* words);
 void slag_root_retain(uint64_t value);
 void slag_root_release(uint64_t value);
 size_t slag_root_count(void);

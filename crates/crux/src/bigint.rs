@@ -48,6 +48,38 @@ impl BigInt {
         self.0.sign() == num_bigint::Sign::NoSign
     }
 
+    /// The value from a sign and its 64-bit magnitude words, least significant
+    /// first: the shape V8's `BigInt::NewFromWords` takes
+    /// (`(-1)^negative * sum(words[i] * 2^(64 * i))`). A negative sign with a
+    /// zero magnitude is zero, not `-0` — the language has only one zero.
+    pub fn from_u64_words(negative: bool, words: &[u64]) -> BigInt {
+        let sign = if negative && words.iter().any(|word| *word != 0) {
+            num_bigint::Sign::Minus
+        } else {
+            num_bigint::Sign::Plus
+        };
+        // Through little-endian bytes: `num-bigint`'s digit slices are radix
+        // 2^32, and widening to them would be the same work with more room to
+        // get the halves backwards.
+        let mut bytes = Vec::with_capacity(words.len() * 8);
+        for word in words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        BigInt(NumBigInt::from_biguint(
+            sign,
+            num_bigint::BigUint::from_bytes_le(&bytes),
+        ))
+    }
+
+    /// The sign and the magnitude's 64-bit words, least significant first —
+    /// [`BigInt::from_u64_words`]'s inverse, and what `BigInt::ToWordsArray`
+    /// writes. Zero answers an empty magnitude, which the caller reports as one
+    /// zero word (V8 stores at least one digit).
+    pub fn to_u64_words(&self) -> (bool, Vec<u64>) {
+        let negative = self.0.sign() == num_bigint::Sign::Minus;
+        (negative, self.0.magnitude().to_u64_digits())
+    }
+
     /// The value's low 64 bits as a signed i64 (wrapping modulo 2^64): the
     /// JS-API conversion of a BigInt to a wasm i64 value.
     pub fn to_i64_wrapping(&self) -> i64 {
@@ -341,6 +373,35 @@ mod tests {
         assert_eq!(big(123456789).to_f64(), 123456789.0);
         assert_eq!(big(-2).to_f64(), -2.0);
         assert_eq!(BigInt::from(1u64 << 63).to_f64(), 9223372036854775808.0);
+    }
+
+    #[test]
+    fn u64_words_round_trip() {
+        // One word, both signs; a negative sign over a zero magnitude is zero.
+        assert_eq!(BigInt::from_u64_words(false, &[7]), big(7));
+        assert_eq!(BigInt::from_u64_words(true, &[7]), big(-7));
+        assert_eq!(BigInt::from_u64_words(true, &[0]), big(0));
+        assert_eq!(BigInt::from_u64_words(false, &[]), big(0));
+
+        // A magnitude that needs two words: the words come back in the order
+        // they went in, least significant first, sign included.
+        let wide = BigInt::from_u64_words(false, &[3, 1]);
+        assert_eq!(wide.to_u64_words(), (false, vec![3, 1]));
+        assert_eq!(
+            BigInt::from_u64_words(true, &[3, 1]).to_u64_words(),
+            (true, vec![3, 1])
+        );
+
+        // A signed value survives the trip in both directions.
+        let negative = BigInt::from(-1234567890123456789i64);
+        assert_eq!(
+            negative.to_u64_words(),
+            (true, vec![1234567890123456789u64])
+        );
+        assert_eq!(
+            BigInt::from_u64_words(true, &[1234567890123456789u64]),
+            negative
+        );
     }
 
     #[test]

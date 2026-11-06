@@ -3835,6 +3835,12 @@ impl JsValue {
         Self(Value::Number(value))
     }
 
+    /// A BigInt from `crux`'s arbitrary-precision integer: the value the
+    /// V8-shaped facade's `BigInt` type wraps.
+    pub fn bigint(value: crux::BigInt) -> Self {
+        Self(Value::BigInt(Handle::new(value)))
+    }
+
     pub fn string(value: impl Into<String>) -> Self {
         let text: String = value.into();
         Self(Value::String(Handle::new(JsString::from_utf8(&text))))
