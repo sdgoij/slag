@@ -17143,3 +17143,87 @@ pop 36, and the call step 147, the largest single item.
 Verified: clippy -D warnings, fmt, cargo test --workspace, test262 language
 23726/23726 + annexB 1086/1086 + built-ins 23821/23821, corpus 79/79 with 0
 mismatches.
+
+## LANDED (2026-11-05): the interpreter's per-step and per-call body work
+
+The `--jitless` gap was re-decomposed with `perf` (Apple PMU) and
+`valgrind --tool=callgrind`, which attribute *instructions* per source line
+once a `CARGO_PROFILE_RELEASE_DEBUG=1` build is profiled. Four changes came out
+of it; each is a control-vs-variant A/B in one session (min of N, same
+workload, `--jitless`).
+
+1. **`frame_get`/`frame_get_mut` are `#[inline(always)]`.** They are the only
+   way the step and register executors reach the frame, they were out of line
+   (`frame_get` alone was 11-13% of `fn_object`), and the three-way
+   `leaf_frame_base`/`nested_frame`/`Frame` match folds per call site once
+   inlined. `fn_object` 78 -> 70, `object` 91 -> 76, `fn_array` 61 -> 51,
+   `local` 146 -> 138. A plain `#[inline]` hint does *not* inline it (12% still
+   self time) — use `always`; the entry points are small and the code growth is
+   one match per access site.
+
+2. **`binary_inline`'s number fast path is `#[inline(always)]`, its cold half
+   is a separate `#[inline(never)]` `binary_inline_slow`.** The function was
+   marked `#[inline]`, but LLVM kept a 48-Ir out-of-line copy and only the
+   register lane that already inlined it avoided the call; measured 41 Ir per
+   add on `local` (2.7M `Ir`/call total). Splitting lets the smi/number
+   comparisons (and the `Value::Number` smi check) fold into every executor
+   arm while the string-concat/`apply_binary` fallback stays one call:
+   `capture` 158 -> 111, `local` 137 -> 115, `fn_array` 59 -> 52,
+   `capture2` 71 -> 66.
+
+3. **`Step::Binary` goes through `binary_inline`** instead of
+   `crate::expr::apply_binary`, so step-path bodies get the same number
+   fast path the register lane has: `closures` 133 -> 124 (its callee is not
+   register-lowered — see below).
+
+4. **`SLOT_LEAF_CELLS` 64 -> 256, and `EnvStack::reset` skips the clear when
+   it holds only the base.** The value-callee half of the slot-callee leaf
+   cache was 32 cells; `fns[i & 63](x)` cycles 64 callees through it, so every
+   call missed and took `fast_call_core`'s full `leaf_lookup` (`closures`:
+   `fast_call_core` 11.3% + `leaf_lookup` 2%). 64 balls into 32 bins is a
+   near-total miss; 128 cells still collided (measured *worse* than 64 — a
+   full cycle thrashes even on one collision), 256 is the first size that
+   pays: `closures` 128 -> 118. `EnvStack::reset`'s
+   `for slot in ..take(len.min(8)) { *slot = None }` compiled to an
+   out-of-line `memset` call **per call** (3.7% + 0.4% of `fib`); the
+   `len <= 1` case needs no clear at all because slot 0 is overwritten.
+
+Same-session A/B (`--jitless`, min of 9, rotated order, against the pre-change
+binary): `capture` 0.67, `local` 0.78, `object` 0.84, `array` 0.86,
+`closures` 0.87, `fn_object` 0.87, `fn_array` 0.87, `fib` 0.93, `sieve` 0.94,
+`capture2` 0.96, `fn_arith` 0.96, `arith` 0.96, `method` 1.01. Against `bs`
+(7 rounds): `arith` 0.84, `array` 0.82, `capture` 1.21, `fn_array` 1.16,
+`object` 1.36, `capture2` 1.47, `fn_arith` 1.57, `local` 1.75, `fn_object`
+1.86, `sieve` 1.87, `method` 2.85, `closures` 3.05, `fib` 7.00.
+
+**Rejected, with the measurement** (do not re-try these blind):
+
+- `#[inline]` on `crux::convert::to_boolean`: removing it makes `closures`
+  17% faster and `local` 8% faster, at a 2% cost on `fib`/`method` — inlining
+  the whole `ValueKind` match into every `JumpIfFalse` arm bloats the dispatch
+  loop the small step-path bodies run. Net negative; leave it out of line.
+- `#[inline(always)]` on `cell_object`: `object` +9%, `method` +3%.
+- A `try_global_cell_read` probe at the top of `load_global_value`: -5.6%
+  instructions on `method` (callgrind), **0% wall clock** — the vector read is
+  cache-hot and the sync is not instruction-bound.
+- `stack.resize` -> `reserve`+`push` in `try_push_inline_call` (drop the
+  double fill): neutral, within noise. `Vec::resize`'s fill is already sunk.
+- `#[inline]` on `new_body_context`/`global_reads_are_unshadowed`: within
+  noise (+/- 1%).
+
+Where the remaining `--jitless` cost is (callgrind, `fib`, 2.69M calls,
+6.19 GIr total = 2.3 KIr/call): `run_inner_inner` 23.6%, the same-stack push
+9%, `pop_inline_call` 8.3%, `save_scratch` 2.7%, `fast_call_core` 3.1%,
+`load_ident_value` 3%, `control_transfer` + `close_for_of_return` 2.6%,
+`is_control_free` 1.6%, `global_reads_are_unshadowed` 1.3%, `leaf_lookup` 2.3%,
+`ContextStack::push` 1.3%. The push/pop is now spread thin rather than one
+item, which is why the next `fib` slice needs the self-call lane (skip the
+context push and the env work when the callee *is* the running body) rather
+than another ablation. `closures`' callee is not register-lowered because its
+captured read is `LoadContextSlot { depth: 1 }` (the IIFE's context is between
+it and `bench`'s) and the lowering only accepts depth 0 — extending `LeafOp`
+with a depth (a short `outer()` walk) would put that body on the register lane.
+
+Verified: clippy -D warnings, fmt, cargo test --workspace (all green),
+test262 language 23726/23726 + annexB 1086/1086 + built-ins 23821/23821,
+corpus 79/79 with identical results in jit and jitless.

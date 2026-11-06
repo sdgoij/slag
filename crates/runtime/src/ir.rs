@@ -3445,8 +3445,12 @@ impl Trace for SlotLeafCell {
 }
 
 /// The direct-mapped slot-callee leaf cache size (Cut 35 slice 12): a
-/// power of two so the index is a mask.
-pub(crate) const SLOT_LEAF_CELLS: usize = 64;
+/// power of two so the index is a mask. The upper half serves value callees
+/// (`fns[i](x)` and other calls whose callee arrives on the stack), so it
+/// must hold a call site's cycling callee set: 32 cells thrashed on the
+/// 64-closure bench and sent every call through `fast_call_core`'s full
+/// lookup.
+pub(crate) const SLOT_LEAF_CELLS: usize = 256;
 
 /// The leaf-inline cache site (Cut 35 slice 12): which per-call-site
 /// cache, if any, the resolved leaf entry is written to on the first
@@ -3606,9 +3610,14 @@ impl EnvStack {
         // Only the used inline slots hold a value (the tail is already `None`),
         // so clear just those: this runs on both sides of every nested call's
         // env swap, and clearing the whole array measured on call-dominated
-        // workloads.
-        for slot in self.inline.iter_mut().take(self.len.min(ENV_INLINE)) {
-            *slot = None;
+        // workloads. The single-entry case (a body whose environment never
+        // grew) needs no clear at all — slot 0 is overwritten below — and
+        // spelling it out keeps LLVM from emitting an out-of-line `memset`
+        // call for a one-slot store on the hottest call path.
+        if self.len > 1 {
+            for slot in self.inline.iter_mut().take(self.len.min(ENV_INLINE)) {
+                *slot = None;
+            }
         }
         self.heap.clear();
         self.inline[0] = Some(base);
@@ -4998,7 +5007,7 @@ impl Vm {
     /// leaf runs inline (`leaf_frame_base`), else the caller's `frame`. The
     /// branch is fully predictable on both paths (the base is `None` for
     /// every non-leaf body).
-    #[inline]
+    #[inline(always)]
     fn frame_get(&self, slot: usize) -> &Value {
         let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
@@ -5013,7 +5022,7 @@ impl Vm {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn frame_get_mut(&mut self, slot: usize) -> &mut Value {
         let slot = slot + self.leaf_frame_offset;
         match self.leaf_frame_base {
@@ -9012,7 +9021,7 @@ impl Vm {
                 Step::Binary(op) => {
                     let right = self.pop();
                     let left = self.pop();
-                    let value = crate::expr::apply_binary(agent, *op, &left, &right)?;
+                    let value = Self::binary_inline(agent, *op, &left, &right)?;
                     self.stack.push(value);
                 }
                 Step::BinaryImm { op, imm } => {
@@ -13886,15 +13895,17 @@ impl Vm {
     }
 
     /// The number-number arithmetic inline shared by the register binary ops
-    /// (Cut 35 slice 10): two tag checks + a direct op for the arithmetic
-    /// shapes, falling back to the general `apply_binary` for anything else
-    /// (mirrors `Step::BinaryImm`'s inline). The Add case is `apply_binary`'s
-    /// own number-number fast path, inlined to skip the call; the
-    /// string-string Add case (Cut 35 slice 29) routes the rope concat through
-    /// a cold helper — inlining the concat body at every register-op call
-    /// site bloats the number loops' icache (measured ~3-6ns/call on the
-    /// closure and call rows, Cut 35 slice 30).
-    #[inline]
+    /// (Cut 35 slice 10) and `Step::Binary`: two tag checks + a direct op for
+    /// the arithmetic shapes, falling back to the general `apply_binary` for
+    /// anything else (mirrors `Step::BinaryImm`'s inline). The Add case is
+    /// `apply_binary`'s own number-number fast path, inlined to skip the call;
+    /// the string-string Add case (Cut 35 slice 29) routes the rope concat
+    /// through a cold helper — inlining the concat body at every call site
+    /// bloats the number loops' icache (measured ~3-6ns/call on the closure
+    /// and call rows, Cut 35 slice 30). Everything past the number checks
+    /// lives in `binary_inline_slow`, so the fast path folds into each arm
+    /// with `#[inline(always)]` without dragging the general evaluator along.
+    #[inline(always)]
     fn binary_inline(
         agent: &mut Agent,
         op: BinaryOp,
@@ -13927,6 +13938,19 @@ impl Vm {
                 _ => {}
             }
         }
+        Self::binary_inline_slow(agent, op, left, right)
+    }
+
+    /// The cold half of [`Self::binary_inline`]: string concatenation and the
+    /// fully general binary evaluator. Kept out of line so the number fast
+    /// path above can inline into every register-executor arm.
+    #[inline(never)]
+    fn binary_inline_slow(
+        agent: &mut Agent,
+        op: BinaryOp,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Value, JsError> {
         if op == BinaryOp::Add {
             if let Some(value) = Self::concat_strings(left, right) {
                 return Ok(value);
