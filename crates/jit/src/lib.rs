@@ -384,6 +384,7 @@ impl JitCache {
                     .body
                     .jit_evictions
                     .set(entry.body.jit_evictions.get().saturating_add(1));
+                runtime::jit::record_evicted();
                 self.evictions_since_decay += 1;
             }
         }

@@ -41,6 +41,14 @@ pub fn install_jit(context: &mut Context) -> Result<(), String> {
     jit::install(context.agent_mut())
 }
 
+/// The process-global JIT counters: bodies compiled, bodies refused (which run
+/// interpreted), evictions, and deopts. A host reads this after loading its
+/// scene to see how many bodies the JIT accepted versus refused — the
+/// per-verdict signal the refusal census used to dump, now available from the
+/// embedding surface. A single-context host reads that context's totals.
+#[cfg(feature = "jit")]
+pub use runtime::jit::{JitStats, jit_stats};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +102,28 @@ mod tests {
             .unwrap();
         assert_eq!(a.eval("1 + 1").unwrap().as_number(), Some(2.0));
         assert_eq!(b.eval("2 + 2").unwrap().as_number(), Some(4.0));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_stats_report_compiled_bodies() {
+        let mut context = Context::new().unwrap();
+        install_jit(&mut context).unwrap();
+        let before = jit_stats();
+        // A certified loop body compiles on its first consult; run it hot.
+        context
+            .eval(
+                "function f() { var s = 0; for (var i = 0; i < 1000; i++) s += i; return s; } \
+                 for (var k = 0; k < 10; k++) f();",
+            )
+            .unwrap();
+        let after = jit_stats();
+        assert!(
+            after.compiled > before.compiled,
+            "a loop body compiled ({} -> {})",
+            before.compiled,
+            after.compiled
+        );
     }
 
     /// A host that installs its own global object implements [`api::HostOps`],

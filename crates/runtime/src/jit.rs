@@ -702,6 +702,63 @@ pub static JIT_DEOPT_PROBE: std::sync::atomic::AtomicI64 = std::sync::atomic::At
 /// telemetry).
 pub static JIT_DEOPT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many bodies the JIT compiled (compile events: a recompile after an
+/// eviction counts again, so `compiled - evicted` approximates the live
+/// compiled body count).
+static JIT_COMPILED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many bodies the JIT refused (too large, or a step the emitter cannot
+/// lower); a refused body runs interpreted.
+static JIT_REFUSED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many bodies the compiled-body cache evicted.
+static JIT_EVICTED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A snapshot of the process-global JIT counters, for a host's telemetry.
+/// These aggregate every context on the thread: a host that runs one context
+/// (the common embed) reads that context's totals. This is the read the
+/// refusal census used to dump — `compiled` vs `refused` is the signal that a
+/// body which compiled on one engine build was refused on another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitStats {
+    /// Bodies compiled to machine code.
+    pub compiled: u64,
+    /// Bodies the JIT refused; they run interpreted.
+    pub refused: u64,
+    /// Bodies evicted from the compiled-body cache.
+    pub evicted: u64,
+    /// Compiled runs that bailed to the interpreter.
+    pub deopted: u64,
+}
+
+#[inline]
+fn record_compiled() {
+    JIT_COMPILED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn record_refused() {
+    JIT_REFUSED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one body evicted from the compiled-body cache. Called by the cache
+/// (`crates/jit`'s `JitCache::evict_if_needed`).
+#[inline]
+pub fn record_evicted() {
+    JIT_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process-global JIT counters (see [`JitStats`]).
+pub fn jit_stats() -> JitStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    JitStats {
+        compiled: JIT_COMPILED_COUNT.load(Relaxed),
+        refused: JIT_REFUSED_COUNT.load(Relaxed),
+        evicted: JIT_EVICTED_COUNT.load(Relaxed),
+        deopted: JIT_DEOPT_COUNT.load(Relaxed),
+    }
+}
+
 /// Whether each deopt is traced to stderr (`SLAG_JIT_DEOPT_TRACE`).
 pub(crate) static JIT_DEOPT_TRACE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -6930,6 +6987,7 @@ pub(crate) fn lookup_info(
             if std::env::var("JIT_DUMP_CLIF").is_ok() {
                 eprintln!("jit skip: body too large ({} steps)", ir.steps.len());
             }
+            record_refused();
             ir.jit_info.set(1);
             return std::ptr::null();
         }
@@ -6964,8 +7022,10 @@ pub(crate) fn lookup_info(
             )
         };
         if ptr.is_null() {
+            record_refused();
             ir.jit_info.set(1);
         } else {
+            record_compiled();
             ir.jit_info.set(ptr as usize);
         }
         ptr as *const JitCompiledInfo
