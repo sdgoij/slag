@@ -38,9 +38,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crux::Value;
 use runtime::ir::{
     ApplyKind, COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT,
-    CompiledBody, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, IntRhs, Intrinsic, LeafOp,
-    MEMBER_CELLS, MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo, Step,
-    TryFrame, is_compound_assign,
+    CompiledBody, CompoundRhs, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, IntRhs, Intrinsic,
+    LeafOp, MEMBER_CELLS, MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo,
+    Step, TryFrame, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -555,6 +555,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::AsyncYieldStarResume { .. } => "YieldStar/AsyncYieldStar",
         Step::Destructure { .. } | Step::DeclInit { .. } => "Destructure",
         Step::CreateArguments { .. } => "CreateArguments",
+        Step::FusedCompoundLocal { .. } => "FusedCompoundLocal",
         Step::ScriptGlobalFlush { .. } => "ScriptGlobalFlush",
         Step::ScriptGlobalReload { .. } => "ScriptGlobalReload",
         Step::TypeofTop => "TypeofTop",
@@ -8686,6 +8687,22 @@ impl<'a> Lowerer<'a> {
             // formals through the capture context — or strict unmapped) and
             // stores it into the frame slot; a step-index helper reads the
             // `slot`/`mapped` payload. Emitted once at body entry.
+            // The general loop path's fused compound update (`for (...; ...;
+            // j += i)`): the same machine code as the `LoadLocal` + `LoadLocal` +
+            // `Binary` + `Dup` + `StoreLocal` + `Pop` sequence it replaces, with
+            // the RHS read straight from its slot (or the loop counter).
+            Step::FusedCompoundLocal { slot, op, rhs } => {
+                let lhs = self.load_slot(*slot);
+                let rhs = match rhs {
+                    CompoundRhs::Imm(imm) => self.const_value(&Value::Number(*imm))?,
+                    CompoundRhs::Slot(rhs_slot) => self.load_slot(*rhs_slot),
+                    CompoundRhs::Global(name) => self.emit_global_read(*name)?,
+                    CompoundRhs::Counter => self.counter_bits(),
+                };
+                let res = self.emit_binary(*op, lhs, rhs)?;
+                self.store_slot(*slot, res);
+                self.fall_through(index);
+            }
             Step::CreateArguments { .. } => {
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                 let _res = self.call_slow(self.sig_step, Helper::CreateArguments, &[step_imm])?;

@@ -17412,3 +17412,41 @@ there the size cost is real and the win is `fib`-only.
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821; corpus 79/79, jit == jitless == the previous commit.
+
+## LANDED (2026-11-06): fuse the general loop's compound update
+
+The fast-loop gate (`Compiler::compile_fast_loop`) only admits `i++`/`i--`, so
+`for (...; ...; j += i)` falls to the general path — whose update is the
+six-step `LoadLocal`/`LoadLocal`/`Binary`/`Dup`/`StoreLocal`/`Pop` sequence, the
+general path having to leave the assignment's value for a `Pop`. `sieve`'s inner
+loop (`for (var j = i + i; j <= n; j += i) a[j] = false;`) was nine dispatches
+per iteration, six of them that update.
+
+`Step::FusedCompoundLocal { slot, op, rhs }` does `frame[slot] = frame[slot] <op>
+rhs` in one dispatch and pushes nothing (the loop protocol discards it). The RHS
+is a `CompoundRhs` — literal, frame slot, declared global, or `Counter`. The last
+one is what the first cut missed: in a `for` nested inside another fast loop, the
+outer counter is `BindingLoc::Acc`, so the RHS compiled to `PushAcc` and the
+fusion silently did not fire (the emitted steps were byte-identical to before —
+a wall-clock null result, not a wrong answer). `Counter` resolves from
+`Vm::loop_counter`, exactly what `PushAcc` reads.
+
+Emitted only for a non-TDZ slot, so neither the read nor the write needs the
+uninitialized-binding check — the same discipline `LeafOp::BinStoreReg` follows.
+The logical assigns stay on the general path (they short-circuit and can skip the
+write). The JIT re-expands the step into the same `load_slot`/`emit_binary`/
+`store_slot` code, so a compiled body's machine code is unchanged.
+
+`sieve` (--jitless, interleaved min of 15): 194 -> 162 ms, **-16%**; callgrind
+3,071.7M -> 2,605.6M Ir (**-15.2%**). Against `bs`, `sieve` njit/bs 1.94 ->
+1.54. JIT mode is at parity (the compiled loop already inlined the RMW), and
+every other row is unchanged.
+
+Differential check (`jit` and `--jitless`, against the previous commit): `+=`
+with a literal / frame slot / global / the enclosing loop's counter, `-=`, `*=`,
+`>>=`, string concatenation through `+=`, and a BigInt `+=` from a slot all
+agree with the general path.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
+--workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
+23821/23821; corpus 79/79, jit == jitless == the previous commit.

@@ -221,6 +221,24 @@ pub enum Step {
     InitLocal {
         slot: usize,
     },
+    /// The statement-position compound update of a frame slot — `for
+    /// (...; ...; j += i)`, the general loop path's counterpart of
+    /// `FastLoopHead`'s `inc` for a counter the fast-loop gate rejects:
+    /// `frame[slot] = frame[slot] <op> rhs` in one dispatch instead of the
+    /// `LoadLocal`/`LoadLocal`/`Binary`/`Dup`/`StoreLocal`/`Pop` sequence,
+    /// which is over half of that loop's dispatches.
+    ///
+    /// The update's value is discarded by the loop protocol (the general path
+    /// pushed it for the following `Pop`), so nothing is pushed. Emitted only
+    /// for a non-TDZ slot, so neither the read nor the write needs the
+    /// uninitialized-binding check (`Lowering` fuses the same shape into
+    /// `LeafOp::BinStoreReg` under the same rule).
+    FusedCompoundLocal {
+        slot: usize,
+        op: BinaryOp,
+        /// The RHS: the shapes a certified loop's compound source takes.
+        rhs: CompoundRhs,
+    },
     /// Apply a `++`/`--` to a frame-slot binding: read the slot, compute the
     /// new value, store it, and push the result (old for postfix, new for
     /// prefix).
@@ -3761,6 +3779,19 @@ pub enum RelLimit {
     Imm(f64),
     Slot(usize),
     Global(crux::AtomId),
+}
+
+/// The source of a [`Step::FusedCompoundLocal`] loop update — the shapes a
+/// certified loop's `counter op= rhs` takes: a literal, a frame slot, a
+/// declared global, or the enclosing accumulator-path loop's counter (which
+/// lives in `Vm::loop_counter` and never in the frame, so a nested loop's
+/// `j += i` reads it from there).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompoundRhs {
+    Imm(f64),
+    Slot(usize),
+    Global(crux::AtomId),
+    Counter,
 }
 
 struct FastLoopShape {
@@ -11167,6 +11198,21 @@ impl Vm {
                     if !truthy(&value) {
                         self.ip = *target;
                     }
+                }
+                Step::FusedCompoundLocal { slot, op, rhs } => {
+                    // `frame[slot] = frame[slot] <op> rhs`, the shape the general
+                    // loop path emitted as six steps. The left operand is read
+                    // before the RHS, matching `LoadLocal` -> `LoadLocal` order
+                    // (both are pure, so only a global RHS could observe it).
+                    let left = *self.frame_get(*slot);
+                    let right = match rhs {
+                        CompoundRhs::Imm(imm) => Value::Number(*imm),
+                        CompoundRhs::Slot(rhs_slot) => *self.frame_get(*rhs_slot),
+                        CompoundRhs::Global(name) => self.load_global_value(agent, *name)?,
+                        CompoundRhs::Counter => Value::Number(self.loop_counter),
+                    };
+                    let value = Self::binary_inline(agent, *op, &left, &right)?;
+                    *self.frame_get_mut(*slot) = value;
                 }
                 Step::JumpIfLtImm { slot, imm, target } => {
                     self.jump_if_rel_imm(agent, BinaryOp::LessThan, *slot, *imm, *target)?
@@ -19158,6 +19204,67 @@ impl Compiler {
         });
     }
 
+    /// A `for` update that is a statement-position compound on a frame slot
+    /// (`j += i`, `j -= step`, ...): the shift/arithmetic assigns whose value
+    /// the loop protocol discards. Only a non-TDZ slot qualifies (the fused
+    /// step does no uninitialized-binding check, which is exactly the pair the
+    /// general path's `LoadLocal`/`StoreLocal` would have done for it), and the
+    /// RHS must be a pure re-readable source so the read order cannot matter.
+    /// The logical assigns stay on the general path: they short-circuit and can
+    /// skip the write.
+    fn fused_compound_update(&self, update: &Expr) -> Option<(usize, BinaryOp, CompoundRhs)> {
+        let ExprKind::Assign { op, target, value } = &update.kind else {
+            return None;
+        };
+        let binary = match op {
+            AssignOp::AddAssign
+            | AssignOp::SubAssign
+            | AssignOp::MulAssign
+            | AssignOp::DivAssign
+            | AssignOp::RemAssign
+            | AssignOp::ExpAssign
+            | AssignOp::LeftShiftAssign
+            | AssignOp::RightShiftAssign
+            | AssignOp::UnsignedRightShiftAssign
+            | AssignOp::BitAndAssign
+            | AssignOp::BitXorAssign
+            | AssignOp::BitOrAssign => crate::expr::compound_binary(*op),
+            AssignOp::Assign
+            | AssignOp::AndAssign
+            | AssignOp::OrAssign
+            | AssignOp::NullishAssign => {
+                return None;
+            }
+        };
+        let ExprKind::Ident(name) = &target.kind else {
+            return None;
+        };
+        let BindingLoc::Slot(slot) = self.binding(*name) else {
+            return None;
+        };
+        if self
+            .scope
+            .as_ref()
+            .is_none_or(|scope| scope.tdz_store.get(slot).copied().unwrap_or(false))
+        {
+            return None;
+        }
+        let rhs = match &value.kind {
+            ExprKind::Ident(rhs_name) => match self.binding(*rhs_name) {
+                BindingLoc::Slot(rhs_slot) => CompoundRhs::Slot(rhs_slot),
+                BindingLoc::Global => CompoundRhs::Global(*rhs_name),
+                // The enclosing accumulator-path loop's counter: exactly what
+                // `PushAcc` reads, so the fused step takes it from
+                // `Vm::loop_counter`.
+                BindingLoc::Acc => CompoundRhs::Counter,
+                _ => return None,
+            },
+            ExprKind::Literal(syntax::ast::Literal::Number(imm)) => CompoundRhs::Imm(*imm),
+            _ => return None,
+        };
+        Some((slot, binary, rhs))
+    }
+
     /// A `for` update that is a bare `i++`/`i--` on a fast binding (Cut 4):
     /// the loop protocol discards the update's value, so the fused `Inc`/
     /// `Dec` (store, no push) is exactly the update step + `Pop`. Only the
@@ -21936,6 +22043,8 @@ impl Compiler {
                     (BindingLoc::Env, _) => unreachable!("fused_update on the environment path"),
                 };
                 self.emit(step);
+            } else if let Some((slot, op, rhs)) = self.fused_compound_update(update) {
+                self.emit(Step::FusedCompoundLocal { slot, op, rhs });
             } else {
                 self.compile_expr(update)?;
                 self.emit(Step::Pop);
