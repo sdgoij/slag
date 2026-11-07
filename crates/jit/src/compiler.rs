@@ -6158,39 +6158,20 @@ impl<'a> Lowerer<'a> {
             .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
     }
 
-    /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_SMI` —
-    /// the inline-integer Number check (smi-aware, I8).
-    fn is_smi(&mut self, bits: ClifValue) -> ClifValue {
-        let masked = self.builder.ins().band_imm_u(bits, crux::SMI_MASK as i64);
+    /// The Number check (I8). Every Number is a double: the inline smi is
+    /// scaffolding for a future representation flip and nothing produces one,
+    /// so testing for it here would bake a dead select into every decode.
+    fn is_number(&mut self, bits: ClifValue) -> ClifValue {
+        self.is_double(bits)
+    }
+
+    /// Decode a Number-typed `bits` to its `f64` value. The caller must have
+    /// proven `is_number(bits)` first (a non-Number passes garbage, exactly as
+    /// the old bitcast-after-`is_double` did).
+    fn value_as_f64(&mut self, bits: ClifValue) -> ClifValue {
         self.builder
             .ins()
-            .icmp_imm_u(IntCC::Equal, masked, crux::SMI_PREFIX as i64)
-    }
-
-    /// `is_double(bits) || is_smi(bits)` — the Number check (I8).
-    fn is_number(&mut self, bits: ClifValue) -> ClifValue {
-        let double = self.is_double(bits);
-        let smi = self.is_smi(bits);
-        self.builder.ins().bor(double, smi)
-    }
-
-    /// Decode a Number-typed `bits` to its `f64` value: a smi is widened from
-    /// its low 32-bit i32, a double is a bitcast. The caller must have proven
-    /// `is_number(bits)` first (a non-Number passes garbage, exactly as the
-    /// old bitcast-after-`is_double` did).
-    fn value_as_f64(&mut self, bits: ClifValue) -> ClifValue {
-        let smi = self.is_smi(bits);
-        let payload = self
-            .builder
-            .ins()
-            .band_imm_u(bits, crux::PAYLOAD_MASK as i64);
-        let i32 = self.builder.ins().ireduce(types::I32, payload);
-        let smi_f64 = self.builder.ins().fcvt_from_sint(types::F64, i32);
-        let dbl_f64 = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlagsData::new(), bits);
-        self.builder.ins().select(smi, smi_f64, dbl_f64)
+            .bitcast(types::F64, MemFlagsData::new(), bits)
     }
 
     /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING`

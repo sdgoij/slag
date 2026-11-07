@@ -157,19 +157,11 @@ impl Value {
         Value(TAG_PREFIX | (tag << 44), std::marker::PhantomData)
     }
 
+    /// Always a double. [`Value::smi`], `as_smi` and the JIT's `is_smi` are
+    /// scaffolding for a future representation flip; boxing whole numbers here
+    /// measured ~25% slower on an integer loop, so nothing produces an smi.
     #[inline]
     pub fn Number(n: f64) -> Value {
-        // Small whole numbers box as an inline smi so integer arithmetic skips
-        // the f64 round-trip. `-0.0` must stay a double (`1 / -0.0` is
-        // -Infinity and `Object.is(-0, 0)` distinguishes them), so only a
-        // non-negative-zero whole value in i32 range is a smi.
-        if n.fract() == 0.0
-            && n >= i32::MIN as f64
-            && n <= i32::MAX as f64
-            && n.to_bits() != (-0.0f64).to_bits()
-        {
-            return Value::smi(n as i32);
-        }
         let bits = n.to_bits();
         // Colliding quiet NaNs (top 16 bits 0x7FF8) would read as a tag.
         let bits = if bits & TAG_MASK == TAG_PREFIX {
@@ -787,13 +779,20 @@ mod tests {
         ] {
             assert_eq!(Value::from_bits(v.bits()).bits(), v.bits());
         }
-        // `bits_are_double` distinguishes a double from every tag, including
-        // the inline smi; `is_number` covers both.
-        assert!(!Value::bits_are_double(Value::Number(1.0).bits()));
-        assert!(Value::Number(1.0).is_smi());
-        assert_eq!(Value::Number(1.0).as_smi(), Some(1));
+        // `Value::Number` boxes a double even for a whole number, so the smi
+        // encoding is only reachable through `Value::smi`.
+        assert!(Value::bits_are_double(Value::Number(1.0).bits()));
+        assert!(!Value::Number(1.0).is_smi());
+        assert_eq!(Value::Number(1.0).as_smi(), None);
+        assert_eq!(Value::Number(1.0).as_number(), Some(1.0));
         assert!(Value::bits_are_double(Value::Number(3.5).bits()));
         assert!(Value::bits_are_double(Value::Number(-0.0).bits()));
+        let smi = Value::smi(-7);
+        assert!(smi.is_smi());
+        assert_eq!(smi.as_smi(), Some(-7));
+        assert_eq!(smi.as_number(), Some(-7.0));
+        assert!(!Value::bits_are_double(smi.bits()));
+        assert_eq!(Value::from_bits(smi.bits()).bits(), smi.bits());
         assert!(!Value::bits_are_double(Value::Undefined.bits()));
         assert!(!Value::bits_are_double(Value::Boolean(true).bits()));
         assert!(!Value::bits_are_double(Value::uninitialized().bits()));

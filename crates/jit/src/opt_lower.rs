@@ -5727,30 +5727,16 @@ fn is_double(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
         .icmp_imm_u(IntCC::NotEqual, masked, crux::TAG_PREFIX as i64)
 }
 
-/// `TAG_PREFIX` and tag `TAG_SMI` — the inline-integer Number check.
-fn is_smi(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
-    let masked = builder.ins().band_imm_u(bits, crux::SMI_MASK as i64);
-    builder
-        .ins()
-        .icmp_imm_u(IntCC::Equal, masked, crux::SMI_PREFIX as i64)
-}
-
-/// `is_double || is_smi` — the Number check.
+/// The Number check: every Number is a double (see `crux::Value::Number`),
+/// and testing for the inert inline smi would add a dead select per decode.
 fn is_number(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
-    let double = is_double(builder, bits);
-    let smi = is_smi(builder, bits);
-    builder.ins().bor(double, smi)
+    is_double(builder, bits)
 }
 
-/// Decode a Number-typed `bits` to its f64 value: a smi widens from its low
-/// i32, a double is a bitcast. The caller must have proven `is_number`.
+/// Decode a Number-typed `bits` to its f64 value. The caller must have proven
+/// `is_number`.
 fn value_as_f64(builder: &mut FunctionBuilder, bits: ClifValue) -> ClifValue {
-    let smi = is_smi(builder, bits);
-    let payload = builder.ins().band_imm_u(bits, crux::PAYLOAD_MASK as i64);
-    let i32v = builder.ins().ireduce(types::I32, payload);
-    let smi_f64 = builder.ins().fcvt_from_sint(types::F64, i32v);
-    let dbl_f64 = builder.ins().bitcast(types::F64, MemFlagsData::new(), bits);
-    builder.ins().select(smi, smi_f64, dbl_f64)
+    builder.ins().bitcast(types::F64, MemFlagsData::new(), bits)
 }
 
 /// Canonicalize a computed double's bits: a NaN whose top bits collide with the
