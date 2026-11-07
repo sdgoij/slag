@@ -18022,3 +18022,30 @@ discovered again.
 Prerequisites already landed on this line: 35d70f32's integer spelling
 (JsString::concat_units, concat_units_left) is the B8A9A8B6 commit immediately
 before this entry.
+
+## LANDED (2026-11-07): split boxes each piece once, into the result array
+
+The split path collected pieces into a Vec<JsString> and let array_from_list
+clone each one to box it: three copies per piece plus a Vec growth and a second
+pass. The pieces are now boxed once and defined into the result array as the scan
+produces them; the array is a stack local, so it roots the boxes exactly as the
+old comment required. Ported from fool f4a1e8ca (no drift: string.rs was
+byte-identical to the commit's parent).
+
+| probe | before | after |
+| --- | ---: | ---: |
+| 200k each of 2/4/8/16 pieces plus split+join, min of 3 interleaved | 3900 ns | **3255** |
+| strings/split_join, isolated | 60.51 ms | **53.06** |
+| strings/split_join, both sides aligned | 61.30 | **53.64** |
+
+Second layout artifact of the session, and the classifier caught this one too:
+coercion_concat read +5.2% isolated (48.98 -> 51.52) although the change is
+confined to split(). Rebuilt both sides with -align-all-functions=5 and it went
+flat (48.46/48.74 vs 48.14/49.77). Do not attribute a row delta to a change that
+cannot reach it: run the aligned pair first.
+
+Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
+String/prototype/split + Symbol.split + RegExp/Symbol.split + Array 3204/3204; a
+17-case split battery byte-identical to node 24.12 (limits 0/2/-1/1.9, empty
+receiver, undefined/null/NaN separator, regexp captures with and without a limit,
+leading/trailing separators, dense result conjoined back).
