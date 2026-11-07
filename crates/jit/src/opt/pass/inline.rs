@@ -17,7 +17,7 @@ use std::rc::Rc;
 use crate::opt::ir::{BlockId, Effects, Function, Imm, Inst, Op, Term, Type, ValueId};
 
 /// A monomorphic call site's inline target: the callee's function id (the
-/// resolver's key) and its box (the `Op::GuardCallee` constant).
+/// resolver's key) and its box (the `Op::CalleeEq` constant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlineSite {
     pub callee_id: u64,
@@ -94,7 +94,7 @@ pub fn run(
         // The budget is per top-level site; the recursion shares it, so a
         // self-recursive callee stops expanding and leaves a real call.
         let mut budget = inline_budget();
-        if try_inline(func, b, sites, resolve, &mut budget, None) {
+        if try_inline(func, b, sites, resolve, &mut budget) {
             changed = true;
         }
     }
@@ -112,29 +112,35 @@ fn try_inline(
     sites: &[Option<InlineSite>],
     resolve: &mut dyn FnMut(u64) -> Option<Callee>,
     budget: &mut usize,
-    root: Option<(&[ValueId], i32)>,
 ) -> bool {
-    let (args, result, ty, step, site) = {
-        let Some(last) = func.block(b).insts.last() else {
-            return false;
-        };
-        if last.op != Op::Call {
-            return false;
+    // The splice is not restricted to a call that ends its block: a call whose
+    // result feeds a later operation (`s += f(x)`) is the common shape, and the
+    // remaining instructions move to the continuation below. The last call with
+    // a refused site is tried first, so a block with several calls splices the
+    // one nearest its terminator and leaves the rest alone.
+    let (at, args, result, ty, step, site) = {
+        let insts = &func.block(b).insts;
+        let mut found = None;
+        for (at, inst) in insts.iter().enumerate().rev() {
+            if inst.op != Op::Call {
+                continue;
+            }
+            let Imm::Int(step) = inst.imm else {
+                continue;
+            };
+            let Some(&Some(site)) = sites.get(step as usize) else {
+                continue;
+            };
+            let Some(result) = inst.result else {
+                continue;
+            };
+            found = Some((at, inst.args.clone(), result, inst.ty, step, site));
+            break;
         }
-        let Imm::Int(step) = last.imm else {
+        let Some(found) = found else {
             return false;
         };
-        let Some(&Some(site)) = sites.get(step as usize) else {
-            return false;
-        };
-        let Some(result) = last.result else {
-            return false;
-        };
-        (last.args.clone(), result, last.ty, step, site)
-    };
-    let (root_args, root_step): (&[ValueId], i32) = match root {
-        Some((a, s)) => (a, s),
-        None => (&args, step),
+        found
     };
     let Some(callee) = resolve(site.callee_id) else {
         return false;
@@ -148,11 +154,19 @@ fn try_inline(
 
     // The call's result is now produced by the continuation, which every
     // successor of `b` passes through (its only edge is `b -> callee -> cont`).
-    func.block_mut(b).insts.pop();
+    // The instructions after the call move to the continuation: they read values
+    // defined in `b` before the call, so `b` still dominates them.
+    let tail = {
+        let insts = &mut func.block_mut(b).insts;
+        let tail = insts.split_off(at + 1);
+        insts.pop();
+        tail
+    };
     let old_term = func.block_mut(b).term.take();
     let cont = func.push_block();
     let param = func.push_value(ty);
     func.block_mut(cont).params.push(param);
+    func.block_mut(cont).insts = tail;
     func.block_mut(cont).term = old_term;
 
     // Clone the callee's blocks with fresh ids, binding its input slots to the
@@ -237,10 +251,13 @@ fn try_inline(
         func.block_mut(dst).term = Some(term);
     }
 
-    // Guard the assumed callee, then enter it. The guard's live operand stack is
-    // the **outer** call's operands and its resume step the outer call's, so a
-    // deopt re-runs the outer call and discards the region (identical to the
-    // local call at the top level, and the only sound target inside a splice).
+    // Enter the callee when the callee is the one the site was compiled for, and
+    // take the ordinary call otherwise. A deopt is *not* sound here: it would
+    // resume the interpreter at this call step, whose operand stack also holds
+    // every value the enclosing expression evaluated before the call (`fib(n-1)`
+    // in `fib(n-1) + fib(n-2)`), and the splice has no way to mirror that state.
+    // A fallback call keeps the region deopt-free as well, so the spliced body
+    // stays eligible for the certified-callee lane.
     let expected = func.push_value(Type::Object);
     func.block_mut(b).insts.push(Inst {
         op: Op::Const,
@@ -250,35 +267,42 @@ fn try_inline(
         effects: Effects::pure(),
         imm: Imm::U64(site.callee_box),
     });
-    let guarded = func.push_value(Type::Object);
-    let mut guard_args = vec![args[1], expected];
-    guard_args.extend_from_slice(root_args);
+    let ok = func.push_value(Type::Bool);
     func.block_mut(b).insts.push(Inst {
-        op: Op::GuardCallee,
-        args: guard_args,
-        result: Some(guarded),
-        ty: Type::Object,
+        op: Op::CalleeEq,
+        args: vec![args[1], expected],
+        result: Some(ok),
+        ty: Type::Bool,
         effects: Effects::pure(),
-        imm: Imm::Int(root_step),
+        imm: Imm::None,
     });
-    func.block_mut(b).term = Some(Term::Jump {
-        target: block_map[0],
-        args: Vec::new(),
+    let fallback = func.push_block();
+    let called = func.push_value(ty);
+    func.block_mut(fallback).insts.push(Inst {
+        op: Op::Call,
+        args: args.clone(),
+        result: Some(called),
+        ty,
+        effects: Effects::call(),
+        imm: Imm::Int(step),
+    });
+    func.block_mut(fallback).term = Some(Term::Jump {
+        target: cont,
+        args: vec![called],
+    });
+    func.block_mut(b).term = Some(Term::Branch {
+        cond: ok,
+        then_block: block_map[0],
+        then_args: Vec::new(),
+        else_block: fallback,
+        else_args: Vec::new(),
     });
 
     replace_uses(func, result, param);
 
-    // I5c-2c-iv: recurse into the callee's own calls, under the shared budget and
-    // the same root guard (a nested deopt still resumes the outermost call).
+    // I5c-2c-iv: recurse into the callee's own calls, under the shared budget.
     for &dst in &block_map {
-        try_inline(
-            func,
-            dst,
-            callee.sites.as_slice(),
-            resolve,
-            budget,
-            Some((root_args, root_step)),
-        );
+        try_inline(func, dst, callee.sites.as_slice(), resolve, budget);
     }
     true
 }
@@ -480,6 +504,12 @@ mod tests {
             .collect()
     }
 
+    /// The number of `Op::Call`s left in the IR: every splice leaves exactly one
+    /// (the mismatch fallback), so a fully spliced site still contains a call.
+    fn call_count(func: &Function) -> usize {
+        ops(func).iter().filter(|o| **o == Op::Call).count()
+    }
+
     fn site() -> Vec<Option<InlineSite>> {
         vec![Some(InlineSite {
             callee_id: 7,
@@ -494,12 +524,9 @@ mod tests {
         let mut func = caller_ir();
         let mut resolve = |id: u64| (id == 7).then(param_callee);
         assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
-        assert!(!ops(&func).contains(&Op::Call), "the call is gone");
+        assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert!(!ops(&func).contains(&Op::FrameLoad), "the param is bound");
-        assert!(
-            ops(&func).contains(&Op::GuardCallee),
-            "the callee is guarded"
-        );
+        assert!(ops(&func).contains(&Op::CalleeEq), "the callee is compared");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
         // The bound value flows: the callee's `Add` now reads the caller's
         // argument (`Const(Float(10.0))`).
@@ -527,8 +554,97 @@ mod tests {
         let mut func = caller_ir();
         let mut resolve = |id: u64| (id == 7).then(constant_callee);
         assert!(run(&mut func, &site(), &mut resolve));
-        assert!(!ops(&func).contains(&Op::Call));
+        assert_eq!(call_count(&func), 1);
         assert_eq!(verify(&func), Ok(()));
+    }
+
+    /// `r = call(this, callee, a1); return r + 1` — the call is not its
+    /// block's terminator.
+    fn caller_ir_mid_block() -> Function {
+        let mut f = Function::new();
+        let e = f.entry();
+        let mut b = Builder::new(&mut f);
+        let this = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Object,
+            Effects::pure(),
+            Imm::U64(0x1111),
+        );
+        let callee = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Object,
+            Effects::pure(),
+            Imm::U64(0xabc),
+        );
+        let a1 = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Number,
+            Effects::pure(),
+            Imm::Float(10.0),
+        );
+        let r = b.emit(
+            e,
+            Op::Call,
+            &[this, callee, a1],
+            Type::Unknown,
+            Effects::call(),
+            Imm::Int(0),
+        );
+        let one = b.emit(
+            e,
+            Op::Const,
+            &[],
+            Type::Number,
+            Effects::pure(),
+            Imm::Float(1.0),
+        );
+        let sum = b.emit(
+            e,
+            Op::Add,
+            &[r, one],
+            Type::Number,
+            Effects::call(),
+            Imm::None,
+        );
+        b.term(e, Term::Return(Some(sum)));
+        f
+    }
+
+    #[test]
+    fn splices_a_call_that_is_not_its_blocks_terminator() {
+        // `r = call(...); return r + 1`: the instruction after the call moves
+        // to the continuation and its operand becomes the continuation's
+        // parameter.
+        let mut func = caller_ir_mid_block();
+        let mut resolve = |id: u64| (id == 7).then(param_callee);
+        assert!(run(&mut func, &site(), &mut resolve), "the site inlined");
+        assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
+        assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
+        let cont = (0..func.block_count() as u32)
+            .find(|&b| {
+                func.block(b)
+                    .insts
+                    .iter()
+                    .any(|i| i.op == Op::Add && i.args.len() == 2)
+            })
+            .expect("the add moved to a block");
+        let add = func
+            .block(cont)
+            .insts
+            .iter()
+            .find(|i| i.op == Op::Add && i.args.len() == 2)
+            .expect("the add");
+        assert_eq!(
+            add.args[0],
+            func.block(cont).params[0],
+            "the call's result is the continuation's parameter"
+        );
     }
 
     #[test]
@@ -634,7 +750,7 @@ mod tests {
         let mut func = caller_ir();
         let mut resolve = |_id: u64| Some(callee.clone());
         assert!(run(&mut func, &site(), &mut resolve), "the callee spliced");
-        assert!(!ops(&func).contains(&Op::Call), "the call is gone");
+        assert_eq!(call_count(&func), 1, "only the mismatch fallback remains");
         assert_eq!(verify(&func), Ok(()), "the spliced IR verifies");
     }
 
@@ -699,11 +815,15 @@ mod tests {
             _ => None,
         };
         assert!(run(&mut func, &site(), &mut resolve));
-        assert!(!ops(&func).contains(&Op::Call), "both calls inlined");
         assert_eq!(
-            ops(&func).iter().filter(|o| **o == Op::GuardCallee).count(),
+            call_count(&func),
             2,
-            "one guard per splice level"
+            "one fallback per spliced level, and nothing else"
+        );
+        assert_eq!(
+            ops(&func).iter().filter(|o| **o == Op::CalleeEq).count(),
+            2,
+            "one compare per splice level"
         );
         assert_eq!(verify(&func), Ok(()));
     }
