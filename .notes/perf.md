@@ -18152,3 +18152,33 @@ method. The port matches Object and Function and takes each box's own edge.
 Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
 object-method + class + super + using 5711/5711 under --gc-stress AND 5711/5711
 under --gc-verify.
+
+## LANDED (2026-11-07): object-literal methods, getters and setters certify
+
+An object-literal method/getter/setter is a closure, but scope certification
+treated it as an unconditional bail, so any body containing { m() {} } dropped to
+the environment-machinery path. The closure body now walks through
+closure_allows (which still rejects super/eval/with inside it) and its computed
+key through property_name. The capture prepass ignored a computed method key
+while the main scan walked it, so a closure inside that key could have been laid
+out as a frame slot it cannot reach; key_captures now serves the Init/Method/Get/
+Set keys in both walkers so their capture sets agree. A using/await-using head
+keeps the bail (spec 15.14.2 registers a disposable and binds immutably).
+Ported from fool 12543d85.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| 1M calls of a function whose body builds { m() { return i; } } | 8.83 s | **1.76 s** |
+
+The fourth instance of family-run contamination in this session, and the clearest:
+opcost read array_fill +11.5%, array_length_write +14.8%, map_for_each +12.3%
+and builtins/math_intrinsics +5.3% in the family runs. Isolated, one file per
+process, two rounds each: 7.496 vs 7.588, 5.888 vs 5.901, 28.012 vs 27.952,
+10.199 vs 10.172 - flat. Family rows share a process and their heap state follows
+the rows before them, so a family delta outside the touched row is a hypothesis,
+not a measurement. Improvements in the family runs (arrays/push_pop -3.1%,
+slice_concat -4.3%, opcost/json_stringify -5.7%, strings/search_slice -5.3%) are
+'not evidence either, in either direction.
+
+Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
+language 23726/23726.
