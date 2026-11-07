@@ -42,7 +42,8 @@ use crux::value::{Value, ValueKind};
 use slag::api::{Local as EngineLocal, Traced};
 use slag::{
     CallbackWindow, CompiledScript, Context, ErrorKind, FunctionCall, HostFn, JsError, JsModule,
-    JsValue, OwnProperty, PauseReason, PromiseHandles, PromiseState, StepMode,
+    JsValue, ModuleNamespacePhase, OwnProperty, PauseReason, PromiseHandles, PromiseState,
+    StepMode,
 };
 
 /// The isolate a host enters. The engine's contexts are the state; this token
@@ -1738,11 +1739,14 @@ pub unsafe extern "C" fn slag_wasm_module_free(compiled: *mut SlagWasmModule) {
     }
 }
 
-/// The module's namespace object (`Module::GetModuleNamespace`).
+/// The module's namespace object (`Module::GetModuleNamespace`), in the phase
+/// named by a `SlagImportPhase`: 0 is the evaluation namespace, 2 the deferred
+/// one. V8 accepts no other phase, so 1 (source) and anything else is refused.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_module_namespace(
     context: *mut SlagContext,
     module: *const SlagModule,
+    phase: i32,
     out: *mut u64,
 ) -> i32 {
     let Some(context) = context.as_mut() else {
@@ -1751,12 +1755,17 @@ pub unsafe extern "C" fn slag_module_namespace(
     let Some(module) = module.as_ref() else {
         return 2;
     };
+    let phase = match phase {
+        0 => ModuleNamespacePhase::Evaluation,
+        2 => ModuleNamespacePhase::Defer,
+        _ => return 2,
+    };
     let namespace = {
         let Ok(mut engine) = context.context.try_borrow_mut() else {
             reentrant(context);
             return 1;
         };
-        engine.module_namespace(&module.module)
+        engine.module_namespace(&module.module, phase)
     };
     match namespace {
         Ok(value) => {

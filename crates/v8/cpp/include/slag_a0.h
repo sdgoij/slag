@@ -666,8 +666,11 @@ int32_t slag_module_register_source(SlagContext* context, const SlagModule* modu
 int32_t slag_module_instantiate(SlagContext* context, const SlagModule* module);
 int32_t slag_module_evaluate(SlagContext* context, const SlagModule* module,
                              uint64_t* out);
+/* The namespace `v8::Module::GetModuleNamespace` asks for: a `SlagImportPhase`
+ * where only `SLAG_IMPORT_PHASE_EVALUATION` and `SLAG_IMPORT_PHASE_DEFER` are
+ * accepted, because V8 accepts only those two. */
 int32_t slag_module_namespace(SlagContext* context, const SlagModule* module,
-                              uint64_t* out);
+                              int32_t phase, uint64_t* out);
 
 /* WebAssembly module objects and their decoded modules (`v8::WasmModuleObject`
  * and `v8::CompiledWasmModule`). */

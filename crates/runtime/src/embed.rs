@@ -991,6 +991,15 @@ fn resolve_fs_write(root: Option<&Path>, path: &str) -> Result<PathBuf, JsError>
     Ok(parent.join(name))
 }
 
+/// Which namespace `v8::Module::GetModuleNamespace` asks for
+/// (`v8::ModuleImportPhase`). V8 accepts only these two; the source phase
+/// answers a Module Source object, which is not a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleNamespacePhase {
+    Evaluation,
+    Defer,
+}
+
 pub struct Context {
     /// Boxed so the agent's address is stable. The GC registers a live agent
     /// by its address (see `Agent::initialize_host_defined_realm`), and this
@@ -2244,9 +2253,25 @@ impl Context {
         Ok(JsValue(value))
     }
 
-    /// The module's namespace object (spec 16.2.1.10).
-    pub fn module_namespace(&mut self, module: &JsModule) -> Result<JsValue, JsError> {
-        crate::module::module_namespace(&mut self.agent, &module.module).map(JsValue)
+    /// Which namespace `v8::Module::GetModuleNamespace` asks for, in the phase
+    /// the host named: the ordinary namespace, or the deferred one
+    /// (import-defer). V8 accepts only those two, so a source-phase answer is not
+    /// a namespace at all; it is the Module Source object a request's source
+    /// callback supplies.
+    pub fn module_namespace(
+        &mut self,
+        module: &JsModule,
+        phase: ModuleNamespacePhase,
+    ) -> Result<JsValue, JsError> {
+        let value = match phase {
+            ModuleNamespacePhase::Evaluation => {
+                crate::module::module_namespace(&mut self.agent, &module.module)?
+            }
+            ModuleNamespacePhase::Defer => {
+                crate::module::deferred_namespace(&mut self.agent, &module.module)?
+            }
+        };
+        Ok(JsValue(value))
     }
 
     /// Compile `wire_bytes` into a `WebAssembly.Module` object
@@ -4694,7 +4719,9 @@ mod tests {
         assert!(context.value_type_mask(&promise) & VALUE_PROMISE != 0);
         assert_eq!(main.status(), crate::api::ModuleStatus::Evaluated);
 
-        let namespace = context.module_namespace(&main).unwrap();
+        let namespace = context
+            .module_namespace(&main, ModuleNamespacePhase::Evaluation)
+            .unwrap();
         context.set_global("ns", namespace).unwrap();
         assert_eq!(context.eval("ns.doubled").unwrap().as_number(), Some(84.0));
         assert!(main.identity_hash() != 0);

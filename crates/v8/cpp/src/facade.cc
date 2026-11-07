@@ -2848,10 +2848,19 @@ Local<Value> Module::GetException() const {
   return Local<Value>::New(out);
 }
 
-Local<Value> Module::GetModuleNamespace() {
+Local<Value> Module::GetModuleNamespace(ModuleImportPhase phase) {
+  /* V8 accepts only the evaluation and defer phases here — its
+   * `SourceTextModule::GetModuleNamespace` DCHECKs the rest — so a source-phase
+   * request is refused rather than silently answered with the deferred
+   * namespace. */
+  if (phase == ModuleImportPhase::kSource) return Local<Value>();
   SlagContext* slag = CurrentSlagContext();
   uint64_t out = 0;
-  if (slag == nullptr || slag_module_namespace(slag, ModuleOf(this), &out) != 0) {
+  const int32_t wire_phase = phase == ModuleImportPhase::kDefer
+                                 ? SLAG_IMPORT_PHASE_DEFER
+                                 : SLAG_IMPORT_PHASE_EVALUATION;
+  if (slag == nullptr ||
+      slag_module_namespace(slag, ModuleOf(this), wire_phase, &out) != 0) {
     return Local<Value>();
   }
   return Local<Value>::New(out);
@@ -2941,16 +2950,18 @@ Maybe<bool> Module::IsSyntheticModule() const {
   return Maybe<bool>(slag_module_is_synthetic(ModuleOf(this)) != 0);
 }
 
-Maybe<bool> Module::InstantiateModule(Local<Context> context,
-                                      ResolveModuleCallback callback,
-                                      ResolveSourceCallback source_callback) {
-  if (context.IsEmpty() || callback == nullptr) return Maybe<bool>();
-  auto* current = reinterpret_cast<Context*>(
-      static_cast<uintptr_t>(context.raw()));
+namespace {
+
+/* The graph walk both `InstantiateModule` overloads share. `resolve` and
+ * `resolve_source` take (request index, specifier, attributes, referrer) so
+ * the specifier-keyed and index-keyed V8 callbacks both fit. */
+template <class Resolve, class ResolveSource>
+Maybe<bool> LinkModuleGraph(Context* current, Module* self, Local<Context> context,
+                            Resolve resolve, ResolveSource resolve_source) {
   // The engine links from its own registry, so every module in the graph has
   // to be reached: the resolver is asked for each request, including the ones
   // a resolved dependency declares.
-  std::vector<Module*> work{this};
+  std::vector<Module*> work{self};
   for (size_t i = 0; i < work.size(); ++i) {
     Module* module = work[i];
     Local<FixedArray> requests = module->GetModuleRequests();
@@ -2963,7 +2974,7 @@ Maybe<bool> Module::InstantiateModule(Local<Context> context,
       Local<Module> referrer = ModuleHandle(ModuleOf(module));
 
       Local<Module> resolved;
-      if (!callback(context, specifier, import_attributes, referrer)
+      if (!resolve(request, specifier, import_attributes, referrer)
                .ToLocal(&resolved)) {
         return Maybe<bool>();
       }
@@ -2971,32 +2982,74 @@ Maybe<bool> Module::InstantiateModule(Local<Context> context,
       auto* dependency = reinterpret_cast<Module*>(
           static_cast<uintptr_t>(resolved.raw()));
 
-      /* A source-phase import binds a Module Source Object, and V8 asks only the
-       * source callback for one. This linker resolves every request from a
-       * module record, so the module callback ran above and its record is what
-       * the host's source is attached to. */
-      if (source_callback != nullptr &&
-          entry->GetPhase() == ModuleImportPhase::kSource) {
+      /* A source-phase import binds a Module Source Object. V8 asks only the
+       * source callback for one (`SourceTextModule::PrepareInstantiate`); this
+       * linker resolves every request from a module record, so the module
+       * callback ran above and its record is what the host's source is attached
+       * to. */
+      if (entry->GetPhase() == ModuleImportPhase::kSource) {
         Local<Object> source;
-        if (!source_callback(context, specifier, import_attributes, referrer)
+        if (!resolve_source(request, specifier, import_attributes, referrer)
                  .ToLocal(&source)) {
           return Maybe<bool>();
         }
         if (source.IsEmpty()) return Maybe<bool>();
         if (slag_module_register_source(current->slag(), ModuleOf(dependency),
                                         source.raw()) != 0) {
-          return Maybe<bool>(false);
+          return Maybe<bool>();
         }
       }
 
       if (slag_module_register(current->slag(), ModuleOf(dependency),
                                specifier.raw()) != 0) {
-        return Maybe<bool>(false);
+        return Maybe<bool>();
       }
       work.push_back(dependency);
     }
   }
-  return Maybe<bool>(slag_module_instantiate(current->slag(), ModuleOf(this)) == 0);
+  /* V8 reports a failed link as an empty `Maybe`, never as `Just(false)`. */
+  if (slag_module_instantiate(current->slag(), ModuleOf(self)) != 0) {
+    return Maybe<bool>();
+  }
+  return Just(true);
+}
+
+}  // namespace
+
+Maybe<bool> Module::InstantiateModule(Local<Context> context,
+                                      ResolveModuleCallback callback,
+                                      ResolveSourceCallback source_callback) {
+  if (context.IsEmpty() || callback == nullptr) return Maybe<bool>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  return LinkModuleGraph(
+      current, this, context,
+      [&](int, Local<String> specifier, Local<FixedArray> import_attributes,
+          Local<Module> referrer) {
+        return callback(context, specifier, import_attributes, referrer);
+      },
+      [&](int, Local<String> specifier, Local<FixedArray> import_attributes,
+          Local<Module> referrer) {
+        if (source_callback == nullptr) return MaybeLocal<Object>();
+        return source_callback(context, specifier, import_attributes, referrer);
+      });
+}
+
+Maybe<bool> Module::InstantiateModule(Local<Context> context,
+                                      ResolveModuleByIndexCallback callback,
+                                      ResolveSourceByIndexCallback source_callback) {
+  if (context.IsEmpty() || callback == nullptr) return Maybe<bool>();
+  auto* current = reinterpret_cast<Context*>(
+      static_cast<uintptr_t>(context.raw()));
+  return LinkModuleGraph(
+      current, this, context,
+      [&](int request, Local<String>, Local<FixedArray>, Local<Module> referrer) {
+        return callback(context, static_cast<size_t>(request), referrer);
+      },
+      [&](int request, Local<String>, Local<FixedArray>, Local<Module> referrer) {
+        if (source_callback == nullptr) return MaybeLocal<Object>();
+        return source_callback(context, static_cast<size_t>(request), referrer);
+      });
 }
 
 MaybeLocal<Value> Module::Evaluate(Local<Context> context) {

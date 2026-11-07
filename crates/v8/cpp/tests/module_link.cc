@@ -33,6 +33,7 @@ const SuppressDialogBoxes kSuppressDialogBoxes;
 }  // namespace
 #endif
 
+#include "include/v8-callbacks.h"
 #include "include/v8-context.h"
 #include "include/v8-data.h"
 #include "include/v8-initialization.h"
@@ -63,6 +64,8 @@ struct LinkState {
   int source_calls = 0;
   int dep_attribute_length = -1;
   std::string dep_type;
+  int by_index_calls = 0;
+  bool by_index_referrer_present = false;
 };
 
 LinkState g_link;
@@ -111,6 +114,16 @@ v8::MaybeLocal<v8::Object> ResolveSource(v8::Local<v8::Context>,
   if (TextOf(specifier) != "src.js") return v8::MaybeLocal<v8::Object>();
   ++g_link.source_calls;
   return v8::MaybeLocal<v8::Object>(g_link.source.Get(v8::g_current_isolate));
+}
+
+// The by-index answer: V8's second `InstantiateModule` overload names the
+// request by its position in the referrer's `GetModuleRequests()` array.
+v8::MaybeLocal<v8::Module> ResolveByIndex(v8::Local<v8::Context>, size_t index,
+                                          v8::Local<v8::Module> referrer) {
+  ++g_link.by_index_calls;
+  g_link.by_index_referrer_present = !referrer.IsEmpty();
+  if (index != 0) return v8::MaybeLocal<v8::Module>();
+  return v8::MaybeLocal<v8::Module>(g_link.dep.Get(v8::g_current_isolate));
 }
 
 bool Compile(v8::Isolate* isolate, const char* name, const char* text,
@@ -205,7 +218,9 @@ int main() {
           "the unsourced import compiled");
     {
       v8::TryCatch caught(isolate);
-      Check(!unsourced->InstantiateModule(context, &Resolve).FromMaybe(true),
+      // V8 reports a failed link as an empty `Maybe`, so the failure test is
+      // `FromMaybe(false)`, not `!FromMaybe(true)`.
+      Check(!unsourced->InstantiateModule(context, &Resolve).FromMaybe(false),
             "a source-phase import without a source callback fails to link");
     }
 
@@ -227,6 +242,35 @@ int main() {
           "the resolver saw three words for one attribute");
     Check(g_link.dep_type == "js",
           "the resolver saw the attribute's value");
+
+    // The by-index resolver. The graph has one request, so index 0 is what the
+    // callback must name; the referrer is the importing module.
+    g_link.by_index_calls = 0;
+    g_link.by_index_referrer_present = false;
+    v8::Local<v8::Module> indexed;
+    Check(Compile(isolate, "indexed.js",
+                  "import \"dep.js\";\nexport const one = 1;",
+                  &indexed),
+          "the indexed graph compiled");
+    Check(indexed->GetModuleRequests()->Length() == 1,
+          "the indexed graph has one request");
+    Check(indexed->InstantiateModule(context, &ResolveByIndex)
+              .FromMaybe(false),
+          "the indexed graph linked");
+    Check(g_link.by_index_calls == 1 && g_link.by_index_referrer_present,
+          "the by-index callback got request 0 and a referrer");
+
+    // `GetModuleNamespace`'s phase. The deferred namespace is a different
+    // object from the evaluation one, and V8 accepts no source phase here.
+    v8::Local<v8::Value> evaluation_namespace = indexed->GetModuleNamespace();
+    v8::Local<v8::Value> deferred_namespace =
+        indexed->GetModuleNamespace(v8::ModuleImportPhase::kDefer);
+    Check(!evaluation_namespace.IsEmpty() && !deferred_namespace.IsEmpty(),
+          "an instantiated module answers both namespaces");
+    Check(evaluation_namespace.raw() != deferred_namespace.raw(),
+          "the deferred namespace is not the evaluation one");
+    Check(indexed->GetModuleNamespace(v8::ModuleImportPhase::kSource).IsEmpty(),
+          "a source-phase namespace is refused, as V8 does");
   }
 
   v8::V8::Dispose();

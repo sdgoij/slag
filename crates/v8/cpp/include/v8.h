@@ -1417,13 +1417,25 @@ using ResolveSourceCallback = MaybeLocal<Object> (*)(Local<Context> context,
                                                      Local<FixedArray> import_attributes,
                                                      Local<Module> referrer);
 
+/* The same two answers, keyed by the request's index in the referrer's
+ * `GetModuleRequests()` array (`v8::Module::ResolveModuleByIndexCallback`). */
+using ResolveModuleByIndexCallback = MaybeLocal<Module> (*)(Local<Context> context,
+                                                            size_t module_request_index,
+                                                            Local<Module> referrer);
+using ResolveSourceByIndexCallback = MaybeLocal<Object> (*)(Local<Context> context,
+                                                            size_t module_request_index,
+                                                            Local<Module> referrer);
+
 /* A module record (`v8::Module`). The facade object is a handle over the
  * engine's pinned record; modules are never freed, like scripts and templates. */
 class Module : public Data {
  public:
   ModuleStatus GetStatus() const;
   Local<Value> GetException() const;
-  Local<Value> GetModuleNamespace();
+  /* The module's namespace (`Module::GetModuleNamespace`). V8 accepts only the
+   * evaluation and defer phases here; the source phase is a Module Source
+   * object, which a request's source callback answers. */
+  Local<Value> GetModuleNamespace(ModuleImportPhase phase = ModuleImportPhase::kEvaluation);
   int GetModuleRequestsLength() const;
   Local<String> GetModuleRequest(int index) const;
   Local<FixedArray> GetModuleRequests() const;
@@ -1434,10 +1446,17 @@ class Module : public Data {
   /* Link the module and its imports, asking `callback` for each specifier in
    * the graph (`Module::InstantiateModule`). A source-phase import also offers
    * its specifier to `source_callback`, whose answer is the Module Source
-   * Object the binding takes. */
+   * Object the binding takes. A failed link is an empty `Maybe`, not
+   * `Just(false)`. */
   Maybe<bool> InstantiateModule(Local<Context> context,
                                 ResolveModuleCallback callback,
                                 ResolveSourceCallback source_callback = nullptr);
+
+  /* The same, keyed by the request's index in `GetModuleRequests()` instead of
+   * its specifier and attributes. */
+  Maybe<bool> InstantiateModule(Local<Context> context,
+                                ResolveModuleByIndexCallback callback,
+                                ResolveSourceByIndexCallback source_callback = nullptr);
   MaybeLocal<Value> Evaluate(Local<Context> context);
   Location SourceOffsetToLocation(int offset) const;
 };
