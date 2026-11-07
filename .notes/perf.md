@@ -17986,3 +17986,39 @@ isolated (3.33 vs 3.31).
 Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
 language addition/template-literal/types 150/150 and built-ins Number/String
 1313/1313; a 30-shape coercion battery byte-identical to node 24.12.
+
+## ENTANGLED (2026-11-07): the concat-chain fold has no home in this line's lowering
+
+fool f20fb2e4 folds a left-leaning Add spine into one ConcatChain helper call:
+the peephole defers an Add whose left operand the typer proved Type::String and
+keeps folding Adds on its own pending result, up to eight pieces. Measured on its
+own line: strings/coercion_concat 49.0 -> 38.9 ms (-21%), at the cost of 20 ns per
+call of helper overhead; three boxes folded into one saved 37 ns, not the ~60 the
+box price predicted.
+
+It does not port as-is. The pre-image drift is the whole JIT:
+
+| file | lines changed between f20fb2e4^ and this line |
+| --- | ---: |
+| crates/jit/src/opt_lower.rs | 1091 |
+| crates/runtime/src/jit.rs | 826 |
+| crates/jit/src/lib.rs | 332 |
+
+and the specific blocker is structural, not textual: the peephole needs per-chain
+state across consecutive lowerings, which the original gets from its stateful
+Lowerer. This line lowers a block with a stateless loop (each instruction through
+`lower_inst(&mut builder, inst, ...)`), so there is nowhere to hold a pending
+chain. Two routes exist:
+
+- thread a chain accumulator through lower_body (the original shape, adapted), or
+- write it as an optimizing-tier IR pass (a left-spine rewrite into Op::ConcatChain,
+  plus a lowering arm like Op::CalleeEq) so the state lives in the pass.
+
+The second matches this line's pass pipeline and cannot miscompile a tier whose
+bugs are the expensive kind, so it is the route to take if the row is worth
+another ~20%. Deferred rather than attempted, and recorded so it is not
+discovered again.
+
+Prerequisites already landed on this line: 35d70f32's integer spelling
+(JsString::concat_units, concat_units_left) is the B8A9A8B6 commit immediately
+before this entry.
