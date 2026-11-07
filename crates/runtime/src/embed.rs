@@ -35,6 +35,7 @@ use crux::typed_array::SharedBuffer;
 use crux::value::{Value, ValueKind};
 
 use crate::agent::Agent;
+#[cfg(feature = "wasm")]
 use crate::api::CompiledWasmModule;
 use crate::context::to_string as js_to_string;
 use crate::host::HostHooks;
@@ -2277,12 +2278,14 @@ impl Context {
     /// Compile `wire_bytes` into a `WebAssembly.Module` object
     /// (`v8::WasmModuleObject::Compile`): decode, validate, and answer the
     /// object the JS-API's own constructor answers.
+    #[cfg(feature = "wasm")]
     pub fn compile_wasm_module(&mut self, wire_bytes: &[u8]) -> Result<JsValue, JsError> {
         crate::builtins::wasm::compile_module_value(&mut self.agent, wire_bytes).map(JsValue)
     }
 
     /// The decoded module a `WebAssembly.Module` object carries
     /// (`WasmModuleObject::GetCompiledModule`).
+    #[cfg(feature = "wasm")]
     pub fn wasm_compiled_module(&mut self, value: &JsValue) -> Result<CompiledWasmModule, JsError> {
         let object = value.0.as_object().ok_or_else(wasm_not_a_module)?;
         self.agent
@@ -2295,6 +2298,7 @@ impl Context {
 
     /// A module object for an already decoded module
     /// (`WasmModuleObject::FromCompiledModule`).
+    #[cfg(feature = "wasm")]
     pub fn wasm_module_object(
         &mut self,
         compiled: &CompiledWasmModule,
@@ -4243,6 +4247,7 @@ impl JsModule {
 
 /// The failure a compiled-module read reports for a value that is not a
 /// `WebAssembly.Module` object, which is V8's own `ApiCheck` reason.
+#[cfg(feature = "wasm")]
 fn wasm_not_a_module() -> JsError {
     JsError::new(
         ErrorKind::TypeError,
@@ -4728,6 +4733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "wasm")]
     fn wasm_modules_compile_and_round_trip() {
         // (func (export "add") (param i32 i32) (result i32) local.get 0
         //   local.get 1 i32.add), the module V8's own sample carries.
