@@ -170,6 +170,22 @@ pub trait HostHooks: std::fmt::Debug {
     ) -> Option<Result<crux::value::Value, JsError>> {
         None
     }
+
+    /// HostResolveImportedModule (spec 16.2.1.6.1.2.1 step 8): resolve a static
+    /// import's specifier through the host's own loader. `Some(Ok(module))`
+    /// names the resolved module; `Some(Err(e))` is a resolution failure;
+    /// `None` means this host resolves no static imports and the engine falls
+    /// back to its own registry ([`crate::module::host_resolve_imported_module`]).
+    ///
+    /// `attributes` is the validated import-attribute list as the host's
+    /// callback takes it: key text and value, in source order.
+    fn resolve_imported_module(
+        &self,
+        _specifier: &JsString,
+        _attributes: &[(JsString, JsString)],
+    ) -> Option<Result<crate::api::Module, JsError>> {
+        None
+    }
 }
 
 /// HostPromiseRejectionTracker dispatch: the agent's hooks if present, else
@@ -304,6 +320,20 @@ pub fn import_module_dynamically(
 ) -> Option<Result<crux::value::Value, JsError>> {
     match &agent.host_hooks {
         Some(hooks) => hooks.import_module_dynamically(specifier, referrer_name, phase, attributes),
+        None => None,
+    }
+}
+
+/// The static-import resolution hook dispatch (see
+/// [`HostHooks::resolve_imported_module`]): the agent's hooks if they resolve
+/// static imports, else `None` — the engine's own registry path.
+pub fn resolve_imported_module(
+    agent: &crate::agent::Agent,
+    specifier: &JsString,
+    attributes: &[(JsString, JsString)],
+) -> Option<Result<crate::api::Module, JsError>> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.resolve_imported_module(specifier, attributes),
         None => None,
     }
 }

@@ -100,6 +100,30 @@ jobs:
       - name: Check the interpreter-only binary
         run: cargo check --locked -p cli --no-default-features --features jit
 
+  # The quickjs facade ships two mutually-exclusive C skins (`ng`, `bellard`),
+  # each producing the same `libquickjs` artifact. Build both and separate the
+  # staticlib and shared library so a single run keeps both available.
+  quickjs-artifacts:
+    name: QuickJS facade artifacts
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          submodules: recursive
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - name: Build and separate the facade artifacts
+        run: bash tools/build-quickjs.sh
+      - name: Link a C host against both artifacts
+        run: bash tools/link-test-quickjs.sh
+      - name: Check the vendored headers for drift
+        run: bash tools/check-quickjs-headers.sh
+      - name: Check the C symbol surface
+        run: bash tools/check-quickjs-surface.sh
+
   # The sweep areas run as separate jobs, which is also how they are measured
   # locally: `annexB` is small and `language`/`built-ins` are ~24k fixtures each.
   # The Windows runner is the author's platform and its CRLF checkout takes the

@@ -735,6 +735,23 @@ pub fn host_resolve_imported_module(
     if let Some(module) = realm.loaded_modules.borrow().get(specifier) {
         return Ok(*module);
     }
+    // A host loader (HostResolveImportedModule) wins over the engine's own
+    // source registry.
+    let attributes_view: Vec<(JsString, JsString)> = attributes
+        .iter()
+        .map(|(key, value)| (JsString::from_utf8(&key_string(key)), value.clone()))
+        .collect();
+    if let Some(resolved) = crate::host::resolve_imported_module(agent, specifier, &attributes_view)
+    {
+        let module = resolved?;
+        let handle = module.handle();
+        crux::heap::write_barrier_handle(&*realm, handle);
+        realm
+            .loaded_modules
+            .borrow_mut()
+            .insert(specifier.clone(), handle);
+        return Ok(handle);
+    }
     let source = agent
         .roots
         .host_modules

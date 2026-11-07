@@ -17,6 +17,7 @@ members = [
     "crates/ffi",
     "crates/jsc",
     "crates/v8",
+    "crates/quickjs",
     "crates/cli",
     "crates/test262",
     "crates/slagc",
