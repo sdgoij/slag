@@ -3870,6 +3870,63 @@ impl JsObject {
         true
     }
 
+    /// Whether this object is the empty ordinary receiver
+    /// [`Self::adopt_fresh_data_properties`] requires: an ordinary, extensible
+    /// object still on its canonical empty map with an empty property vector.
+    /// Cheap and allocation-free, so a copy path can test it before building
+    /// the snapshot the batch would need.
+    pub fn is_fresh_plain_object(&self) -> bool {
+        matches!(self.kind, ObjectKind::Ordinary)
+            && self.extensible.get()
+            && self.map.get().is_some_and(|map| map.is_empty())
+            && self.properties.borrow().is_empty()
+    }
+
+    /// Adopt a whole key list on a fresh ordinary receiver, exactly like a
+    /// whole object literal: resolve (or fork and cache) the shape `names`
+    /// from the receiver's empty map and write every value in one batch.
+    /// `names.len()` must equal `values.len()`.
+    ///
+    /// This is what `Object.assign({}, o)` and `{...o}` use when the source's
+    /// own keys are plain enumerable data properties: per-key defines on a
+    /// fresh receiver pay a scan, a transition and a generation bump each,
+    /// while the key list is constant across calls, so one composite shape
+    /// lookup serves them all. False keeps the caller on its per-key loop.
+    pub fn adopt_fresh_data_properties(&self, names: &[AtomId], values: &[Value]) -> bool {
+        // The batch is vector-free, so a list longer than the in-field area
+        // cannot be adopted here.
+        if names.len() != values.len()
+            || names.len() > INLINE_FIELDS
+            || !self.is_fresh_plain_object()
+        {
+            return false;
+        }
+        let Some(mut base) = self.map.get() else {
+            return false;
+        };
+        let shape = match base.composite_child(names) {
+            Some(shape) => shape,
+            _ => {
+                let attrs = MapAttrs::new(true, true, true);
+                let mut shape = base;
+                for name in names {
+                    match shape.get_or_create_child(PropertyKey::String(*name), attrs) {
+                        Some(child) => shape = child,
+                        None => return false,
+                    }
+                }
+                // A duplicate key resolves to an existing descriptor, so the
+                // shape then describes fewer keys than the list: neither cache
+                // it nor adopt (the per-key path applies the redefinition).
+                if shape.descriptor_count() == names.len() {
+                    base.set_composite_child(names, shape);
+                }
+                shape
+            }
+        };
+        self.adopt_vector_free_fields(shape, values)
+    }
+
     /// Whether a map-described key (whose descriptor `ord` `Map::find`
     /// returned) is an own property in the vector-free state: its field must
     /// be written. A constructor-presize descriptor the body never wrote is

@@ -852,7 +852,17 @@ pub(crate) fn copy_data_properties(
         kept.push(Value::Object(*to));
     }
     let result = (|| -> Result<(), JsError> {
-        for key in from_obj.own_property_keys()? {
+        let keys = from_obj.own_property_keys()?;
+        // The freshness test is cheap and allocation-free, so it runs before
+        // the snapshot: a copy into a destination that already has properties
+        // pays neither the snapshot's vectors nor a second descriptor read.
+        if to.is_fresh_plain_object()
+            && let Some(snapshot) = plain_data_snapshot(&from_obj, &keys)?
+            && to.adopt_fresh_data_properties(snapshot.atoms(), snapshot.values())
+        {
+            return Ok(());
+        }
+        for key in keys {
             let property = from_obj.get_own_property_key(&key)?;
             if let Some(property) = property {
                 if !property.enumerable {
@@ -867,6 +877,65 @@ pub(crate) fn copy_data_properties(
     })();
     agent.roots.kept_during_job.borrow_mut().truncate(root_len);
     result
+}
+
+/// The plain-data snapshot a fresh-destination copy adopts in one batch: every
+/// own key of `from` that is a string atom with an enumerable data descriptor,
+/// in enumeration order. The storage is a fixed in-field-sized array, so a
+/// decline costs no allocation, and the values stay on the stack where the
+/// collector's conservative scan can see them.
+pub(crate) struct PlainDataSnapshot {
+    atoms: [crux::AtomId; crux::object::INLINE_FIELDS],
+    values: [Value; crux::object::INLINE_FIELDS],
+    len: usize,
+}
+
+impl PlainDataSnapshot {
+    pub(crate) fn atoms(&self) -> &[crux::AtomId] {
+        &self.atoms[..self.len]
+    }
+
+    pub(crate) fn values(&self) -> &[Value] {
+        &self.values[..self.len]
+    }
+}
+
+/// Snapshot `from`'s own keys as plain data properties, or `None` when the list
+/// cannot be adopted as one batch: a key that is not a string atom, or one
+/// whose descriptor is not a plain data property (an accessor's get would run
+/// user code, and a non-data descriptor cannot be adopted), or more keys than
+/// the vector-free batch can hold.
+pub(crate) fn plain_data_snapshot(
+    from: &crux::handle::Handle<crux::object::JsObject>,
+    keys: &[crux::PropertyKey],
+) -> Result<Option<PlainDataSnapshot>, JsError> {
+    // The batch writes the in-field area only, so a longer list cannot adopt.
+    if keys.len() > crux::object::INLINE_FIELDS {
+        return Ok(None);
+    }
+    let mut snapshot = PlainDataSnapshot {
+        atoms: [0; crux::object::INLINE_FIELDS],
+        values: [Value::Undefined; crux::object::INLINE_FIELDS],
+        len: 0,
+    };
+    for key in keys {
+        let crux::PropertyKey::String(atom) = key else {
+            return Ok(None);
+        };
+        let Some(property) = from.get_own_property_key(key)? else {
+            continue;
+        };
+        if !property.enumerable {
+            continue;
+        }
+        let crux::object::PropertyKind::Data { value, .. } = property.kind else {
+            return Ok(None);
+        };
+        snapshot.atoms[snapshot.len] = *atom;
+        snapshot.values[snapshot.len] = value;
+        snapshot.len += 1;
+    }
+    Ok(Some(snapshot))
 }
 
 /// The property name, evaluating computed keys (spec 13.2.5.5).

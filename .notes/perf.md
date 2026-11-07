@@ -17914,3 +17914,45 @@ interleaved runs). The unit test moved to `expr::tests` and gained `1 ** NaN`,
 Verified: clippy --workspace --all-targets -D warnings, fmt, cargo test
 --workspace green; test262 language 23726/23726, annexB 1086/1086, built-ins
 23821/23821 in BOTH modes; corpus 79/79 identical in both modes.
+
+## LANDED (2026-11-07): a fresh copy destination adopts its key list in one batch
+
+Object.assign({}, o) and {...o} copied key by key: an own-descriptor read plus
+a CreateDataProperty or [[Set]] per key. When the destination is fresh and the
+source's own keys are plain enumerable data properties, the whole list is adopted
+in one batch now, through the same vector-free adopt a whole object literal uses
+(the composite shape cache resolves the list). The batch holds INLINE_FIELDS (8)
+keys, so a longer list stays per-key; the tail half of the original change is not
+ported (fool 1eace5d1), only the fresh-destination half (fool 739ace8e + 87a965a6).
+
+Object spread needs only freshness (CreateDataProperty). Object.assign uses
+[[Set]], so it also requires an ordinary, extensible, empty destination on null or
+Object.prototype and no __proto__ key (the per-key loop then runs the setter).
+An accessor, a non-data descriptor, or a symbol or non-string key keeps the
+per-key loop. The freshness test runs BEFORE the snapshot, so a warm destination
+pays nothing.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| objects/spread_assign, family run | 118.2 ms | **83.0** |
+| objects/spread_assign, isolated | 124.9 | **94.2** |
+| 200k assign + assign + spread micro (min of 4 interleaved) | 816.7 | **652.3** |
+
+The decline path is a measured cost, not an afterthought: a source that declines
+(an own accessor or a symbol key) pays the descriptor reads twice. A synthetic
+100-decline workload reads 598 -> 628 ns (+4.9%). It was +12.5% when the
+snapshot used two heap vecs; the fixed in-field array removed the allocations and
+the values now sit on the stack where the conservative scan sees them. If the
+shape ever matters, the fix is to fuse the prefix: adopt the leading data run,
+then continue per-key from the first offending key.
+
+Family-run deltas outside the touched row are not evidence: map_churn read -16.6%
+in the builtins family run and -0.4% isolated (intra-process heap contamination,
+the trap this file already records). Isolated object_keys: 47.23 -> 46.66.
+
+Verified: clippy --workspace --all-targets -D warnings; cargo test crux 273,
+runtime 1090, jit 380, 0 failed; test262 built-ins/Object/assign 38/38 and
+language/expressions/object 1170/1170; a 14-case differential battery byte-
+identical to node 24.12 (source __proto__ in both forms, prototype-setter target,
+class instance, null-prototype target, frozen TypeError, getter source,
+multi-source, non-enumerable, symbol key, key order, 20 keys, warm destination).
