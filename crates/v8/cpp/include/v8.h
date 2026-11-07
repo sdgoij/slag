@@ -350,7 +350,115 @@ enum PropertyAttribute {
   DontDelete = 1 << 2,
 };
 
-class Value {
+/* The phase an import was written in (`v8::ModuleImportPhase`, from V8's
+ * `v8-callbacks.h`). An ordinary `import` is the evaluation phase; the other two
+ * are the source-phase and deferred-phase proposals. */
+enum class ModuleImportPhase {
+  kSource,
+  kDefer,
+  kEvaluation,
+};
+
+/* The superclass of objects that can reside on the heap (`v8::Data`,
+ * `v8-data.h`).
+ *
+ * A `Data` handle carries one of two words: a NaN-boxed engine value, or a
+ * pointer to an object the facade minted (`FixedArray`, `ModuleRequest`,
+ * `Module`, `Script`, `Context`, a template). The predicates cannot tell those apart from
+ * the word alone — a facade pointer has a non-`TAG_PREFIX` high word, exactly as
+ * a double does — so facade.cc records what it mints and the predicates ask that
+ * registry; an unrecorded word is an engine value.
+ *
+ * Three predicates answer false because the thing they name does not exist here
+ * yet: `IsPrivate` (this facade's `Private` is an ordinary engine symbol and
+ * records no brand, where V8 15's `Private : Data` does), `IsDictionaryTemplate`
+ * (no such type), and `IsCppHeapExternal` (cppgc is not implemented).
+ *
+ * Unlike V8's, this class is constructible: the facade's non-value data objects
+ * are plain C++ objects. */
+class Data {
+ public:
+  bool IsValue() const;
+  bool IsModule() const;
+  bool IsModuleRequest() const;
+  bool IsFixedArray() const;
+  bool IsPrivate() const;
+  bool IsObjectTemplate() const;
+  bool IsFunctionTemplate() const;
+  bool IsDictionaryTemplate() const;
+  bool IsContext() const;
+  bool IsCppHeapExternal() const;
+
+ protected:
+  Data() = default;
+};
+
+class ModuleRequest;
+
+/* A fixed-size array of `Data` (`v8::FixedArray`, `v8-data.h`). The facade owns
+ * the storage: `Module::GetModuleRequests` assembles one from the engine's
+ * per-index accessors, and each `ModuleRequest` owns the attributes array it
+ * answers. A `Local<FixedArray>` therefore roots nothing. */
+class FixedArray : public Data {
+ public:
+  ~FixedArray();
+
+  int Length() const;
+  Local<Data> Get(int i) const;
+
+  static FixedArray* Cast(Data* data) {
+    return reinterpret_cast<FixedArray*>(data);
+  }
+
+ private:
+  friend class Module;
+  friend class ModuleRequest;
+
+  FixedArray();
+  void Append(uint64_t word);
+  void AppendOwned(ModuleRequest* request);
+
+  std::vector<uint64_t> elements_;
+  /* The requests this array owns. A `ModuleRequest` is only reachable through
+   * its array, so the array frees them. */
+  std::vector<ModuleRequest*> owned_;
+};
+
+/* One import of a module (`v8::ModuleRequest`, `v8-script.h`): the specifier,
+ * the phase it was written in, its position, and its import attributes.
+ *
+ * `GetImportAttributes` answers V8's `[key, value, offset, …]` encoding. The
+ * engine records the specifier's span but not each attribute's, so every
+ * attribute reports the specifier's offset: that is the value DevTools reads,
+ * and it points at the import rather than at nothing. */
+class ModuleRequest : public Data {
+ public:
+  ~ModuleRequest();
+
+  Local<String> GetSpecifier() const;
+  ModuleImportPhase GetPhase() const;
+  int GetSourceOffset() const;
+  Local<FixedArray> GetImportAttributes() const;
+  Local<FixedArray> GetImportAssertions() const { return GetImportAttributes(); }
+
+  static ModuleRequest* Cast(Data* data) {
+    return reinterpret_cast<ModuleRequest*>(data);
+  }
+
+ private:
+  friend class Module;
+
+  ModuleRequest(uint64_t specifier, ModuleImportPhase phase, int source_offset,
+                FixedArray* attributes);
+
+  uint64_t specifier_;
+  ModuleImportPhase phase_;
+  int source_offset_;
+  /* Owned: the import-attributes array. */
+  FixedArray* attributes_;
+};
+
+class Value : public Data {
  public:
   /* The type predicates (`v8::Value::IsArray` and its siblings). The shape bits
    * come from the value; the brands the engine records per object (date,
@@ -1261,7 +1369,7 @@ class StackTrace {
   std::vector<StackFrame*> frames_;
 };
 
-class Script {
+class Script : public Data {
   public:
   static MaybeLocal<Script> Compile(Local<Context> context,
                                     Local<String> source,
@@ -1299,13 +1407,14 @@ using ResolveModuleCallback = MaybeLocal<Module> (*)(Local<Context> context,
 
 /* A module record (`v8::Module`). The facade object is a handle over the
  * engine's pinned record; modules are never freed, like scripts and templates. */
-class Module {
+class Module : public Data {
  public:
   ModuleStatus GetStatus() const;
   Local<Value> GetException() const;
   Local<Value> GetModuleNamespace();
   int GetModuleRequestsLength() const;
   Local<String> GetModuleRequest(int index) const;
+  Local<FixedArray> GetModuleRequests() const;
   Local<Integer> GetIdentityHash() const;
   Maybe<bool> IsSourceTextModule() const;
   Maybe<bool> IsSyntheticModule() const;
@@ -1668,7 +1777,7 @@ class AccessorSignature {
   FunctionTemplate* function_ = nullptr;
 };
 
-class FunctionTemplate {
+class FunctionTemplate : public Data {
  public:
   static Local<FunctionTemplate> New(
       Isolate* isolate, FunctionCallback callback,
@@ -1734,7 +1843,7 @@ class FunctionTemplate {
   uint64_t prototype_bits_ = 0;
 };
 
-class ObjectTemplate {
+class ObjectTemplate : public Data {
  public:
   struct Entry {
     std::string name;
@@ -1869,7 +1978,7 @@ class ObjectTemplate {
   uint64_t access_check_data_bits_ = 0;
 };
 
-class Context {
+class Context : public Data {
  public:
   static Local<Context> New(
       Isolate* isolate, std::nullptr_t = nullptr,

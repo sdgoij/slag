@@ -8,6 +8,7 @@
 // runs.
 
 #include "include/v8-array-buffer.h"
+#include "include/v8-callbacks.h"
 #include "include/v8-container.h"
 #include "include/v8-context.h"
 #include "include/v8-data.h"

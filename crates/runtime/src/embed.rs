@@ -4147,6 +4147,50 @@ impl JsModule {
             .map(|request| request.specifier.clone())
     }
 
+    /// How many import attributes the `index`-th request carries
+    /// (`ModuleRequest::GetImportAttributes`). A request with no `with { … }`
+    /// clause reports none.
+    pub fn request_attribute_count(&self, index: usize) -> usize {
+        self.module
+            .requested_modules
+            .get(index)
+            .map_or(0, |request| request.attributes.len())
+    }
+
+    /// The `attribute`-th key and value of the `index`-th request. The key is
+    /// the text the parser saw, not the atom it interned, because the host
+    /// reads a `String` (`ModuleRequest::GetImportAttributes`).
+    pub fn request_attribute(
+        &self,
+        index: usize,
+        attribute: usize,
+    ) -> Option<(JsString, JsString)> {
+        let request = self.module.requested_modules.get(index)?;
+        let (key, value) = request.attributes.get(attribute)?;
+        Some((
+            JsString::from_utf8(&crate::module::key_string(key)),
+            value.clone(),
+        ))
+    }
+
+    /// The `index`-th request's import phase (`ModuleRequest::GetPhase`).
+    pub fn request_phase(&self, index: usize) -> Option<syntax::ast::ImportPhase> {
+        self.module
+            .requested_modules
+            .get(index)
+            .map(|request| request.phase)
+    }
+
+    /// The source offset of the `index`-th request's specifier
+    /// (`ModuleRequest::GetSourceOffset`): the string literal the parser
+    /// recorded, quotes included.
+    pub fn request_offset(&self, index: usize) -> Option<u32> {
+        self.module
+            .requested_modules
+            .get(index)
+            .map(|request| request.span.start)
+    }
+
     /// Where `offset` into the module's source is
     /// (`Module::SourceOffsetToLocation`). The engine reports 1-based line and
     /// column; V8's `Location` is 0-based in both, which is the bridge's rule.

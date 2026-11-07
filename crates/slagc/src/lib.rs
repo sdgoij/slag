@@ -1422,6 +1422,73 @@ pub unsafe extern "C" fn slag_module_request(
     }
 }
 
+/// How many import attributes the `index`-th request carries
+/// (`ModuleRequest::GetImportAttributes`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_request_attribute_count(
+    module: *const SlagModule,
+    index: usize,
+) -> usize {
+    module
+        .as_ref()
+        .map_or(0, |module| module.module.request_attribute_count(index))
+}
+
+/// The `attribute`-th key and value of the `index`-th request, each as a string
+/// value (`ModuleRequest::GetImportAttributes`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_request_attribute(
+    module: *const SlagModule,
+    index: usize,
+    attribute: usize,
+    key: *mut u64,
+    value: *mut u64,
+) -> i32 {
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    match module.module.request_attribute(index, attribute) {
+        Some((attribute_key, attribute_value)) => {
+            if !key.is_null() {
+                *key = Value::String(Handle::new(attribute_key)).bits();
+            }
+            if !value.is_null() {
+                *value = Value::String(Handle::new(attribute_value)).bits();
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// The `index`-th request's import phase (`ModuleRequest::GetPhase`), as one of
+/// the `SlagImportPhase` numbers; -1 when the index is out of range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_request_phase(module: *const SlagModule, index: usize) -> i32 {
+    let Some(module) = module.as_ref() else {
+        return -1;
+    };
+    match module.module.request_phase(index) {
+        Some(syntax::ast::ImportPhase::Import) => 0,
+        Some(syntax::ast::ImportPhase::Source) => 1,
+        Some(syntax::ast::ImportPhase::Defer) => 2,
+        None => -1,
+    }
+}
+
+/// The source offset of the `index`-th request's specifier
+/// (`ModuleRequest::GetSourceOffset`); -1 when the index is out of range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_request_offset(
+    module: *const SlagModule,
+    index: usize,
+) -> i32 {
+    module
+        .as_ref()
+        .and_then(|module| module.module.request_offset(index))
+        .map_or(-1, |offset| offset as i32)
+}
+
 /// Where `offset` into the module's source is, as a 0-based line and column.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slag_module_source_offset_to_location(

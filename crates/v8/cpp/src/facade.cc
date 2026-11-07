@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <deque>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -35,6 +36,38 @@ void HandleRestore(std::size_t mark) {
     if (g_handles[i].rooted) slag_root_release(g_handles[i].value);
   }
   g_handles.resize(mark);
+}
+
+/* What a `v8::Data` handle names. A handle word is either a NaN-boxed engine
+ * value or a pointer to an object this facade minted, and the two are not
+ * distinguishable from the word (a facade pointer has a non-`TAG_PREFIX` high
+ * word, exactly as a double does). So every object the facade mints as `Data`
+ * is recorded here, and `Data::IsX` asks this; an unrecorded word is a value. */
+enum class DataKind : uint8_t {
+  kValue = 0,
+  kModule,
+  kModuleRequest,
+  kFixedArray,
+  kContext,
+  kObjectTemplate,
+  kFunctionTemplate,
+  kScript,
+};
+
+thread_local std::unordered_map<uint64_t, DataKind> g_data_kinds;
+
+void RegisterDataKind(const void* object, DataKind kind) {
+  g_data_kinds[static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object))] = kind;
+}
+
+void UnregisterDataKind(const void* object) {
+  g_data_kinds.erase(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object)));
+}
+
+DataKind ClassifyData(const void* data) {
+  const auto found = g_data_kinds.find(
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)));
+  return found == g_data_kinds.end() ? DataKind::kValue : found->second;
 }
 
 std::string ValueText(uint64_t value) {
@@ -663,6 +696,86 @@ void CollectionObserver(void* data, int32_t phase, int32_t gc_type) {
 
 }  // namespace
 
+bool Data::IsValue() const { return ClassifyData(this) == DataKind::kValue; }
+
+bool Data::IsModule() const { return ClassifyData(this) == DataKind::kModule; }
+
+bool Data::IsModuleRequest() const {
+  return ClassifyData(this) == DataKind::kModuleRequest;
+}
+
+bool Data::IsFixedArray() const {
+  return ClassifyData(this) == DataKind::kFixedArray;
+}
+
+/* No private brand exists to test: this facade's `Private` is an ordinary
+ * engine symbol, where V8 15's `Private : Data` records its own kind. */
+bool Data::IsPrivate() const { return false; }
+
+bool Data::IsObjectTemplate() const {
+  return ClassifyData(this) == DataKind::kObjectTemplate;
+}
+
+bool Data::IsFunctionTemplate() const {
+  return ClassifyData(this) == DataKind::kFunctionTemplate;
+}
+
+bool Data::IsDictionaryTemplate() const { return false; }
+
+bool Data::IsContext() const { return ClassifyData(this) == DataKind::kContext; }
+
+/* cppgc is not implemented, so nothing in this facade is a cppgc external. */
+bool Data::IsCppHeapExternal() const { return false; }
+
+FixedArray::FixedArray() { RegisterDataKind(this, DataKind::kFixedArray); }
+
+FixedArray::~FixedArray() {
+  for (ModuleRequest* request : owned_) delete request;
+  UnregisterDataKind(this);
+}
+
+void FixedArray::Append(uint64_t word) { elements_.push_back(word); }
+
+void FixedArray::AppendOwned(ModuleRequest* request) {
+  owned_.push_back(request);
+  elements_.push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request)));
+}
+
+int FixedArray::Length() const { return static_cast<int>(elements_.size()); }
+
+Local<Data> FixedArray::Get(int i) const {
+  if (i < 0 || static_cast<size_t>(i) >= elements_.size()) return Local<Data>();
+  return Local<Data>::New(elements_[static_cast<size_t>(i)]);
+}
+
+ModuleRequest::ModuleRequest(uint64_t specifier, ModuleImportPhase phase,
+                             int source_offset, FixedArray* attributes)
+    : specifier_(specifier),
+      phase_(phase),
+      source_offset_(source_offset),
+      attributes_(attributes) {
+  RegisterDataKind(this, DataKind::kModuleRequest);
+}
+
+ModuleRequest::~ModuleRequest() {
+  delete attributes_;
+  UnregisterDataKind(this);
+}
+
+Local<String> ModuleRequest::GetSpecifier() const {
+  return Local<String>::New(specifier_);
+}
+
+ModuleImportPhase ModuleRequest::GetPhase() const { return phase_; }
+
+int ModuleRequest::GetSourceOffset() const { return source_offset_; }
+
+Local<FixedArray> ModuleRequest::GetImportAttributes() const {
+  if (attributes_ == nullptr) return Local<FixedArray>();
+  return Local<FixedArray>::New(
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(attributes_)));
+}
+
 bool Value::IsUndefined() const {
   return (TypeMaskOf(this) & SLAG_VALUE_UNDEFINED) != 0;
 }
@@ -891,6 +1004,7 @@ Local<FunctionTemplate> FunctionTemplate::New(
     Local<Signature> signature, int length, ConstructorBehavior behavior,
     SideEffectType) {
   auto* tmpl = new FunctionTemplate(callback);
+  RegisterDataKind(tmpl, DataKind::kFunctionTemplate);
   tmpl->data_bits_ = data.IsEmpty() ? slag_undefined() : data.raw();
   slag_root_retain(tmpl->data_bits_);
   if (!signature.IsEmpty()) {
@@ -2628,6 +2742,7 @@ MaybeLocal<Script> Script::Compile(Local<Context> context,
     }
     return MaybeLocal<Script>();
   }
+  RegisterDataKind(script, DataKind::kScript);
   return Local<Script>::New(reinterpret_cast<uint64_t>(script));
 }
 
@@ -2671,6 +2786,18 @@ SlagModule* ModuleOf(const Module* module) {
   return reinterpret_cast<SlagModule*>(static_cast<uintptr_t>(Raw(module)));
 }
 
+/* The handle a module is minted as. The kind is recorded so `Data::IsModule`
+ * answers; a `SlagModule` is pinned for the process, so the record never goes
+ * stale. */
+Local<Module> ModuleHandle(SlagModule* module) {
+  RegisterDataKind(module, DataKind::kModule);
+  return Local<Module>::New(reinterpret_cast<uint64_t>(module));
+}
+
+/* The requests array built for a module, once, on first ask. A `SlagModule` is
+ * pinned for the process, so neither is this. */
+thread_local std::unordered_map<SlagModule*, FixedArray*> g_module_requests;
+
 std::string TextOf(Local<Value> value) {
   if (value.IsEmpty()) return {};
   return ValueText(value.raw());
@@ -2695,7 +2822,7 @@ MaybeLocal<Module> ScriptCompiler::CompileModule(Isolate* isolate,
           &module) != 0) {
     return MaybeLocal<Module>();
   }
-  return MaybeLocal<Module>(Local<Module>::New(reinterpret_cast<uint64_t>(module)));
+  return MaybeLocal<Module>(ModuleHandle(module));
 }
 
 ModuleStatus Module::GetStatus() const {
@@ -2743,6 +2870,64 @@ Local<String> Module::GetModuleRequest(int index) const {
   return Local<String>::New(out);
 }
 
+Local<FixedArray> Module::GetModuleRequests() const {
+  SlagModule* module = ModuleOf(this);
+  const auto cached = g_module_requests.find(module);
+  if (cached != g_module_requests.end()) {
+    return Local<FixedArray>::New(
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cached->second)));
+  }
+
+  auto* requests = new FixedArray();
+  const size_t count = slag_module_request_count(module);
+  for (size_t index = 0; index < count; ++index) {
+    uint64_t specifier = 0;
+    if (slag_module_request(module, index, &specifier) != 0) continue;
+    /* The array outlives every handle scope, so the words it keeps have to be
+     * rooted: nothing else in the facade holds them, and a collection between
+     * two reads would otherwise move or free them. */
+    slag_root_retain(specifier);
+
+    ModuleImportPhase phase = ModuleImportPhase::kEvaluation;
+    switch (slag_module_request_phase(module, index)) {
+      case SLAG_IMPORT_PHASE_SOURCE:
+        phase = ModuleImportPhase::kSource;
+        break;
+      case SLAG_IMPORT_PHASE_DEFER:
+        phase = ModuleImportPhase::kDefer;
+        break;
+      default:
+        break;
+    }
+    const int offset = slag_module_request_offset(module, index);
+
+    auto* attributes = new FixedArray();
+    const size_t attribute_count =
+        slag_module_request_attribute_count(module, index);
+    for (size_t attribute = 0; attribute < attribute_count; ++attribute) {
+      uint64_t key = 0;
+      uint64_t value = 0;
+      if (slag_module_request_attribute(module, index, attribute, &key, &value) !=
+          0) {
+        continue;
+      }
+      slag_root_retain(key);
+      slag_root_retain(value);
+      attributes->Append(key);
+      attributes->Append(value);
+      /* The engine records the specifier's span, not each attribute's, so the
+       * attribute's reported offset is the request's. */
+      attributes->Append(slag_number_new(static_cast<double>(offset)));
+    }
+
+    requests->AppendOwned(new ModuleRequest(specifier, phase, offset, attributes));
+  }
+
+  g_module_requests.emplace(module, requests);
+  return Local<FixedArray>::New(
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(requests)));
+}
+
 Local<Integer> Module::GetIdentityHash() const {
   Isolate* isolate = g_current_isolate;
   return Integer::New(isolate, slag_module_identity_hash(ModuleOf(this)));
@@ -2772,8 +2957,7 @@ Maybe<bool> Module::InstantiateModule(Local<Context> context,
       Local<String> specifier = module->GetModuleRequest(request);
       if (specifier.IsEmpty()) return Maybe<bool>();
       Local<Module> resolved;
-      if (!callback(context, specifier,
-                    Local<Module>::New(reinterpret_cast<uint64_t>(module)))
+      if (!callback(context, specifier, ModuleHandle(ModuleOf(module)))
                .ToLocal(&resolved)) {
         return Maybe<bool>();
       }
@@ -3192,8 +3376,9 @@ MaybeLocal<Value> TryCatch::StackTrace(Local<Context> context) const {
 }
 
 Local<ObjectTemplate> ObjectTemplate::New(Isolate*) {
-  return Local<ObjectTemplate>::New(
-      reinterpret_cast<uint64_t>(new ObjectTemplate()));
+  auto* tmpl = new ObjectTemplate();
+  RegisterDataKind(tmpl, DataKind::kObjectTemplate);
+  return Local<ObjectTemplate>::New(reinterpret_cast<uint64_t>(tmpl));
 }
 
 void ObjectTemplate::Set(Isolate*, const char* name,
@@ -3436,6 +3621,7 @@ Local<Context> Context::New(Isolate* isolate, std::nullptr_t,
   if (slag == nullptr) return Local<Context>();
 
   auto* context = new Context();
+  RegisterDataKind(context, DataKind::kContext);
   context->slag_ = slag;
   context->isolate_ = isolate;
   slag_watch_collections(slag, isolate, &CollectionObserver);

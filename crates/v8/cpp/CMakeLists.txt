@@ -72,3 +72,8 @@ target_link_libraries(value-basics PRIVATE v8_facade)
 # `v8::MicrotaskQueue`: a host queue a context's realm sends its jobs to.
 add_executable(microtasks tests/microtasks.cc)
 target_link_libraries(microtasks PRIVATE v8_facade)
+
+# `Module::GetModuleRequests`: a `FixedArray` of `ModuleRequest` with the
+# specifier, phase, source offset, and attributes Blink's module machinery reads.
+add_executable(module-requests tests/module_requests.cc)
+target_link_libraries(module-requests PRIVATE v8_facade)

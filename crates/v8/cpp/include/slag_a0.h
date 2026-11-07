@@ -87,6 +87,15 @@ enum SlagExceptionKind {
   SLAG_EXCEPTION_URI_ERROR = 6,
 };
 
+/* The import phase of a module request (`v8::ModuleImportPhase`). The numbers
+ * mirror the engine's `syntax::ast::ImportPhase`, and the facade maps them; a
+ * read of an out-of-range request reports -1. */
+enum SlagImportPhase {
+  SLAG_IMPORT_PHASE_EVALUATION = 0, /* an ordinary `import` */
+  SLAG_IMPORT_PHASE_SOURCE = 1,     /* `import source` / `import.source` */
+  SLAG_IMPORT_PHASE_DEFER = 2,      /* `import defer` / `import.defer` */
+};
+
 /* A property descriptor as the definer callback receives it
  * (v8::PropertyDescriptor). Each field is present-or-absent, because V8's
  * descriptor distinguishes "not mentioned" from "mentioned and false". */
@@ -634,6 +643,18 @@ int32_t slag_module_is_source_text(const SlagModule* module);
 int32_t slag_module_is_synthetic(const SlagModule* module);
 size_t slag_module_request_count(const SlagModule* module);
 int32_t slag_module_request(const SlagModule* module, size_t index, uint64_t* out);
+/* The number of import attributes the `index`-th request carries
+ * (`ModuleRequest::GetImportAttributes`). */
+size_t slag_module_request_attribute_count(const SlagModule* module, size_t index);
+/* The `attribute`-th key and value of the `index`-th request, each as a string
+ * value. Reports 1 when either index is out of range. */
+int32_t slag_module_request_attribute(const SlagModule* module, size_t index,
+                                      size_t attribute, uint64_t* key, uint64_t* value);
+/* The `index`-th request's import phase (`ModuleRequest::GetPhase`). */
+int32_t slag_module_request_phase(const SlagModule* module, size_t index);
+/* The source offset of the `index`-th request's specifier
+ * (`ModuleRequest::GetSourceOffset`). */
+int32_t slag_module_request_offset(const SlagModule* module, size_t index);
 int32_t slag_module_source_offset_to_location(const SlagModule* module, int32_t offset,
                                               int32_t* line, int32_t* column);
 int32_t slag_module_register(SlagContext* context, const SlagModule* module,
