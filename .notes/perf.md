@@ -18049,3 +18049,26 @@ String/prototype/split + Symbol.split + RegExp/Symbol.split + Array 3204/3204; a
 17-case split battery byte-identical to node 24.12 (limits 0/2/-1/1.9, empty
 receiver, undefined/null/NaN separator, regexp captures with and without a limit,
 leading/trailing separators, dense result conjoined back).
+
+## LANDED (2026-11-07): a keyed collection is looked up once per call
+
+Map.get/has/set/delete/size and the Set twins each ran two lookups into the
+agent's identity table: map_of/set_of did a contains_key brand check, then the
+body resolved the same id again, cloned the Rc and borrowed it. The table entry IS
+the brand, so the check folds into the data lookup (map_data_of / set_data_of);
+the compiled intrinsic helpers and the nine hot builtins take the single lookup,
+and a missing record raises the same TypeError. Ported from fool 7285a62a (no
+drift: keyed.rs was byte-identical to the commit's parent).
+
+| row | before | after |
+| --- | ---: | ---: |
+| opcost/map_get | 3.069 | **2.840** (-7.5%) |
+| opcost/set_has | 3.418 | **3.212** (-6.0%) |
+| builtins/map_churn | 29.25 | **28.03** (-4.2%) |
+| builtins/set_churn | 42.93 | **39.82** (-7.2%) |
+
+Rows isolated (one file per process), two rounds each in alternating order, min
+reported; all four move the same way in both rounds and every value is identical.
+
+Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
+Map/Set/WeakMap/WeakSet 813/813.
