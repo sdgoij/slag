@@ -684,10 +684,6 @@ fn eval_object_literal(
             } => {
                 let key = eval_property_name(agent, key, strict)?;
                 let value = eval_expr(agent, value_expr, strict)?;
-                if crate::function::is_anonymous_function_definition(value_expr) {
-                    // spec 15.4.2 step 5: SetFunctionName from the property key.
-                    crate::function::set_function_name(&value, &property_key_display(&key), None)?;
-                }
                 // Only a non-computed, non-shorthand `__proto__` key is the
                 // prototype setter (Annex B.3.1); computed keys and shorthand
                 // properties are ordinary own data properties, and duplicate
@@ -701,18 +697,23 @@ fn eval_object_literal(
                         }
                     )
                     && matches!(&key, PropertyKey::String(id) if crux::lookup(*id).to_string_lossy() == "__proto__");
+                // spec 13.2.5.5 step 5: NamedEvaluation, but NOT for a
+                // prototype setter (its value is applied to [[Prototype]]
+                // and is never renamed after the key).
+                if !proto_setter && crate::function::is_anonymous_function_definition(value_expr) {
+                    crate::function::set_function_name(&value, &property_key_display(&key), None)?;
+                }
                 if proto_setter {
-                    match value.kind() {
-                        ValueKind::Object(proto) => {
-                            set_proto_or_throw(&object, Some(proto))?;
-                        }
-                        ValueKind::Null => {
-                            set_proto_or_throw(&object, None)?;
-                        }
-                        // B.3.1 step 6: a non-object, non-null value sets
-                        // neither the prototype nor an own property — the
-                        // property definition is a no-op.
-                        _ => {}
+                    // B.3.1 step 6: an Object or null value becomes
+                    // [[Prototype]]; any other value sets neither the
+                    // prototype nor an own property — the definition is a
+                    // no-op. A FUNCTION is an Object (`as_object` recovers
+                    // its object part), which matching only
+                    // `ValueKind::Object` silently dropped.
+                    if matches!(value.kind(), ValueKind::Null) {
+                        set_proto_or_throw(&object, None)?;
+                    } else if let Some(proto) = crate::context::as_object(&value) {
+                        set_proto_or_throw(&object, Some(proto))?;
                     }
                 } else {
                     object.create_data_property_key(&key, value)?;
