@@ -378,6 +378,47 @@ fn regexp_match_parts(
     Ok((obj, std::rc::Rc::clone(&state.compiled), state.flags))
 }
 
+/// `lastIndex` as an interned property key: the protocol reads and writes it on
+/// every match, so the name must never be encoded per call.
+fn last_index_key() -> PropertyKey {
+    PropertyKey::String(crux::string::last_index_atom())
+}
+
+/// The same name as a `JsString`, for the general paths that take one (the
+/// text comes from the intern table's memo, so it is a handle clone).
+fn key_string(key: &PropertyKey) -> JsString {
+    match key {
+        PropertyKey::String(atom) => crux::lookup(*atom),
+        _ => unreachable!("the regexp protocol only uses the lastIndex name"),
+    }
+}
+
+/// The value of `obj`'s OWN `lastIndex` when it is a data property. A data own
+/// property shadows the rest of the chain for [[Get]], so this is the exact
+/// read with none of the chain machinery; `None` (absent or an accessor) means
+/// the caller must take the general [[Get]].
+fn own_data_value(obj: &Handle<JsObject>, key: &PropertyKey) -> Result<Option<Value>, JsError> {
+    let Some(property) = obj.get_own_property_key(key)? else {
+        return Ok(None);
+    };
+    Ok(match property.kind {
+        crux::object::PropertyKind::Data { value, .. } => Some(value),
+        crux::object::PropertyKind::Accessor { .. } => None,
+    })
+}
+
+/// Write `lastIndex`, in place when the receiver's own property is a writable
+/// data property (the shape a RegExp is born with); anything else takes the
+/// exact [[Set]].
+fn set_last_index(obj: &Handle<JsObject>, value: f64) -> Result<(), JsError> {
+    // `set_key` is the spec's [[Set]] with the own-writable-data in-place write
+    // as its fast path, and unlike the compiled store's `write_data_property`
+    // entry it also bumps the generation, which is what the read-side value
+    // cell needs: nothing here refreshes that cell.
+    obj.set_key(&last_index_key(), Value::Number(value), true)?;
+    Ok(())
+}
+
 fn regexp_receiver_error() -> JsError {
     JsError::new(
         ErrorKind::TypeError,
@@ -466,7 +507,13 @@ fn regexp_exec_protocol<M>(
     search: impl FnOnce(usize) -> Result<Option<(usize, M)>, regexp::BudgetExceeded>,
     end: impl FnOnce(usize, &M) -> usize,
 ) -> Result<Option<(usize, M)>, JsError> {
-    let last_index_value = get_property(agent, regexp, &JsString::from_utf8("lastIndex"), *regexp)?;
+    let key = last_index_key();
+    let last_index_value = match own_data_value(obj, &key)? {
+        Some(value) => value,
+        // No own data property: the read may resolve a getter further up the
+        // chain, so take the exact [[Get]].
+        None => get_property(agent, regexp, &key_string(&key), *regexp)?,
+    };
     let mut last_index = to_length(to_number(&last_index_value)?) as usize;
     let global = flags.g;
     let sticky = flags.y;
@@ -475,13 +522,13 @@ fn regexp_exec_protocol<M>(
     }
     let matched = if sticky {
         if last_index > length {
-            obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+            set_last_index(obj, 0.0)?;
             return Ok(None);
         }
         match at(last_index).map_err(regexp_budget_error)? {
             Some(m) => m,
             None => {
-                obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+                set_last_index(obj, 0.0)?;
                 return Ok(None);
             }
         }
@@ -495,7 +542,7 @@ fn regexp_exec_protocol<M>(
             }
             None => {
                 if global {
-                    obj.set(&JsString::from_utf8("lastIndex"), Value::Number(0.0), true)?;
+                    set_last_index(obj, 0.0)?;
                 }
                 return Ok(None);
             }
@@ -503,11 +550,7 @@ fn regexp_exec_protocol<M>(
     };
     if global || sticky {
         let end_index = end(last_index, &matched);
-        obj.set(
-            &JsString::from_utf8("lastIndex"),
-            Value::Number(end_index as f64),
-            true,
-        )?;
+        set_last_index(obj, end_index as f64)?;
     }
     Ok(Some((last_index, matched)))
 }

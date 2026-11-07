@@ -18097,3 +18097,29 @@ direction.
 
 Verified: clippy -D warnings, fmt; regexp 44, crux 273, runtime 1090, jit 380;
 test262 RegExp 1879/1879.
+
+## LANDED (2026-11-07): the regexp protocol stops encoding its own property name
+
+regexp_exec_protocol runs on every test, exec, match, replace and split, and it
+read lastIndex through a JsString::from_utf8("lastIndex") (a UTF-8 encode and a
+box per call) plus the full chain-walking [[Get]], then wrote it through another
+encode. The name is now the interned crux::string::last_index_atom the pattern
+length_atom already used, and the read takes the object's own lastIndex directly
+when it is a data property (a data own property shadows the chain); an absent or
+accessor own property still takes the general [[Get]]. The write stays set_key —
+the compiled store's write_data_property entry leaves read-cell refresh to its
+caller, which read stale across 11 fixtures. Ported from fool 8030d0fe.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| opcost/regexp_test, isolated | 31.15 ms | **29.55** (-5.1%) |
+| hoisted-regex micro, 100k x2 calls, min of 2 interleaved | 232.4 us | **202.4** (-12.9%) |
+
+Micro trap worth keeping: the first probe wrote the literal in the loop
+(/{...}/.test(s)) and read only -1.2%, because a regex literal creates its
+object per evaluation, which dominates the protocol's share. Hoist the regex to
+measure the protocol; leave it inline only when construction is what you mean to
+measure.
+
+Verified: clippy -D warnings, fmt; crux 273, runtime 1090, regexp 44; test262
+RegExp 1879/1879.
