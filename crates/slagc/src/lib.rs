@@ -6044,7 +6044,7 @@ mod tests {
             assert!(script.is_null());
             assert_eq!(slag_has_error(context), 1);
 
-            let mut message = [0i8; 256];
+            let mut message = [0 as c_char; 256];
             let len = slag_pending_error(context, message.as_mut_ptr(), message.len());
             assert!(len > 0);
             // Reading the message does not consume it: the TryCatch reads the
@@ -6053,8 +6053,8 @@ mod tests {
 
             // A compile error records a position, so a message can name it.
             let mut position = SlagMessage::default();
-            let mut script_name = [0i8; 64];
-            let mut source_line = [0i8; 64];
+            let mut script_name = [0 as c_char; 64];
+            let mut source_line = [0 as c_char; 64];
             assert_eq!(
                 slag_pending_message(
                     context,
