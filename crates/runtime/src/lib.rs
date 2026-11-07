@@ -36,6 +36,7 @@ pub mod promise;
 pub mod raylib;
 pub mod realm;
 mod rlx;
+pub mod sampler;
 pub mod script;
 pub mod snapshot;
 pub mod stack;

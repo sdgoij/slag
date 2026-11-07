@@ -25,7 +25,6 @@ use std::time::Instant;
 use crux::error::JsError;
 use runtime::embed::{Context, JsValue};
 
-mod sampler;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -202,7 +201,7 @@ fn execute() -> Result<(), u8> {
     runtime::stack::install_probe();
     // A flat self-time profile of this thread, printed when the run ends
     // (inert unless `SLAG_SAMPLE` is set).
-    let _profile = sampler::Profiler::start();
+    let _profile = runtime::sampler::Profiler::start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     run(parse(&args))
 }

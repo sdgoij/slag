@@ -16,6 +16,7 @@
 pub use crux::error::{ErrorKind, JsError};
 pub use runtime::HostHooks;
 pub use runtime::dump;
+pub use runtime::sampler;
 pub use runtime::embed::{
     BindingView, BufferInfo, CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks,
     HostFn, JsModule, JsObject, JsValue, ModuleNamespacePhase, OwnProperty, OwnPropertyView,

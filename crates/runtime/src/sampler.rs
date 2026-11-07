@@ -1,5 +1,9 @@
 //! A flat self-time sampler for attribution runs.
 //!
+//! Any host starts it where its frame loop runs (`Profiler::start`, held for
+//! the life of the run); the CLI, the game and the extension all sample the
+//! thread that called into the engine.
+//!
 //! Enabled with `SLAG_SAMPLE=<interval-µs>` (e.g. `SLAG_SAMPLE=500`). A
 //! watchdog thread periodically suspends the engine thread, reads its
 //! instruction pointer, and resumes it. The recorded addresses are image
