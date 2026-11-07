@@ -1,6 +1,6 @@
 ---
 name: slag-perf-measurement
-description: Measure and A/B a Slag interpreter/JIT performance change without fooling yourself. Load before claiming any speedup or regression from wall-clock numbers, comparing two binaries, or reporting a benchmark row. Covers the same-session interleaved control protocol, the global-loop-bound confound, jitless vs JIT mode checks, the step census (--features step-stats) and how to read its bucket totals, and the traps that produced a false "minus 19 percent".
+description: Measure and A/B a Slag interpreter/JIT performance change without fooling yourself. Load before claiming any speedup or regression from wall-clock numbers, comparing two binaries, or reporting a benchmark row. Covers the same-session interleaved control protocol, dependency-provenance and native-layout swings (git vs path dep, `-align-all-functions`), representation changes that are free in one tier and paid in the other, the global-loop-bound confound, jitless vs JIT mode checks, the step census (--features step-stats) and how to read its bucket totals, and the traps that produced a false "minus 19 percent".
 ---
 
 # Measuring a Slag performance change
@@ -40,6 +40,25 @@ was 211 ms, five fresh control runs were 166-175 ms, and the variant was 171 ms.
 - **The first sample after linking.** It is frequently the fastest. Take min-of-N
   with N >= 3 and confirm with a repeat before writing the number down.
 
+## Build provenance and native layout
+
+- **Two builds of the same commit can differ by 30%.** A `git` dependency and a
+  `path` dependency on identical sources measured 13.7 ms and 10.6 ms for the
+  same commit, with identical JIT verdicts and identical generated code. Never
+  A/B across provenance: build both sides the same way and say which way. A
+  regression that reproduces only in one provenance is a build question, not an
+  engine one — the shipped configuration is the one that counts.
+- **`-align-all-functions=5` classifies a swing; do not ship it.** It removed a
+  slow draw (13.7 -> 10.73 ms) and cost the good build 3% (10.57 -> 10.92 ms).
+  If the flag moves the number, the cause is native layout rather than workload;
+  if it does not, keep looking. It hides the sensitivity instead of removing it,
+  so treat it as a diagnostic and fix the code growth that made the layout
+  fragile.
+- **A layout swing invalidates a mechanism attribution made across binaries.** A
+  "+7.8% frame" measured path-built against a previous pin reversed sign under
+  alignment (the newer pin came out 0.2 ms *faster*), so the whole delta was
+  layout. Re-run the control with the flag before blaming a commit.
+
 ## The step census
 
 For claims about *why* a row is slow (dispatch count, which step families), use the
@@ -75,3 +94,11 @@ tiers. `emit_leaf_op` in `crates/jit/src/compiler.rs` (baseline) and
 `_ => Err(Unsupported)`, and a lane op that degrades to a runtime helper call
 costs tens of ns per use — it turned a 24 ms row into 517 ms. Measure the JIT row
 on every interpreter change.
+
+A value-representation knob can be free for the interpreter and expensive for the
+compiled tiers. Stopping inline-smi boxing in `Value::Number` took `--jitless`
+from 31.5 to 17.7 ns/iter but left the JIT 16% over its baseline, because
+`is_number`/`value_as_f64` emit the representation test and a `select` into the
+generated code: deleting the *producer* moves no emitted code. Measure both rows,
+and read an unchanged `SLAG_OPT=0` row as the signal that the cost sits in the
+lowering both tiers share, not in the optimizing tier's lift.
