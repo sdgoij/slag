@@ -6,6 +6,46 @@
 use regexp::{Flags, compile};
 use std::time::Instant;
 
+/// A counting global allocator, so a per-call allocation is visible as a number
+/// instead of inferred from a time delta.
+struct Counting;
+
+static ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+/// Report the allocations one engine call performs.
+fn count_allocs(label: &str, mut f: impl FnMut()) {
+    const ITERS: usize = 1000;
+    for _ in 0..10 {
+        f();
+    }
+    let start = ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..ITERS {
+        f();
+    }
+    let end = ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "{label:<32} {:.2} allocs/call",
+        (end - start) as f64 / ITERS as f64
+    );
+}
+
 fn bench(name: &str, iters: u32, mut f: impl FnMut()) {
     let warmup = (iters / 20).max(1);
     for _ in 0..warmup {
@@ -44,6 +84,34 @@ fn runtime_search(re: &regexp::Regex, input: &[u16]) -> Option<(usize, usize)> {
 #[test]
 #[ignore]
 fn perf() {
+    // The `test` shape the corpus measures: a tiny input, a tiny pattern, so
+    // the number is per-call engine setup plus one match.
+    {
+        let r = re("a", "");
+        let input = utf16("abcdefgh");
+        count_allocs("allocs: test /a/ on 8 units", || {
+            let _ = r.search_end_at(&input, 0);
+        });
+        let r3 = re("[a-z]+", "");
+        count_allocs("allocs: test /[a-z]+/ on 8 units", || {
+            let _ = r3.search_end_at(&input, 0);
+        });
+        let empty0: Vec<u16> = Vec::new();
+        count_allocs("allocs: test /a/ on empty", || {
+            let _ = r.search_end_at(&empty0, 0);
+        });
+        bench("test /a/ on 8 units (search_end_at)", 1_000_000, || {
+            let _ = r.search_end_at(&input, 0);
+        });
+        let r2 = re("[a-z]+", "");
+        bench("test /[a-z]+/ on 8 units", 1_000_000, || {
+            let _ = r2.search_end_at(&input, 0);
+        });
+        let empty: Vec<u16> = Vec::new();
+        bench("test /a/ on empty (setup only)", 1_000_000, || {
+            let _ = r.search_end_at(&empty, 0);
+        });
+    }
     // Search-loop cost over a long input.
     {
         let input: Vec<u16> = vec![b'x' as u16; 100_000];

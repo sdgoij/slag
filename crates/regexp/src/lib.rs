@@ -12,6 +12,7 @@
 pub mod engine;
 pub mod escape;
 pub mod parse;
+mod small_stack;
 
 use std::collections::HashMap;
 

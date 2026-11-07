@@ -18072,3 +18072,28 @@ reported; all four move the same way in both rounds and every value is identical
 
 Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
 Map/Set/WeakMap/WeakSet 813/813.
+
+## LANDED (2026-11-07): the matcher's task stacks stay inline
+
+The engine built its task and backtrack-point stacks as empty Vecs on every
+match, so /a/ against an empty input allocated once: 1.00 allocation per
+search_end_at call and 54 of the 60 ns a /a/.test cost. SmallStack keeps the
+first N entries inline (task 8, choice 4) and spills to a Vec past that, with the
+drop accounting a non-Copy element needs since Task holds an Rc<[usize]>. Ported
+from fool 90d52169 (no drift: engine.rs and lib.rs were byte-identical).
+
+| probe | before | after |
+| --- | ---: | ---: |
+| opcost/regexp_test, isolated | 33.56 ms | **31.90** |
+| opcost/regexp_test, both sides aligned | 35.12 | **31.95** |
+
+Third layout artifact of the session: array_to_sorted read +3.9% isolated
+(36.70 -> 38.12) for a change inside the regexp engine, and the aligned pair is
+flat (37.87 vs 38.05). The classifier has now paid for itself three times; take a
+row's delta as a claim about the change only after the aligned pair agrees.
+math_abs is below the measurement floor at 0.7-1.0 ms and swung -29% isolated and
++5.6% in the family run in the same pair, so it is not evidence in either
+direction.
+
+Verified: clippy -D warnings, fmt; regexp 44, crux 273, runtime 1090, jit 380;
+test262 RegExp 1879/1879.
