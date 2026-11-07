@@ -17956,3 +17956,33 @@ language/expressions/object 1170/1170; a 14-case differential battery byte-
 identical to node 24.12 (source __proto__ in both forms, prototype-setter target,
 class instance, null-prototype target, frozen TypeError, getter source,
 multi-source, non-enumerable, symbol key, key order, 20 keys, warm destination).
+
+## LANDED (2026-11-07): a number spells straight into its concat
+
+The Add fast path for a string next to a plain primitive boxed the primitive's
+spelling and then boxed the concat, so "value=" + i paid two allocations. The
+integer spelling now writes into a caller stack buffer (crux::number::integer_units,
+the fast path small_integer_string already had, now shared) and
+JsString::concat_units / concat_units_left build the result once, inline Small
+when it fits. Ported from fool 35d70f32.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| 300k ('value='+i), ('v='+j+':'+(j*2)), (k+'x'), min of 3 interleaved | 353.6 ns | **223.2** |
+| strings/coercion_concat, isolated | 61.5 ms | **51.0** |
+| strings/coercion_concat, family run | 65.9 | **50.9** |
+
+integer_units bounds the form to |x| <= 2^53 and declines a fraction, NaN and
+Infinity, so everything else takes the general path; 0 and -0 both spell "0",
+which is what ToString says.
+
+A layout artifact, classified rather than argued: search_slice read +3.2 0n the
+unflagged pair (11.36 -> 11.73, reproducing isolated) although the row never
+concatenates a number. Rebuilt both sides with -align-all-functions=5 and it went
+flat (11.09/11.19 vs 11.17/11.03) while the concat win held (64.3 -> 49.8), so the
+delta was native layout. char_ops' +3.3 0n the family run did not reproduce
+isolated (3.33 vs 3.31).
+
+Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
+language addition/template-literal/types 150/150 and built-ins Number/String
+1313/1313; a 30-shape coercion battery byte-identical to node 24.12.

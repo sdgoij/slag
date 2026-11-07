@@ -93,17 +93,20 @@ pub fn to_string(x: f64) -> JsString {
     JsString::from_utf8(&out)
 }
 
-/// The decimal string of an exactly-representable small integer (`|x|` an
-/// integer `<= 2^53`, never zero — `to_string` handles zero first).
-fn small_integer_string(x: f64) -> JsString {
+/// The decimal units of an exactly-representable integer (`|x| <= 2^53`),
+/// right-aligned in `buf`. `None` when the form does not apply, so the caller
+/// takes the general `to_string` path. Exposed so a string coercion can spell
+/// the number straight into the concat buffer instead of boxing it first.
+pub fn integer_units(x: f64, buf: &mut [u16; 22]) -> Option<&[u16]> {
+    if x.fract() != 0.0 || x.abs() > 9007199254740992.0 {
+        return None;
+    }
     let negative = x < 0.0;
     let mut digits = x.abs() as u64;
-    // Sign + 20 digits + NUL margin; 2^53 has 16 digits.
-    let mut buf = [0u8; 22];
     let mut i = buf.len();
     loop {
         i -= 1;
-        buf[i] = b'0' + (digits % 10) as u8;
+        buf[i] = u16::from(b'0') + (digits % 10) as u16;
         digits /= 10;
         if digits == 0 {
             break;
@@ -111,11 +114,18 @@ fn small_integer_string(x: f64) -> JsString {
     }
     if negative {
         i -= 1;
-        buf[i] = b'-';
+        buf[i] = u16::from(b'-');
     }
-    // SAFETY: buf[i..] holds only '-' (optional) followed by ASCII digits.
-    let text = unsafe { std::str::from_utf8_unchecked(&buf[i..]) };
-    JsString::from_utf8(text)
+    Some(&buf[i..])
+}
+
+/// The decimal string of an exactly-representable integer (`|x| <= 2^53`,
+/// never zero: `to_string` handles zero first).
+fn small_integer_string(x: f64) -> JsString {
+    let mut buf = [0u16; 22];
+    // The caller proved the integer form.
+    let units = integer_units(x, &mut buf).unwrap_or(&[]);
+    JsString::from_utf16(units)
 }
 
 /// spec 6.1.6.1.1 Number::add.
