@@ -262,7 +262,11 @@ pub struct EcmaFunction {
     /// [[Strict]]: the body's strictness (distinct from [[ThisMode]] for
     /// arrows, which are always ~lexical~).
     pub strict: bool,
-    /// [[HomeObject]]: set for methods (super property access).
+    /// [[HomeObject]]: set for methods (super property access). The typed value
+    /// is read from the record, but the GC edge lives on the closure box
+    /// (`Function::home_object`), NOT traced here — a traced record edge pinned
+    /// the home object (which owns the closure) for the record's whole
+    /// lifetime, leaking every method's object literal.
     pub home_object: Option<Value>,
     /// [[ConstructorKind]]: ~derived~ for classes with a heritage.
     pub constructor_kind: ConstructorKind,
@@ -372,7 +376,12 @@ impl Trace for EcmaFunction {
         // record outlives its box by one sweep - which promoted those
         // environments (and source strings) to the old generation, where only
         // a major could reclaim them.
-        self.home_object.trace(visit);
+        //
+        // `home_object` is likewise NOT traced: the closure box carries its
+        // edge (see `Function`'s `home_object` field). A traced record edge was
+        // worse than a one-collection lifetime: the home object owns the
+        // closure, so the record's permanent root formed an uncollectable
+        // cycle for every method.
         // `private_environment` is inline, not in `class_parts`, so it needs
         // its own edge: a method's `#name` resolution dereferences it when the
         // body runs.
@@ -1543,7 +1552,21 @@ pub fn make_method(agent: &mut Agent, function: &Value, home_object: Value) -> R
             "Cannot set a HomeObject on a non-ECMAScript function".into(),
         ));
     };
+    // A static method's and a static block's home object is the class
+    // constructor, i.e. a function value, so the edge must cover both kinds:
+    // an object-only edge would leave that constructor untraced while the
+    // method holds the only reference to it.
+    let home_edge = match home_object.kind() {
+        ValueKind::Object(object) => Some(object.as_any()),
+        ValueKind::Function(function) => Some(function.as_any()),
+        _ => None,
+    };
     data.home_object = Some(home_object);
+    // The GC edge lives on the closure box (see `Function`'s `home_object`
+    // field): the record is an Agent root and a traced record edge would pin
+    // the home object — and, through its property value, the closure itself —
+    // forever.
+    function.set_home_object_edge(home_edge);
     Ok(())
 }
 

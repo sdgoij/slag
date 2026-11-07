@@ -18123,3 +18123,32 @@ measure.
 
 Verified: clippy -D warnings, fmt; crux 273, runtime 1090, regexp 44; test262
 RegExp 1879/1879.
+
+## LANDED (2026-11-07): a method's home object rides on the closure box
+
+EcmaFunction::trace visited home_object, and every function record is a permanent
+Agent root in ecma_functions. For a method the home object is the object literal
+whose method property IS the closure, so the record's root formed an
+uncollectable cycle: every method ever created pinned its literal and closure for
+the process lifetime. The edge moves to the closure box, exactly as environment
+and resolving_promise already do; the record keeps the typed Value for reads and
+traces it no longer. Ported from fool 31031f4b.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| 200k iterations of { m() {} } + o.m(), two runs each | 16784-16910 ms | **296-304** |
+
+The loop is 56x faster here (16.8 s -> 0.30 s), far worse than the source
+commit's 2.0 s, because this line's gate compiles the method literal path and so
+creates the cycle on every iteration.
+
+Deviation from the source patch, deliberate: it derived the edge with
+home_object.as_object(), and crux's Value::as_object matches TAG_OBJECT only. A
+static method's and a static block's home object is the class constructor, i.e. a
+function value, so that form would have left it with NO edge at all - the record
+value is untraced now, so the constructor could be collected under a live static
+method. The port matches Object and Function and takes each box's own edge.
+
+Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
+object-method + class + super + using 5711/5711 under --gc-stress AND 5711/5711
+under --gc-verify.
