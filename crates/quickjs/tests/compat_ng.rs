@@ -47,6 +47,7 @@ unsafe extern "C" {
     fn qjs_test_throw_out_of_memory();
     fn qjs_test_abi_layout();
     fn qjs_test_by_value_jsvalue_abi();
+    fn qjs_test_string_property_gc();
 }
 
 #[test]
@@ -341,5 +342,12 @@ fn c_abi_layout() {
 fn c_by_value_jsvalue_abi() {
     unsafe {
         qjs_test_by_value_jsvalue_abi();
+    }
+}
+
+#[test]
+fn c_string_property_gc() {
+    unsafe {
+        qjs_test_string_property_gc();
     }
 }

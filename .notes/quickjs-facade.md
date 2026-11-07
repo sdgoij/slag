@@ -537,12 +537,14 @@ Dependencies: Phases 2–5. Size: M (1 week).
 | 2026-11-07 | Phase 6.3 header drift: +`tools/check-quickjs-headers.sh` pins the post-patch vendored-file SHA-256s (ng `6d3879c8…`, bellard `6904cf9e…`) and fails on drift; wired into the CI `quickjs-artifacts` job. The `ad3455…` hash in §10 is the upstream Bellard tarball, distinct from the patched vendored file | Phase 6.3 surface ledger |
 | 2026-11-07 | Phase 6.3 surface ledger + symbol audit: +`tools/quickjs-surface.py` (feature-aware, cross-checks exports vs header contract vs `unsupported.<feature>.toml`; `--bless`; collision check against the C test harness) + `tools/check-quickjs-surface.sh`; surfaced and fixed 10 Bellard-only leaks (gated `js_calloc`/`js_calloc_rt` to ng; wrapped the NG-only `JS_New*Error`/`JS_ThrowPlainError`/`JS_ThrowDOMException` shim symbols in `#ifdef QJS_NG` via a `build.rs` define); blessed ng=137 / bellard=86 gaps; wired into CI | Phase 6.4 documentation |
 | 2026-11-07 | Phase 6.4 documentation: +`DIVERGENCES.md` (bytecode/finalizers/gc_mark/allocator/partial-realms/Intl-Temporal/quickjs-libc/dump-flags/interrupt/resizable-buffers/eval-this/modules), +`README.md` (Rust facade usage + per-target C build/link), +`c/README.md` (header provenance + vendored SHA-256s); plan checkboxes updated | Phase 6.5 certification |
+| 2026-11-07 | Closed the `JS_RunGC` string-collection issue below: a string stored as an ordinary object's data property survives `JS_RunGC` (leaf, long `Flat`, rope-from-concat, and `JS_SetPropertyFunctionList` string rows) and `--gc-stress`; +`c/tests/ng/string_gc.c` and +`tests/gc_stress.rs` regression to pin it. The trace path is correct end-to-end (`JsObject::trace` visits `in_fields`+`properties` -> `Value::trace` -> `Gc<JsString>::trace` -> rope/cons/sliced children), so the earlier repro no longer fires | done |
 
-### Known issue: strings in ordinary objects are collected by `JS_RunGC`
+### Resolved: strings in ordinary objects were collected by `JS_RunGC`
 
-`JS_SetPropertyStr(obj, "k", string)` then `JS_RunGC(rt)` collects the string
-(`obj.k` then throws), while a boxed string survives the same GC and a number
-or function stored the same way survives. Reproduces with both
-`JS_NewString` and `JS_Eval("'...'")`. Not yet diagnosed; needs the
-`--gc-stress`/`for_each_live_box` probe from `slag-gc-rooting`. Worked around
-in the function-list C test by using primitive constants, not string rows.
+Recorded during Phase 3 and worked around in the function-list test; the
+current code does not reproduce it. A string stored via `JS_SetPropertyStr`
+(or a `JS_PROP_STRING_DEF` row) survives `JS_RunGC` for the leaf, long-flat,
+and rope-from-concat shapes, and survives `--gc-stress`. The string value is
+traced through the ordinary object's property/inline-field trace, so no
+workaround is needed. Pinned by `c/tests/ng/string_gc.c` and
+`tests/gc_stress.rs::a_string_property_survives_gc_stress`.

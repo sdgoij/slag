@@ -51,3 +51,23 @@ fn arrays_and_functions_survive_gc_stress() {
         .unwrap();
     assert_eq!(array.get(&context, "2").unwrap().as_number(), Some(6.0));
 }
+
+#[test]
+fn a_string_property_survives_gc_stress() {
+    let mut runtime = Runtime::new();
+    runtime.set_gc_stress(true);
+    let context = runtime.create_context().unwrap();
+
+    let object = quickjs::Object::new(&context).unwrap();
+    let string = context.eval("'hello'").unwrap();
+    object.set(&context, "k", string).unwrap();
+
+    for _ in 0..50 {
+        let _ = context.eval("'churn' + 'allocations'").unwrap();
+    }
+
+    assert_eq!(
+        object.get(&context, "k").unwrap().as_string().as_deref(),
+        Some("hello")
+    );
+}
