@@ -2217,6 +2217,18 @@ impl Context {
         Ok(())
     }
 
+    /// Give `module` the Module Source Object that a source-phase import of it
+    /// binds (`v8::Module::ResolveSourceCallback`). Without one the engine
+    /// builds the standard `%AbstractModuleSource%`, which a source text module
+    /// does not have.
+    pub fn register_module_source(&mut self, module: &JsModule, source: JsValue) {
+        self.agent
+            .roots
+            .host_module_sources
+            .borrow_mut()
+            .insert(module.module.as_any().addr(), source.0);
+    }
+
     /// Link the module and everything the registry resolves for it
     /// (spec 16.2.1.6.1.2).
     pub fn instantiate_module(&mut self, module: &JsModule) -> Result<(), JsError> {

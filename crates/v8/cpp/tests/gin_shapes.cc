@@ -323,7 +323,12 @@ v8::Global<v8::Module> module_dependency;
 
 v8::MaybeLocal<v8::Module> ResolveModule(v8::Local<v8::Context>,
                                         v8::Local<v8::String> specifier,
+                                        v8::Local<v8::FixedArray> import_attributes,
                                         v8::Local<v8::Module>) {
+  // `dep.js` is imported without a `with` clause, so V8 hands an empty array.
+  if (import_attributes->Length() != 0) {
+    return v8::MaybeLocal<v8::Module>();
+  }
   v8::String::Utf8Value text(nullptr, specifier);
   if (*text != nullptr && strcmp(*text, "dep.js") == 0 &&
       !module_dependency.IsEmpty()) {

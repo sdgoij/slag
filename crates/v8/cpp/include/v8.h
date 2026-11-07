@@ -1400,9 +1400,21 @@ enum class ModuleStatus {
 class Module;
 
 /* The host's resolver, called for each import a module declares
- * (`v8::ResolveModuleCallback`). Returning an empty handle is a failed link. */
+ * (`v8::Module::ResolveModuleCallback`): the specifier, the request's import
+ * attributes as V8's `[key, value, offset, …]` array, and the importing module.
+ * Returning an empty handle is a failed link. */
 using ResolveModuleCallback = MaybeLocal<Module> (*)(Local<Context> context,
                                                      Local<String> specifier,
+                                                     Local<FixedArray> import_attributes,
+                                                     Local<Module> referrer);
+
+/* The host's answer for a source-phase import
+ * (`v8::Module::ResolveSourceCallback`): the Module Source Object the binding
+ * takes, which for Slag is the record's `%AbstractModuleSource%` unless the
+ * host supplies one. */
+using ResolveSourceCallback = MaybeLocal<Object> (*)(Local<Context> context,
+                                                     Local<String> specifier,
+                                                     Local<FixedArray> import_attributes,
                                                      Local<Module> referrer);
 
 /* A module record (`v8::Module`). The facade object is a handle over the
@@ -1420,9 +1432,12 @@ class Module : public Data {
   Maybe<bool> IsSyntheticModule() const;
 
   /* Link the module and its imports, asking `callback` for each specifier in
-   * the graph (`Module::InstantiateModule`). */
+   * the graph (`Module::InstantiateModule`). A source-phase import also offers
+   * its specifier to `source_callback`, whose answer is the Module Source
+   * Object the binding takes. */
   Maybe<bool> InstantiateModule(Local<Context> context,
-                                ResolveModuleCallback callback);
+                                ResolveModuleCallback callback,
+                                ResolveSourceCallback source_callback = nullptr);
   MaybeLocal<Value> Evaluate(Local<Context> context);
   Location SourceOffsetToLocation(int offset) const;
 };

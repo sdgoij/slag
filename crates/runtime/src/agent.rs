@@ -1027,6 +1027,11 @@ pub(crate) struct AgentRoots {
     /// Host-provided module sources, keyed by specifier (HostResolveImportedModule).
     pub(crate) host_modules:
         RefCell<std::collections::HashMap<crux::string::JsString, crate::module::HostModuleSource>>,
+    /// Host-provided Module Source Objects for a source-phase import
+    /// (`v8::Module::ResolveSourceCallback`), keyed by the module record's
+    /// address. A record the host did not name gets the standard
+    /// `%AbstractModuleSource%` the engine builds.
+    pub(crate) host_module_sources: RefCell<std::collections::HashMap<usize, Value>>,
     /// The module behind each namespace object, keyed by object identity.
     pub(crate) module_namespaces:
         RefCell<std::collections::HashMap<u64, Handle<crate::module::SourceTextModule>>>,
@@ -1495,6 +1500,7 @@ impl AgentRoots {
             string_iter_data: RefCell::new(IdMap::default()),
             regexp_string_iter_data: RefCell::new(IdMap::default()),
             host_modules: RefCell::new(std::collections::HashMap::new()),
+            host_module_sources: RefCell::new(std::collections::HashMap::new()),
             module_namespaces: RefCell::new(std::collections::HashMap::new()),
             deferred_namespaces: RefCell::new(std::collections::HashMap::new()),
             module_sources: RefCell::new(std::collections::HashMap::new()),
@@ -1800,6 +1806,13 @@ impl Trace for AgentRoots {
         for (key, value) in host_modules.iter() {
             key.trace(visit);
             value.trace(visit);
+        }
+        let Ok(host_module_sources) = self.host_module_sources.try_borrow() else {
+            crux::heap::note_aborted_trace();
+            return;
+        };
+        for source in host_module_sources.values() {
+            source.trace(visit);
         }
         self.module_namespaces.trace(visit);
         self.deferred_namespaces.trace(visit);

@@ -2942,7 +2942,8 @@ Maybe<bool> Module::IsSyntheticModule() const {
 }
 
 Maybe<bool> Module::InstantiateModule(Local<Context> context,
-                                      ResolveModuleCallback callback) {
+                                      ResolveModuleCallback callback,
+                                      ResolveSourceCallback source_callback) {
   if (context.IsEmpty() || callback == nullptr) return Maybe<bool>();
   auto* current = reinterpret_cast<Context*>(
       static_cast<uintptr_t>(context.raw()));
@@ -2952,18 +2953,42 @@ Maybe<bool> Module::InstantiateModule(Local<Context> context,
   std::vector<Module*> work{this};
   for (size_t i = 0; i < work.size(); ++i) {
     Module* module = work[i];
-    const int count = module->GetModuleRequestsLength();
+    Local<FixedArray> requests = module->GetModuleRequests();
+    const int count = requests->Length();
     for (int request = 0; request < count; ++request) {
-      Local<String> specifier = module->GetModuleRequest(request);
+      Local<ModuleRequest> entry = requests->Get(request).As<ModuleRequest>();
+      Local<String> specifier = entry->GetSpecifier();
       if (specifier.IsEmpty()) return Maybe<bool>();
+      Local<FixedArray> import_attributes = entry->GetImportAttributes();
+      Local<Module> referrer = ModuleHandle(ModuleOf(module));
+
       Local<Module> resolved;
-      if (!callback(context, specifier, ModuleHandle(ModuleOf(module)))
+      if (!callback(context, specifier, import_attributes, referrer)
                .ToLocal(&resolved)) {
         return Maybe<bool>();
       }
       if (resolved.IsEmpty()) return Maybe<bool>();
       auto* dependency = reinterpret_cast<Module*>(
           static_cast<uintptr_t>(resolved.raw()));
+
+      /* A source-phase import binds a Module Source Object, and V8 asks only the
+       * source callback for one. This linker resolves every request from a
+       * module record, so the module callback ran above and its record is what
+       * the host's source is attached to. */
+      if (source_callback != nullptr &&
+          entry->GetPhase() == ModuleImportPhase::kSource) {
+        Local<Object> source;
+        if (!source_callback(context, specifier, import_attributes, referrer)
+                 .ToLocal(&source)) {
+          return Maybe<bool>();
+        }
+        if (source.IsEmpty()) return Maybe<bool>();
+        if (slag_module_register_source(current->slag(), ModuleOf(dependency),
+                                        source.raw()) != 0) {
+          return Maybe<bool>(false);
+        }
+      }
+
       if (slag_module_register(current->slag(), ModuleOf(dependency),
                                specifier.raw()) != 0) {
         return Maybe<bool>(false);

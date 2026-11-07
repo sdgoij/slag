@@ -659,6 +659,10 @@ int32_t slag_module_source_offset_to_location(const SlagModule* module, int32_t 
                                               int32_t* line, int32_t* column);
 int32_t slag_module_register(SlagContext* context, const SlagModule* module,
                              uint64_t specifier);
+/* Name the Module Source Object a source-phase import of `module` binds
+ * (`v8::Module::ResolveSourceCallback`); `source` is a value. */
+int32_t slag_module_register_source(SlagContext* context, const SlagModule* module,
+                                    uint64_t source);
 int32_t slag_module_instantiate(SlagContext* context, const SlagModule* module);
 int32_t slag_module_evaluate(SlagContext* context, const SlagModule* module,
                              uint64_t* out);

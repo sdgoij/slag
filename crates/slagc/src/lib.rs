@@ -1544,6 +1544,28 @@ pub unsafe extern "C" fn slag_module_register(
     }
 }
 
+/// Name the Module Source Object that a source-phase import of `module` binds
+/// (`v8::Module::ResolveSourceCallback`); `source` is a value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slag_module_register_source(
+    context: *mut SlagContext,
+    module: *const SlagModule,
+    source: u64,
+) -> i32 {
+    let Some(context) = context.as_ref() else {
+        return 2;
+    };
+    let Some(module) = module.as_ref() else {
+        return 2;
+    };
+    let Ok(mut engine) = context.context.try_borrow_mut() else {
+        reentrant(context);
+        return 1;
+    };
+    engine.register_module_source(&module.module, JsValue::from_bits(source));
+    0
+}
+
 /// Link the module and everything the registry resolves for it
 /// (`Module::InstantiateModule`).
 #[unsafe(no_mangle)]

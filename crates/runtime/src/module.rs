@@ -671,6 +671,19 @@ pub(crate) fn module_source_object(
     agent: &mut Agent,
     module: &Handle<SourceTextModule>,
 ) -> Result<Value, JsError> {
+    // A host that supplies the ModuleSource itself (`v8::Module`'s
+    // ResolveSourceCallback) decides what a source-phase import of this record
+    // binds, including for a kind the engine cannot represent (a source text
+    // module has an empty [[ModuleSource]]).
+    if let Some(source) = agent
+        .roots
+        .host_module_sources
+        .borrow()
+        .get(&module.as_any().addr())
+        .copied()
+    {
+        return Ok(source);
+    }
     // GetModuleSource: a Module Record with no source representation (every
     // ECMA-262 Module Record, i.e. a Source Text Module) has an *empty*
     // [[ModuleSource]], so a source-phase import of it throws a SyntaxError

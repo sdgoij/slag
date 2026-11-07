@@ -77,3 +77,8 @@ target_link_libraries(microtasks PRIVATE v8_facade)
 # specifier, phase, source offset, and attributes Blink's module machinery reads.
 add_executable(module-requests tests/module_requests.cc)
 target_link_libraries(module-requests PRIVATE v8_facade)
+
+# Module linking with V8 15's resolver shapes: the attributes array the module
+# callback receives, and the source callback a source-phase import binds.
+add_executable(module-link tests/module_link.cc)
+target_link_libraries(module-link PRIVATE v8_facade)
