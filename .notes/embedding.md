@@ -2676,7 +2676,7 @@ Gates: `cargo fmt --all -- --check` clean; `cargo test -p runtime --lib` **829 p
 
 **The realm's global function properties — landed, and deno's `create_blob` now stops on a class constructor.** The sixth part of ledger item 16, and the naming step the record above measured.
 
-*The spec names them, so the registry is the right home.* `builtins/global.rs::install` created the global function properties as builtins on the global object and never registered them, so `isFinite` was a built-in the walk could not name. It now registers each one under the spec's own well-known name — `%isFinite%`, `%isNaN%`, `%parseFloat%`, `%parseInt%`, `%encodeURI%`, `%encodeURIComponent%`, `%decodeURI%`, `%decodeURIComponent%`, and Annex B's `%escape%`/`%unescape%` — in the same table `%eval%` (`realm.rs:509`) already sits in. The names are the spec's, not invented: `spec.html` lists every one in the well-known intrinsics table and defines each as an intrinsic object ("This function is the %isFinite% intrinsic object", "It is the %escape% intrinsic object"), and the table's own documentation ("the intrinsic registry (spec 9.3.1): %-named values installed by each built-in phase") is exactly what these are. Nothing in the format moved: `REC_INTRINSIC` already carries a name, and the restore resolves it in the realm being rebuilt.
+*The spec names them, so the registry is the right home.* `builtins/global.rs::install` created the global function properties as builtins on the global object and never registered them, so `isFinite` was a built-in the walk could not name. It now registers each one under the spec's own well-known name — `%isFinite%`, `%isNaN%`, `%parseFloat%`, `%parseInt%`, `%encodeURI%`, `%encodeURIComponent%`, `%decodeURI%`, `%decodeURIComponent%`, and Annex B's `%escape%`/`%unescape%` — in the same table `%eval%` (`realm.rs:509`) already sits in. The names are the spec's, not invented: `ecma262/spec.html` lists every one in the well-known intrinsics table and defines each as an intrinsic object ("This function is the %isFinite% intrinsic object", "It is the %escape% intrinsic object"), and the table's own documentation ("the intrinsic registry (spec 9.3.1): %-named values installed by each built-in phase") is exactly what these are. Nothing in the format moved: `REC_INTRINSIC` already carries a name, and the restore resolves it in the realm being rebuilt.
 
 *Tests.* One in the engine, over all ten names: the name is in the blob, and a restore **into a second realm** answers that realm's own function rather than the writer's — the strong form, since a copy would carry the writer's identity. (The reading realm is created *after* the value is in hand, because the api makes the last context created current and the evals have to run in the writer's; the reader's own function is read from its intrinsic table rather than by an eval for the same reason.) One in the bridge: `isFinite` attached as context data, called from a script after the restore. Two mutations: dropping the registration fails the ten-name test with the refusal this slice removes ("a built-in function"), and misspelling one name fails the *blob-content* assertion — the one that pins the name, which is the format's compatibility surface, since a name registered on both sides would otherwise round trip under any spelling.
 
@@ -6839,11 +6839,13 @@ a frame view of the running stack. §7's survey already split the subsystem: the
   *What the source is, per the spec, and why that is the whole design.*
   ClassDefinitionEvaluation sets `ctorFunc.[[SourceText]]` to the **class source
   text** for the explicit *and* the implicit constructor — the set is a sibling
-  of the empty/non-empty branch, not inside it (spec.html:25789-25795) — and
+  of the empty/non-empty branch, not inside it
+  (ecma262/spec.html, sec-runtime-semantics-classdefinitionevaluation) — and
   `Function.prototype.toString` answers `[[SourceText]]` when it is not empty
-  (spec.html:31977-31978). The engine captures the explicit constructor's
-  *method* span today, only as a body-cache key, and stores **no** source for the
-  record: so a class constructor answers the native form, which the four
+  (ecma262/spec.html, sec-function.prototype.tostring). The engine captures the
+  explicit constructor's *method* span today, only as a body-cache key, and
+  stores **no** source for the record: so a class constructor answers the native
+  form, which the four
   `builtins/Function/prototype/toString/class-*-ctor.js` fixtures cannot see
   because `assertToStringOrNativeFunction` accepts that branch. So the record's
   source is not a convenience — it is the spec's own slot, and the same slot the
@@ -7264,12 +7266,14 @@ a frame view of the running stack. §7's survey already split the subsystem: the
     GeneratorMethod, AsyncMethod and AsyncGeneratorMethod each set
     `[[SourceText]]` to the source text matched by that production — the property
     name and the parameter list, with no `function` keyword
-    (spec.html:24626-24715) — which is what the engine captures for a method
-    today. An **accessor** is a MethodDefinition alternative
-    (`get ClassElementName ( ) { FunctionBody }`), so its source is
-    `get x() {}` *including* the keyword (spec.html:24653-24670) — and that is the
-    half the engine keeps nothing for, because the AST nodes for `get`/`set`
-    carry no span covering the keyword. It is the **second half** of this part.
+    (ecma262/spec.html, sec-runtime-semantics-definemethod) — which is what the
+    engine captures for a method today. An **accessor** is a MethodDefinition
+    alternative (`get ClassElementName ( ) { FunctionBody }`), so its source is
+    `get x() {}` *including* the keyword
+    (ecma262/spec.html, sec-runtime-semantics-methoddefinitionevaluation) — and
+    that is the half the engine keeps nothing for, because the AST nodes for
+    `get`/`set` carry no span covering the keyword. It is the **second half** of
+    this part.
   - **The parse entry had been doing the wrong thing quietly, and the mutation
     sweep is what showed it.** `parse_function_expression` consumes the
     `function` keyword *without checking it*, so `parse_function` reads a

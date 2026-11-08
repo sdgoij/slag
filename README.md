@@ -16,9 +16,9 @@ embedding API, and drop-in JavaScriptCore C-API bindings.
 
 ## Highlights
 
-- **Spec-faithful** — written chapter-by-chapter against the vendored
-  `spec.html`; abstract operations keep the spec's names, ordering, and
-  edge cases so conformance bugs are easy to diff.
+- **Spec-faithful** — written chapter-by-chapter against the `ecma262`
+  submodule's `spec.html`; abstract operations keep the spec's names,
+  ordering, and edge cases so conformance bugs are easy to diff.
 - **Conformant** — 51,998 passing fixtures, **0 failures / 0 crashes /
   0 hangs** across 51,998 `test262` fixtures (runnable-only; see
   `.notes/conformance.md`). Proper tail calls: 34/34 `tco-*`. Workspace

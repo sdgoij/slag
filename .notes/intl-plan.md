@@ -4,7 +4,7 @@ This is the engineering spec for implementing the ECMA-402 Intl API. The
 reference is the vendored `ecma402.html` (the rendered spec from
 https://tc39.es/ecma402/ — the current ECMAScript 2027 draft era, which
 matches the proposal-stage features the corpus tests; the live URL is
-the fallback reference). The vendored `spec.html` is ECMA-262 only. The
+the fallback reference). The `ecma262` submodule's `spec.html` is ECMA-262 only. The
 regression net is the `intl402` fixture area of the pinned test262
 submodule — the corpus encodes the exact locale data this implementation
 must match.

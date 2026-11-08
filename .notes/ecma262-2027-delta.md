@@ -1,9 +1,9 @@
 # ECMAScript 2027 (18th edition): the 2026 → 2027 delta
 
-**Status: audited 2026-10-06.** The edition bump is nomenclature. The vendored
-`spec.html` refresh (`cced75e`) plus one engine-side rename are the entire
-change; no 2027 clause adds a conformance requirement the engine does not
-already meet. The pinned test262 — updated upstream to the current era — passes
+**Status: audited 2026-10-06.** The edition bump is nomenclature. The
+`ecma262/spec.html` refresh (`cced75e`; the file now lives in the `ecma262`
+submodule) plus one engine-side rename are the entire change; no 2027 clause
+adds a conformance requirement the engine does not already meet. The pinned test262 — updated upstream to the current era — passes
 100% (`sweep all` 48,632 pass / 0 fail / 1 stale skip of 48,633; `sweep intl402`
 3,365 / 0), which is the empirical confirmation.
 
@@ -17,7 +17,7 @@ document and corrected the docs.
 ## 1. How the delta was measured
 
 The two vendored revisions are `HEAD~1:spec.html` (the older 2027 draft) and
-`spec.html` (the refresh). The diff is done on **tag-stripped text**, because a
+`ecma262/spec.html` (the refresh). The diff is done on **tag-stripped text**, because a
 raw HTML line-diff of a 3 MB ecmarkup build is unreadable and the line churn is
 mostly rewrapping:
 
@@ -25,7 +25,7 @@ mostly rewrapping:
 git show HEAD~1:spec.html > scratch/spec_old.html
 # norm.js: split tags to lines, strip tags, collapse whitespace, drop blanks
 node scratch/norm.js scratch/spec_old.html scratch/spec_old.txt
-node scratch/norm.js spec.html        scratch/spec_new.txt
+node scratch/norm.js ecma262/spec.html scratch/spec_new.txt
 diff -u scratch/spec_old.txt scratch/spec_new.txt     # -> spec_diff.txt
 ```
 

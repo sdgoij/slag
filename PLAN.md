@@ -1,12 +1,12 @@
 # slag — JavaScript Runtime: Implementation Plan
 
 **Target:** a from-scratch, spec-faithful JavaScript engine in Rust that implements the complete
-ECMAScript® 2027 Language Specification (18th edition), as captured in [`spec.html`](spec.html).
+ECMAScript® 2027 Language Specification (18th edition), as captured in [`ecma262/spec.html`](ecma262/spec.html).
 **Goal state:** a `cargo` workspace whose members live under `crates/`, able to parse and execute
 arbitrary ES2026 source, pass the vast majority of the official `test262` conformance suite, and
 expose a small embedding API plus a CLI/REPL.
 
-This plan is written chapter-by-chapter against `spec.html`. Phase numbers below are an
+This plan is written chapter-by-chapter against `ecma262/spec.html`. Phase numbers below are an
 engineering order, **not** the spec chapter order; each phase lists the spec sections it consumes.
 
 ---
@@ -20,7 +20,7 @@ Build a JavaScript engine in Rust that is:
    control flow, and (eventually) the shared-memory model.
 2. **Spec-faithful** — implementation follows the spec's abstract operations and algorithms
    closely (same names, same ordering, same edge cases), so conformance bugs are easy to find by
-   diffing against `spec.html`.
+   diffing against `ecma262/spec.html`.
 3. **Tested** — every phase ships with unit tests, and the project tracks `test262` pass rates as
    its primary correctness metric.
 4. **Usable** — a `slag` CLI (script runner + REPL) and a `runtime::Context` embedding API.
@@ -29,7 +29,7 @@ Build a JavaScript engine in Rust that is:
 
 **In scope**
 
-- All of ECMA-262 (2027): chapters 1–28 of `spec.html`, including Annex B legacy behaviors,
+- All of ECMA-262 (2027): chapters 1–28 of `ecma262/spec.html`, including Annex B legacy behaviors,
   explicit resource management (`using` / `await using`, `DisposableStack`, `AsyncDisposableStack`,
   `SuppressedError`), the full standard library (including ES2026 additions: `Math.sumPrecise`,
   `Iterator.concat`, `Array.fromAsync`, `Error.isError`, `Map`/`WeakMap` `getOrInsert(Computed)`,
@@ -39,7 +39,7 @@ Build a JavaScript engine in Rust that is:
 
 **Non-goals (explicitly deferred or out of scope)**
 
-- **ECMA-402 (Intl)** — not part of `spec.html`. Locale-sensitive methods (`toLocaleString`,
+- **ECMA-402 (Intl)** — not part of `ecma262/spec.html`. Locale-sensitive methods (`toLocaleString`,
   `toLocaleLowerCase`, `localeCompare`, …) are implemented per the "no Intl" behavior the spec
   permits (usually identity with their non-locale counterparts). A later `slag-intl` crate could
   add Intl on top.
@@ -316,7 +316,7 @@ Rust convention. A public function with no inline test is a merge-blocking defec
 
 1. **Inline unit tests (mandatory, per the rule above)** — every crate tests its algorithms
    (conversions, number formatting, lexing, parsing, matcher, each built-in). Use the spec's own
-   examples from `spec.html` as test vectors.
+   examples from `ecma262/spec.html` as test vectors.
 2. **test262** (the north star) — vendor the official suite (git clone `tc39/test262`) once
    network access is available; commit a pinned revision under `test262/` (or use a git submodule).
    `test262`:
