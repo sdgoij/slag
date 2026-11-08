@@ -4069,6 +4069,27 @@ mod tests {
         );
     }
 
+    /// The vector-free receiver's warm store writes the map field at the shape
+    /// cell's pinned ordinal and refreshes the read cell without bumping, so a
+    /// read after the write in the same iteration sees the new value, and two
+    /// same-shape instances keep their own field values.
+    #[test]
+    fn deferred_field_warm_store_reads_back_and_is_per_instance() {
+        assert_eq!(
+            run("var a = { x: 1 }, b = { x: 10 }, s = 0; \
+                 for (var i = 0; i < 3; i++) { a.x = a.x + 1; b.x = b.x + 1; s += a.x + b.x; } \
+                 s + ':' + a.x + ':' + b.x")
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("45:4:13")))
+        );
+        // A hole is an absent property: the first write is a define, the
+        // second is the warm in-place update, and both are visible.
+        assert_eq!(
+            run("var o = {}; o.x = 1; o.x = o.x + 1; o.x").unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
     #[test]
     fn for_let_head_is_lexical_not_a_global_var() {
         // A `let`-headed for loop must not create a global binding (the

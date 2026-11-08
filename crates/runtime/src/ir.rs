@@ -7091,6 +7091,13 @@ impl Vm {
         let Some(object) = Self::store_cell_object(base) else {
             return false;
         };
+        // A vector-free receiver keeps its own properties in map fields, so the
+        // (id, name) cell's vector slot cannot serve it (`write_data_property_slot`
+        // declines an empty vector). The shared shape cell pins the descriptor
+        // ordinal instead: a hit writes the field with no descriptor scan.
+        if object.props_deferred.get() {
+            return Self::warm_store_deferred(agent, &object, name, value);
+        }
         let index = Self::member_write_cell_index(object.id(), name);
         let Some(cell) = agent.member_write_cells[index] else {
             return Self::warm_store_fallback(agent, &object, name, value);
@@ -7205,6 +7212,71 @@ impl Vm {
         true
     }
 
+    /// The vector-free receiver's warm store: the shared `(map id, name)`
+    /// shape cell pins the descriptor ordinal, so a hit writes the inline field
+    /// with no `map.find`/descriptor scan. A hole on this instance is an absent
+    /// property (the store is a define), so the probe declines to the same
+    /// cold path [`Self::warm_store_fallback`] uses.
+    fn warm_store_deferred(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        value: Value,
+    ) -> bool {
+        let Some(map) = object.map.get() else {
+            return false;
+        };
+        let map_id = map.id();
+        let shape_index = Self::member_map_cell_index(map_id, name);
+        let cell = agent.member_map_cells[shape_index];
+        if cell.map_id == map_id
+            && cell.name == name
+            && cell.writable != 0
+            && object.deferred_field_write_at(cell.slot, value)
+        {
+            Self::refresh_written_value_cell(agent, object, name, value);
+            return true;
+        }
+        let key = PropertyKey::String(name);
+        let Some(field) = object.deferred_field_write_field(&key, value) else {
+            return false;
+        };
+        let (proto_id, proto_gen) = Self::member_map_proto(object);
+        agent.member_map_cells[shape_index] = MemberMapCell {
+            map_id,
+            name,
+            slot: field,
+            clean: 0,
+            proto_id,
+            proto_gen,
+            writable: 1,
+            count: map.descriptor_count() as u32,
+        };
+        Self::refresh_written_value_cell(agent, object, name, value);
+        true
+    }
+
+    /// Front the read-side value cell with a no-bump in-place value write (see
+    /// `JsObject::write_data_property_slot`): the write changed no shape, so the
+    /// recorded generation stays current, and the next read (and the compiled
+    /// probe) must hit without a re-resolve. A global receiver also refreshes
+    /// the name-keyed global-value cell.
+    fn refresh_written_value_cell(
+        agent: &mut Agent,
+        object: &Handle<crux::object::JsObject>,
+        name: crux::AtomId,
+        value: Value,
+    ) {
+        let read_index = Self::member_cell_index(object.id(), name);
+        agent.roots.member_value_cells[read_index].set(MemberValueCell {
+            id: object.id(),
+            name,
+            generation: object.generation(),
+            value,
+        });
+        Self::refresh_global_read_cell(agent, object, name, value);
+    }
+
     /// The cell-miss chain of [`Self::warm_store_put`]: the shape-keyed
     /// cell first (a same-shape working set shares one (map id, name)
     /// entry), then the direct own-data slot write for keys the map does not
@@ -7228,14 +7300,6 @@ impl Vm {
         if object.properties.borrow().is_empty() {
             let key = PropertyKey::String(name);
             if let Some(field) = object.deferred_field_write_field(&key, value) {
-                let generation = object.generation();
-                let read_index = Self::member_cell_index(object.id(), name);
-                agent.roots.member_value_cells[read_index].set(MemberValueCell {
-                    id: object.id(),
-                    name,
-                    generation,
-                    value,
-                });
                 // Warm the compiled store's map-keyed shape cell too: a hit
                 // routes the next write through the inline deferred field
                 // update instead of the helper. A map id pins the descriptor
@@ -7257,7 +7321,7 @@ impl Vm {
                         count: map.descriptor_count() as u32,
                     };
                 }
-                Self::refresh_global_read_cell(agent, object, name, value);
+                Self::refresh_written_value_cell(agent, object, name, value);
                 return true;
             }
             return false;

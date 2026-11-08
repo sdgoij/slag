@@ -18304,3 +18304,41 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
 --workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
 built-ins 23821/23821 in BOTH modes; corpus 79/79 identical across parent/new,
 jit/jitless, and `--gc-stress`.
+
+## LANDED (2026-11-07): a vector-free store uses its shape cell, not a map scan
+
+`fn_object`/`object` update a vector-free (deferred) object per iteration
+(`o.a = o.a + 1`). `warm_store_put` probed the `(id, name)` write cell first;
+that cell's `write_data_property_slot` needs a property vector, so a deferred
+receiver always declined to `warm_store_fallback`, whose `deferred_field_write_field`
+ran `map.find` + `descriptor_at` per store. The shape cell it recorded there —
+`(map id, name) → descriptor ordinal` — was never consulted by the interpreter,
+only by the compiled store.
+
+`warm_store_put` now routes a deferred receiver to a dedicated path before the
+`(id, name)` cell. A shape-cell hit writes `in_fields[ordinal]` directly
+(`JsObject::deferred_field_write_at`), skipping the descriptor scan; the cold
+path resolves once and records the cell. The shape cell is shared by a map, so
+the write re-checks THIS instance's field is written (a hole is an absent
+property, and the store is a define that declines to the full [[Set]]), and the
+writable bit comes from the map descriptor pinned by the immutable map id. The
+value-cell refresh stays the L1c no-bump discipline (shared with the old
+fallback).
+
+| row | before | after |
+| --- | ---: | ---: |
+| `fn_object` | 68-77 ms | **63-67** (-7%) |
+| `fn_object` instructions / cycles | 1.236B / 200.5M | **1.142B / 187.0M** (-7.6% / -6.7%) |
+| `object` | 77-88 ms | **70-74** (-6.5%) |
+| `object` instructions / cycles | 1.266B / 225.6M | **1.172B / 211.7M** (-7.4% / -6.2%) |
+
+`njit/bs`: `fn_object` 1.97 -> 1.88, `object` 1.43 -> 1.28. The same suite run's
+`sieve` (+14.5%) and `local` (+3.8%) readings are layout: their instruction
+counts match the parent to 0.01%. A new test
+(`deferred_field_warm_store_reads_back_and_is_per_instance`) pins the
+read-after-write and two-instances-one-shape cases.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; runtime 1150 +
+the new test; `cargo test --workspace` green serialized; test262 language
+23726/23726, annexB 1086/1086, built-ins 23821/23821 in BOTH modes; corpus
+79/79 identical across parent/new, jit/jitless, and `--gc-stress`.

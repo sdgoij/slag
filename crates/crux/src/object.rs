@@ -3705,6 +3705,26 @@ impl JsObject {
         Some(offset)
     }
 
+    /// Write a value into a written inline field at a known descriptor
+    /// ordinal, skipping the `map.find`/descriptor scan. The caller must have
+    /// validated the map id that pins the ordinal and the descriptor's
+    /// writable attribute (maps are immutable, so a matching id pins both);
+    /// the runtime's shape cell carries exactly that record. This still
+    /// re-checks the vector-free state, bounds the ordinal, and that THIS
+    /// instance's field is written: a hole is an absent property, so the store
+    /// is a define and must take the full [[Set]].
+    pub fn deferred_field_write_at(&self, field: usize, value: Value) -> bool {
+        if !self.props_deferred.get()
+            || field >= INLINE_FIELDS
+            || self.in_fields[field].get().is_uninitialized()
+        {
+            return false;
+        }
+        crate::heap::write_barrier(self, value);
+        self.in_fields[field].set(value);
+        true
+    }
+
     /// Rebuild `properties` from the map descriptors and clear the
     /// `props_deferred` bit (Option-3 vector-free exit). While the bit is
     /// set the vector is empty and NOT authoritative: every own property is
