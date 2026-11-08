@@ -18342,3 +18342,23 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; runtime 1150 +
 the new test; `cargo test --workspace` green serialized; test262 language
 23726/23726, annexB 1086/1086, built-ins 23821/23821 in BOTH modes; corpus
 79/79 identical across parent/new, jit/jitless, and `--gc-stress`.
+
+## LANDED (2026-11-07): a warm CallFastIdent callee skips the load wrapper
+
+`do_call_fast_ident` (an environment callee — `fib`'s recursion) called
+`load_ident_value`, whose first branch IS the same `env_constant &&
+globals_unshadowed && try_global_cell_read` probe the call needs; the call then
+paid the wrapper's `Result` and its own function frame on every activation. The
+handler now performs that probe directly and falls back to `load_ident_value`
+only when the cell misses.
+
+`fib` in `--jitless`, same-session interleaved control: 290-304 -> **283-288
+ms**, 4.132B -> **4.054B** instructions (-1.9%), 864M -> 852M cycles (-1.4%).
+The 5-round suite row reads 289 -> 284 (-1.7%). JIT mode is instruction-identical
+(`fib` 1.2153B on both sides) because the compiled body never enters this
+handler; every other suite row also matches the parent's instruction count.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821 in BOTH modes; corpus 79/79 identical across parent/new,
+jit/jitless, and `--gc-stress`.

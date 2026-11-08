@@ -16455,7 +16455,16 @@ impl Vm {
         argc: usize,
         env_constant: bool,
     ) -> Result<(), JsError> {
-        let callee = self.load_ident_value(agent, name, env_constant)?;
+        let callee = if env_constant
+            && self.globals_unshadowed
+            && let Some(value) = self.try_global_cell_read(agent, name)
+        {
+            // The warm cell is the whole read; skip the `load_ident_value`
+            // wrapper (and its `Result`) on the hot self-call path.
+            value
+        } else {
+            self.load_ident_value(agent, name, env_constant)?
+        };
         let mut leaf_known_not = false;
         if let Some(payload) = callee.heap_payload() {
             let index = Self::value_leaf_index(payload);
