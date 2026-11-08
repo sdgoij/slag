@@ -18271,3 +18271,36 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; runtime 1150
 passed; `cargo test --workspace` green serialized; test262 language 23726/23726,
 annexB 1086/1086, built-ins 23821/23821 in BOTH modes; corpus 79/79 identical
 across parent/new, jit/jitless, and `--gc-stress`.
+
+## LANDED (2026-11-07): the stack-callee leaf cache holds a real call site's set
+
+The `closures` row calls `fns[i & 63](i)`: 64 leaf closures through one
+register-lane `CallFast`. The leaf cache's value half (`SLOT_LEAF_CELLS` 256,
+so 128 cells) only hit 1 call in 8 — the 64 payloads collided into a handful of
+cells — so 7 calls in 8 paid `fast_call_core`'s guards, `leaf_lookup`, and a
+fresh `SlotLeafCell` clone/drop, then ran the leaf anyway. The table is 1024
+(512 value cells) now, and the cached entry is the whole call.
+
+| `closures` (jitless) | before | after |
+| --- | ---: | ---: |
+| wall | 92-99 ms | **78-82** (-17%) |
+| instructions | 1.431B | **1.248B** (-12.7%) |
+| cycles | 275.5M | **234.4M** (-14.9%) |
+
+`njit/bs` goes 2.58 -> 2.14. In the new profile `fast_call_core` and
+`leaf_lookup` are gone; the call is `run_leaf_entry` (328M) plus
+`do_call_fast` (110M) per 1M iterations.
+
+Size, not hashing, is the lever. 512 cells still thrashed (92 ms); a full
+64-bit finalizer over the payload at 128 cells got only partway (1.340B), and
+keeping the multiply's high bits (`>> 40`, the `computed_read_cell_index`
+discipline) was no better (~90 ms). 1024 and 2048 measure the same, so 1024 is
+the size. The table is boxed, so the Agent's inline layout does not grow, and
+every other suite row is instruction-identical (`capture2`, `fn_forin`,
+`fn_object`, `local` and `fib` match to 0.01%; JIT mode likewise) — the row's
++7-9% wall readings in the same suite run are layout noise.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821 in BOTH modes; corpus 79/79 identical across parent/new,
+jit/jitless, and `--gc-stress`.

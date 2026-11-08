@@ -3693,10 +3693,11 @@ impl Trace for SlotLeafCell {
 /// The direct-mapped slot-callee leaf cache size (Cut 35 slice 12): a
 /// power of two so the index is a mask. The upper half serves value callees
 /// (`fns[i](x)` and other calls whose callee arrives on the stack), so it
-/// must hold a call site's cycling callee set: 32 cells thrashed on the
-/// 64-closure bench and sent every call through `fast_call_core`'s full
-/// lookup.
-pub(crate) const SLOT_LEAF_CELLS: usize = 256;
+/// must hold a call site's cycling callee set. 256 still thrashed the
+/// 64-closure bench (7 calls in 8 missed, the set colliding into a handful of
+/// cells) and sent every miss through `fast_call_core`'s full lookup and a
+/// cache rewrite; 1024 holds the set and the leaf hit becomes the whole call.
+pub(crate) const SLOT_LEAF_CELLS: usize = 1024;
 
 /// The leaf-inline cache site (Cut 35 slice 12): which per-call-site
 /// cache, if any, the resolved leaf entry is written to on the first
