@@ -4126,13 +4126,17 @@ impl Drop for ActiveRunGuard {
 /// caller's `globals_unshadowed` verdict, and the shared value/array-index/
 /// `var`-reference/class cursors (saved, and truncated back on restore so a
 /// nested run's error path cannot leak an entry into the caller).
+///
+/// The string builder is NOT in here: it is 72 bytes and active across a call
+/// only for a `s += f(...)` append loop, so saving it by value put it in every
+/// activation's copy. An active builder parks on `Vm::saved_builders` instead,
+/// and `builder_saved` records that it did.
 #[derive(Debug)]
 pub(crate) struct VmScratch {
     ip: usize,
     acc: Value,
     loop_counter: f64,
     loop_num: f64,
-    builder: Builder,
     completion: Value,
     completion_is_empty: bool,
     switch_disc: Value,
@@ -4159,6 +4163,9 @@ pub(crate) struct VmScratch {
     /// (`certified_call_inline`); restore must reset it to the caller's base
     /// even when the depth did not change.
     env_swapped: bool,
+    /// Whether the caller's active string builder was moved onto
+    /// `Vm::saved_builders` for the nested run.
+    builder_saved: bool,
     /// The caller's suspended register-program resume point (see
     /// `Vm::reg_resume`). A nested run must not observe it — a stale op index
     /// would resume the callee's program at the caller's position.
@@ -4610,6 +4617,11 @@ pub struct Vm {
     /// The active string builder for a planned `s += e` append loop (see
     /// [`Builder`]). `owner == usize::MAX` outside such a loop.
     pub(crate) builder: Builder,
+    /// Active string builders parked for the duration of a nested run on this
+    /// Vm (see [`VmScratch::builder_saved`]). Only a `s += f(...)` append loop
+    /// has a builder live across a call, so this is empty on the common path;
+    /// `Builder` holds UTF-16 units and has no GC edges, so it needs no trace.
+    saved_builders: Vec<Builder>,
     /// Completion-register saves for the `finally` blocks currently running
     /// (nested finallys push in order).
     completion_stack: Vec<(Value, bool)>,
@@ -4834,6 +4846,7 @@ impl Vm {
             loop_counter: 0.0,
             loop_num: 0.0,
             builder: Builder::inactive(),
+            saved_builders: Vec::new(),
             completion_stack: Vec::new(),
             list_stack: Vec::new(),
             var_ref_stack: Vec::new(),
@@ -4863,15 +4876,18 @@ impl Vm {
     #[inline]
     pub(crate) fn save_scratch(&mut self) -> VmScratch {
         // Read the caller's control verdict BEFORE the literal: taking it out
-        // afterwards forces a second copy of the whole ~168-byte struct on
-        // every call.
+        // afterwards forces a second copy of the whole struct on every call.
         let control_saved = self.has_control_state();
+        let builder_saved = self.builder.owner != usize::MAX;
+        if builder_saved {
+            self.saved_builders
+                .push(std::mem::replace(&mut self.builder, Builder::inactive()));
+        }
         let scratch = VmScratch {
             ip: self.ip,
             acc: self.acc,
             loop_counter: self.loop_counter,
             loop_num: self.loop_num,
-            builder: std::mem::replace(&mut self.builder, Builder::inactive()),
             completion: self.completion,
             completion_is_empty: self.completion_is_empty,
             switch_disc: self.switch_disc,
@@ -4885,6 +4901,7 @@ impl Vm {
             control_saved,
             env_len: self.env_stack.len(),
             env_swapped: false,
+            builder_saved,
             reg_resume: self.reg_resume.take(),
         };
         self.ip = 0;
@@ -5076,7 +5093,15 @@ impl Vm {
         self.acc = scratch.acc;
         self.loop_counter = scratch.loop_counter;
         self.loop_num = scratch.loop_num;
-        self.builder = scratch.builder;
+        if scratch.builder_saved {
+            self.builder = self
+                .saved_builders
+                .pop()
+                .expect("an active builder is saved before a nested run");
+        } else if self.builder.owner != usize::MAX {
+            // The caller had no builder; drop whatever the nested run left.
+            self.builder = Builder::inactive();
+        }
         self.completion = scratch.completion;
         self.completion_is_empty = scratch.completion_is_empty;
         self.switch_disc = scratch.switch_disc;
@@ -5193,6 +5218,7 @@ impl Vm {
         self.acc = Value::Undefined;
         self.loop_counter = 0.0;
         self.builder = Builder::inactive();
+        self.saved_builders.clear();
         self.completion_stack.clear();
         self.list_stack.clear();
         self.var_ref_stack.clear();
@@ -5248,6 +5274,7 @@ impl Vm {
         self.acc = Value::Undefined;
         self.loop_counter = 0.0;
         self.loop_num = 0.0;
+        self.saved_builders.clear();
     }
 
     /// Reset in place for pooling when no running context is available to

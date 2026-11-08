@@ -18234,3 +18234,40 @@ Verified: clippy --workspace --all-targets -D warnings, fmt, `cargo test
 run OOM-kills this machine); test262 language 23726/23726, annexB 1086/1086,
 built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
 parent/new, jit/jitless, and `--gc-stress`.
+
+## LANDED (2026-11-07): the string builder is parked, not copied, per activation
+
+`VmScratch` embedded the whole `Builder` (~72 bytes), so every same-stack
+activation — and every JIT self-call — copied it into the scratch and the
+`InlineCallFrame`, and `restore_scratch` wrote it back even when it was the
+inactive value. A builder is live across a call only for a `s += f(...)` append
+loop; the common call never has one. The scratch now carries a `builder_saved`
+bit, and an active builder parks on `Vm::saved_builders` (a `Vec<Builder>` whose
+inactive path is empty). Save skips the `mem::replace` entirely when inactive;
+restore skips the write when neither side has a builder, and resets only a
+builder the nested run left behind.
+
+| row | before | after |
+| --- | ---: | ---: |
+| `fib` (jitless) | 326-333 ms | **287-288** (-12.0%) |
+| `fib` instructions | 4.417B | **4.132B** (-6.5%) |
+| `fib` cycles | 977M | **862M** (-11.5%) |
+| `fib` (JIT) | 84 ms | **78** (-7.1%), cycles -4.7% |
+
+`njit/bs` on `fib` 5.38 -> **4.48** (same session, `bs` rebuilt from source).
+The JIT row moves because its self-call lane saves the same scratch: its
+instructions rise 1.1% (the builder check) while cycles fall 4.7% (the smaller
+copy). Every other suite row is within layout noise; `local` -1.5%, `object`
+-2.5%, `sieve` -1.4% in the same run.
+
+`Builder` holds only UTF-16 units, so `saved_builders` needs no trace. It is
+pool state: `reset` and `clean_after_leaf` clear it, exactly like
+`saved_control`. That reset cannot run while a scratch is parked: the
+same-stack gate (`nested_call_eligible`) excludes every `TailCall*` step, and a
+tail call is what reaches `tail_prepare_ordinary`'s `reset`. A builder-active
+probe (`s += f(i)` for 300k iterations) is flat against the parent.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; runtime 1150
+passed; `cargo test --workspace` green serialized; test262 language 23726/23726,
+annexB 1086/1086, built-ins 23821/23821 in BOTH modes; corpus 79/79 identical
+across parent/new, jit/jitless, and `--gc-stress`.
