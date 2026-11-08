@@ -7,3 +7,6 @@
 [submodule "ecma262"]
 	path = ecma262
 	url = https://github.com/tc39/ecma262
+[submodule "ecma402"]
+	path = ecma402
+	url = https://github.com/tc39/ecma402
