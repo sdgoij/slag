@@ -18182,3 +18182,55 @@ slice_concat -4.3%, opcost/json_stringify -5.7%, strings/search_slice -5.3%) are
 
 Verified: clippy -D warnings, fmt; crux 273, runtime 1090, jit 380; test262
 language 23726/23726.
+
+## LANDED (2026-11-07): an environment-callee call needs no callee/this slots
+
+The register lane's `CallFastIdent` (the `fib` shape: a call to a script global
+from inside a function body) resolved the callee and then built the canonical
+`[this, callee, args]` layout — `stack.resize(+2)` plus a `copy_within` of the
+arguments — only to call `do_call_fast`, which re-read callee/this off the stack
+and re-probed the leaf cell. `fast_call_core` already takes callee/this as
+values and reads the arguments in place, so the ident site now passes them
+directly with `below` 0: the arguments stay where the register ops pushed them
+and the result lands in their place. The negative leaf verdict is checked
+before the positive `RefCell` cell, so a warm non-leaf callee skips the borrow.
+
+The callee is also classified once. Only a `Builtin` function can be a
+registered handler or `%eval%`, and any function value is callable, so an
+ordinary EcmaScript callee (this lane's common case) skips
+`builtin_call_lookup`, `is_eval_function`, and `is_callable` — three
+`Value::kind()` handle clones and a cell probe per call. The global-cell read
+behind `load_ident_value` validates against the cached `Vm.global` handle in
+place instead of taking `global_object`'s per-call clone.
+
+Same-session interleaved control (`slag-base` built from the parent tree, 5
+rounds, min per cell; `fib` = fib(30)):
+
+- `fib` 354-360 -> **327-330 ms** (-8.1%), instructions 4.842B -> **4.417B**
+  (-8.8%), cycles 1.063B -> 981M (-7.7%). Worst-row `njit/bs` 5.87 -> 5.38
+  against a Brimstone `bs` rebuilt from source (64d6698) this session.
+- The aligned pair (`-align-all-functions=5`) still moves the row (abase
+  352-357 vs anew 340-348, instructions -8.6%), so the win is work, not layout.
+  `method`, `sieve`, `arith`, `fn_arith`, `array` and `fn_object` read +3-5% in
+  the unflagged suite but are instruction-identical on those rows (or lower)
+  and flat in the aligned pair — layout, as this file keeps recording.
+- JIT mode is neutral: `fib`/`sieve`/`fn_array` instructions match the parent to
+  0.01%; the wall swings on 15-80 ms rows are noise.
+
+**The trap: a call with no arguments and no frame grows neither stack.** The
+same-stack lane runs the callee in the driver's loop, so the native-stack guard
+never sees that recursion; the *value-stack* guard was the bound, and it used to
+be charged two slots (`this`, `callee`) per call. With the canonical layout gone,
+`function f(){ return g(); } function g(){ return f(); }` pushes nothing and
+recurse until the heap is exhausted — `runaway_recursion_is_a_catchable_range_error`
+was OOM-killed. The lane now has `MAX_SAME_STACK_DEPTH` (= `MAX_VALUE_STACK / 2`,
+the old two-slots-per-level budget). The check must live in the driver's
+`VmOutcome::Call` arm, NOT in `try_push_inline_call`: putting it there cost 4%
+of `fib`'s cycles for 0.5% of its instructions, the same inlining cliff the
+rejected control-free verdict hit.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt, `cargo test
+--workspace` green (serialized with `--test-threads=1`; the default parallel
+run OOM-kills this machine); test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
+parent/new, jit/jitless, and `--gc-stress`.

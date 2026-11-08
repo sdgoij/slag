@@ -3080,6 +3080,15 @@ const INLINE_FRAME: usize = 8;
 /// depth and bounds the per-`Vm` reservation.
 const MAX_VALUE_STACK: usize = 1 << 16;
 
+/// The same-stack lane's depth bound (see `run_inner_impl`'s call arm): the
+/// lane runs the callee in the driver's loop, so no native frame grows per
+/// level and the value-stack guard is the only bound on runaway recursion. A
+/// call site used to charge that guard two slots (`this`, `callee`) per level;
+/// a shape that pushes only its arguments (a zero-frame, zero-arg call) would
+/// otherwise never grow the stack and recurse until the heap is exhausted. This
+/// keeps the same budget without the two dead slots.
+const MAX_SAME_STACK_DEPTH: usize = MAX_VALUE_STACK / 2;
+
 /// Whether `len + max_stack` exceeds the value-stack `cap` (the guard
 /// predicate, extracted so it is testable without a `Vm`).
 const fn value_stack_overflows(len: usize, max_stack: usize, cap: usize) -> bool {
@@ -5698,8 +5707,16 @@ impl Vm {
         if cell.name != name {
             return None;
         }
-        let global = self.global_object(agent).ok()?;
-        if cell.global_id != global.id() || cell.generation != global.generation() {
+        let (global_id, generation) = match &self.global {
+            // Read the cached handle in place: `global_object` clones it on
+            // every call, and this probe runs on every `LoadIdent`.
+            Some(global) => (global.id(), global.generation()),
+            None => {
+                let global = self.global_object(agent).ok()?;
+                (global.id(), global.generation())
+            }
+        };
+        if cell.global_id != global_id || cell.generation != generation {
             return None;
         }
         Some(cell.value)
@@ -5716,8 +5733,14 @@ impl Vm {
         if cell.name != name || cell.declarative != 0 {
             return None;
         }
-        let global = self.global_object(agent).ok()?;
-        if cell.global_id != global.id() || cell.generation != global.generation() {
+        let (global_id, generation) = match &self.global {
+            Some(global) => (global.id(), global.generation()),
+            None => {
+                let global = self.global_object(agent).ok()?;
+                (global.id(), global.generation())
+            }
+        };
+        if cell.global_id != global_id || cell.generation != generation {
             return None;
         }
         Some(cell.value)
@@ -8661,6 +8684,20 @@ impl Vm {
                             _ => None,
                         };
                         if let Some((callee, this, arg_start, argc, below)) = inline {
+                            // The lane performs the callee in this loop, so no
+                            // native frame grows per level and the native-stack
+                            // guard never sees this recursion. A call that
+                            // pushes only its arguments (or none) does not grow
+                            // the value stack either, so the lane needs its own
+                            // bound; it charges the same two slots per level the
+                            // canonical call layout used to.
+                            if self.inline_calls.len() >= MAX_SAME_STACK_DEPTH {
+                                pending_error = Some(JsError::new(
+                                    ErrorKind::RangeError,
+                                    "Maximum call stack size exceeded".into(),
+                                ));
+                                continue;
+                            }
                             let caller = match &current {
                                 CurrentBody::Owned(rc) => Some(rc.clone()),
                                 CurrentBody::Borrowed(_) => None,
@@ -16330,46 +16367,50 @@ impl Vm {
         let mut leaf_known_not = false;
         if let Some(payload) = callee.heap_payload() {
             let index = Self::value_leaf_index(payload);
-            let cached = {
-                let cells = agent.roots.slot_leaf_cells.borrow();
-                match cells[index].as_ref() {
-                    Some(cell) if cell.payload == payload => Some(cell.entry.clone()),
-                    _ => None,
-                }
-            };
-            if let Some(entry) = cached
-                && self.can_inline_leaf()
-                && agent.realm_count.get() == 1
-                && !agent.is_terminating()
-            {
-                return self.run_leaf_entry(agent, argc, Value::Undefined, entry, 0);
-            }
+            // A cached negative verdict settles it: a body cannot become
+            // leaf-inlineable after its record was compiled, and one callee is
+            // never in both cells, so the positive probe (and its `RefCell`
+            // borrow) is skipped once the verdict is warm.
             leaf_known_not = Self::callee_known_not_leaf(agent, index, payload);
+            if !leaf_known_not {
+                let cached = {
+                    let cells = agent.roots.slot_leaf_cells.borrow();
+                    match cells[index].as_ref() {
+                        Some(cell) if cell.payload == payload => Some(cell.entry.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(entry) = cached
+                    && self.can_inline_leaf()
+                    && agent.realm_count.get() == 1
+                    && !agent.is_terminating()
+                {
+                    return self.run_leaf_entry(agent, argc, Value::Undefined, entry, 0);
+                }
+            }
         }
-        // Anything else takes the general path, which is written for the
-        // canonical `[.., this, callee, a1..aN]` layout: build it around the
-        // arguments in place rather than growing a second call entry point.
-        let arg_start = self.stack.len() - argc;
-        self.stack.resize(self.stack.len() + 2, Value::Undefined);
-        self.stack
-            .copy_within(arg_start..arg_start + argc, arg_start + 2);
-        self.stack[arg_start] = Value::Undefined;
-        self.stack[arg_start + 1] = callee;
-        if leaf_known_not {
-            // The callee's negative verdict is already known: skip the leaf
-            // probe in the shared core.
-            return self.fast_call_core(
-                agent,
-                argc,
-                false,
-                callee,
-                Value::Undefined,
-                2,
-                LeafCacheSite::None,
-                true,
-            );
-        }
-        self.do_call_fast(agent, argc, false)
+        // The general path reads the arguments in place: `this` is
+        // `undefined` and only the arguments were pushed, so the canonical
+        // `[this, callee, args]` layout is not built (`below` 0 places the
+        // result where the arguments are).
+        self.fast_call_core(
+            agent,
+            argc,
+            false,
+            callee,
+            Value::Undefined,
+            0,
+            match callee.heap_payload() {
+                // Keep the call-site leaf cache: the probe above may have
+                // missed only because the entry was not cached yet.
+                Some(payload) => LeafCacheSite::Slot {
+                    index: Self::value_leaf_index(payload),
+                    callee,
+                },
+                None => LeafCacheSite::None,
+            },
+            leaf_known_not,
+        )
     }
 
     /// The shared leaf-inline run (Cut 25/34/35): bind `this`, run the
@@ -17025,55 +17066,33 @@ impl Vm {
         // handler / Cut 80's crux-native closure / neither), so a warm
         // builtin call no longer SipHashes the thread-local handler map and
         // the `builtin_dispatch_cache` HashMap on every call.
-        if agent.realm_count.get() == 1
-            && let ValueKind::Function(function) = callee.kind()
-        {
-            let is_native = matches!(
-                &function.kind,
-                crux::function::FunctionKind::Builtin { call: Some(_), .. }
-            );
-            match agent.builtin_call_lookup(function.id(), is_native) {
-                // A registered builtin's handler — an agent-dependent engine
-                // method (the Map/Set/String/Array members `Intrinsics::define`
-                // installs). Only a host callback withdraws (see the
-                // crux-native note below); a handler the engine registered runs
-                // in place, its own body being the whole call.
-                crate::function::BuiltinCall::Handler { handler, reentrant } => {
-                    if reentrant {
-                        debug_assert!(self.pending_call.is_none());
-                        self.pending_call = Some(PendingCall::Handler {
-                            handler,
-                            this,
-                            arg_start,
-                            argc,
-                            below,
-                        });
-                        return Ok(());
-                    }
-                    let result = handler(agent, &this, args)?;
-                    self.stack.truncate(arg_start - below);
-                    self.stack.push(result);
-                    return Ok(());
-                }
-                // Warm crux-native builtins (Math/JSON/typed-array methods
-                // whose body is a plain `NativeFn`): the function's own
-                // native closure is the whole call. A host callback among
-                // them (`mark_host_reentrant` — a `v8::Function`, an op) may
-                // run JavaScript that nests before it returns, so it
-                // withdraws and runs on its own activation; every
-                // engine-defined built-in runs in place, where a
-                // `valueOf`/callback it triggers returns before it does and
-                // pays no frame per cycle. A `call: None` builtin keeps
-                // falling through.
-                crate::function::BuiltinCall::Native { reentrant } => {
-                    if let crux::function::FunctionKind::Builtin {
-                        call: Some(native), ..
-                    } = &function.kind
-                    {
+        //
+        // The callee is classified once: a Function value is always callable,
+        // and only a `Builtin` can be a registered handler or the `%eval%`
+        // intrinsic. An ordinary EcmaScript callee — the user-function call
+        // this lane mostly performs — therefore skips the builtin-table probe,
+        // the eval identity lookup, and the callable check.
+        let mut is_callable_function = false;
+        let mut is_builtin = false;
+        if let ValueKind::Function(function) = callee.kind() {
+            is_callable_function = true;
+            is_builtin = matches!(function.kind, crux::function::FunctionKind::Builtin { .. });
+            if is_builtin && agent.realm_count.get() == 1 {
+                let is_native = matches!(
+                    &function.kind,
+                    crux::function::FunctionKind::Builtin { call: Some(_), .. }
+                );
+                match agent.builtin_call_lookup(function.id(), is_native) {
+                    // A registered builtin's handler — an agent-dependent engine
+                    // method (the Map/Set/String/Array members `Intrinsics::define`
+                    // installs). Only a host callback withdraws (see the
+                    // crux-native note below); a handler the engine registered runs
+                    // in place, its own body being the whole call.
+                    crate::function::BuiltinCall::Handler { handler, reentrant } => {
                         if reentrant {
                             debug_assert!(self.pending_call.is_none());
-                            self.pending_call = Some(PendingCall::Native {
-                                callee,
+                            self.pending_call = Some(PendingCall::Handler {
+                                handler,
                                 this,
                                 arg_start,
                                 argc,
@@ -17081,16 +17100,48 @@ impl Vm {
                             });
                             return Ok(());
                         }
-                        let result = native(agent as *mut Agent as *mut (), &this, args)?;
+                        let result = handler(agent, &this, args)?;
                         self.stack.truncate(arg_start - below);
                         self.stack.push(result);
                         return Ok(());
                     }
+                    // Warm crux-native builtins (Math/JSON/typed-array methods
+                    // whose body is a plain `NativeFn`): the function's own
+                    // native closure is the whole call. A host callback among
+                    // them (`mark_host_reentrant` — a `v8::Function`, an op) may
+                    // run JavaScript that nests before it returns, so it
+                    // withdraws and runs on its own activation; every
+                    // engine-defined built-in runs in place, where a
+                    // `valueOf`/callback it triggers returns before it does and
+                    // pays no frame per cycle. A `call: None` builtin keeps
+                    // falling through.
+                    crate::function::BuiltinCall::Native { reentrant } => {
+                        if let crux::function::FunctionKind::Builtin {
+                            call: Some(native), ..
+                        } = &function.kind
+                        {
+                            if reentrant {
+                                debug_assert!(self.pending_call.is_none());
+                                self.pending_call = Some(PendingCall::Native {
+                                    callee,
+                                    this,
+                                    arg_start,
+                                    argc,
+                                    below,
+                                });
+                                return Ok(());
+                            }
+                            let result = native(agent as *mut Agent as *mut (), &this, args)?;
+                            self.stack.truncate(arg_start - below);
+                            self.stack.push(result);
+                            return Ok(());
+                        }
+                    }
+                    crate::function::BuiltinCall::Other => {}
                 }
-                crate::function::BuiltinCall::Other => {}
             }
         }
-        if is_eval_function(agent, &callee)? {
+        if is_builtin && is_eval_function(agent, &callee)? {
             let source = args.first().cloned().unwrap_or(Value::Undefined);
             // The `eval` builtin (spec 18.2.1 step 1): a non-string argument
             // is returned unchanged — only a primitive string is parsed.
@@ -17105,7 +17156,7 @@ impl Vm {
             self.stack.push(result);
             return Ok(());
         }
-        if !is_callable(&callee) {
+        if !is_callable_function && !is_callable(&callee) {
             return Err(JsError::new(
                 ErrorKind::TypeError,
                 format!("{} is not a function", crux::value::type_of(&callee)),
