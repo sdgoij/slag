@@ -1628,18 +1628,31 @@ mod tests {
     fn a_host_object_swept_under_gc_stress_finalizes_once() {
         let mut isolate = isolate();
         let context = context(&mut isolate);
-        FINALIZED.with(|ids| ids.borrow_mut().clear());
 
-        let id = an_unrooted_host_object();
-        scrub_stack(32);
-        isolate.agent().set_gc_stress(true);
-        context
-            .try_eval("let keep = []; for (let i = 0; i < 256; i++) keep.push({ i });")
-            .expect("eval");
-        isolate.agent().set_gc_stress(false);
-        isolate.run_finalizers();
+        // The conservative scan reads the words of `[sp, high)`; on some ABIs a
+        // stale word in a frame `scrub_stack` does not reach can keep the box
+        // alive (`.notes/host-object-gc.md` §5). A fresh object gets a fresh
+        // address, so retry with a new one rather than trust one stack layout;
+        // each attempt still exercises the engine's own stress sweep.
+        for _ in 0..8 {
+            FINALIZED.with(|ids| ids.borrow_mut().clear());
+            let id = an_unrooted_host_object();
+            scrub_stack(32);
+            isolate.agent().set_gc_stress(true);
+            context
+                .try_eval("(function () { let keep = []; for (let i = 0; i < 256; i++) keep.push({ i }); })()")
+                .expect("eval");
+            isolate.agent().set_gc_stress(false);
+            isolate.run_finalizers();
 
-        assert_eq!(FINALIZED.with(|ids| ids.borrow().clone()), vec![id]);
+            let seen =
+                FINALIZED.with(|ids| ids.borrow().iter().filter(|&&seen| seen == id).count());
+            if seen == 1 {
+                return;
+            }
+            assert_eq!(seen, 0, "a swept host object finalizes exactly once");
+        }
+        panic!("the engine's stress sweep must finalize an unreachable host object");
     }
 
     thread_local! {

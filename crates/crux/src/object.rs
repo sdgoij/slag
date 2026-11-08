@@ -971,12 +971,46 @@ impl Trace for PrivateElement {
 /// at 1 — 0 is reserved for "no verdict recorded".
 pub static PROTOTYPE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+std::thread_local! {
+    /// A unit-test build gives each test thread its own protector. The
+    /// production epoch is process-global by design (the JIT bakes its
+    /// address into compiled code), but the unit tests run in parallel and a
+    /// sibling test's prototype mutation must not invalidate a verdict another
+    /// test is asserting.
+    static TEST_PROTOTYPE_EPOCH: AtomicU64 = const { AtomicU64::new(1) };
+}
+
+/// The live elements-protector epoch (see [`PROTOTYPE_EPOCH`]). A unit-test
+/// build reads a per-thread copy so parallel tests cannot disturb each other's
+/// cached verdicts; production reads the process-global static.
+#[inline]
+fn prototype_epoch() -> u64 {
+    #[cfg(test)]
+    {
+        TEST_PROTOTYPE_EPOCH.with(|epoch| epoch.load(Ordering::Relaxed))
+    }
+    #[cfg(not(test))]
+    {
+        PROTOTYPE_EPOCH.load(Ordering::Relaxed)
+    }
+}
+
 /// Advance the elements protector, invalidating every cached clean-chain
 /// verdict. Relaxed: it only needs to be observed by the same agent, and the
 /// JIT's plain load pairs with it.
 #[inline]
 pub fn bump_epoch() {
-    PROTOTYPE_EPOCH.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        TEST_PROTOTYPE_EPOCH.with(|epoch| {
+            epoch.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        PROTOTYPE_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Register `proto` as a prototype: mark it so a later own-property change to
@@ -3210,7 +3244,7 @@ impl JsObject {
     /// load + compare, where the walk pays a property lookup per link.
     fn store_chain_clean_hit(&self) -> bool {
         let recorded = self.store_chain_clean.get();
-        recorded != 0 && recorded == PROTOTYPE_EPOCH.load(Ordering::Relaxed)
+        recorded != 0 && recorded == prototype_epoch()
     }
 
     /// The per-index chain walk for `array_element_write` (semantics
@@ -3243,8 +3277,7 @@ impl JsObject {
             && !first.has_index_keyed_own_property()
             && !second.has_index_keyed_own_property()
         {
-            self.store_chain_clean
-                .set(PROTOTYPE_EPOCH.load(Ordering::Relaxed));
+            self.store_chain_clean.set(prototype_epoch());
         }
         true
     }
