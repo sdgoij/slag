@@ -18362,3 +18362,67 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
 --workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
 built-ins 23821/23821 in BOTH modes; corpus 79/79 identical across parent/new,
 jit/jitless, and `--gc-stress`.
+
+## LANDED (2026-11-09): a recursive register body calls itself without the driver
+
+The `fib` shape ran its 13-op whole-body register program through a full driver
+round-trip per call: the `CallFastIdent` op withdrew the activation
+(`pending_call`), `run_inner_impl` matched `VmOutcome::Call`, resolved the
+same-stack record, carved the callee frame, and re-entered `run_body_segment`
+— twice per activation (fib's two self-calls). Two contained changes close most
+of that:
+
+1. **A self-call skips callee classification and the record lookup.**
+   `do_call_fast_ident` now detects `callee == current_function` before the
+   leaf probe and writes `PendingCall::Function` directly (the running body
+   holds this call step, so it cannot be a leaf; the callee is EcmaScript,
+   callable, and not eval/builtin by construction). `try_push_inline_call`
+   likewise takes a self fast path: the caller's `Rc` IS the callee body, the
+   running execution context carries the same realm/source, and `env_constant`
+   fixes the environment, so it skips `same_stack_lookup` and its entry clone.
+2. **The register executor performs the self-call in place.** On a
+   whole-body register program, `CallFastIdent` first tries
+   `try_inline_self_call`: when the warm global cell resolves to the running
+   closure, it pushes the frame through the same `try_push_inline_call` lane,
+   parks the resume op on `Vm::reg_self_pcs`, and restarts the SAME op program
+   at 0. `ReturnAcc` above the program's entry pc pops that frame and resumes
+   the caller. The frames still live on `Vm::inline_calls` (so the execution
+   context, GC tracing, and the driver's error unwind are unchanged);
+   `InlineCallFrame::in_loop_self` makes `pop_inline_call` pop the matching pc
+   entry on every path.
+
+Same-session interleaved control (`slag-base` = HEAD, 4 rounds, min per cell;
+`fib` = fib(30)):
+
+| `fib` (jitless) | HEAD | before in-loop lane | after |
+| --- | ---: | ---: | ---: |
+| wall | 284 ms | 272 ms | **239 ms** |
+| instructions (fib(24)) | 248.6M | 241.1M | **217.8M** |
+
+So the driver round-trip was ~12% of the interpreter's instructions and ~16% of
+`fib`'s wall. `njit/bs` 4.46 -> **3.81** against the same `bs` (jit/bs stays
+1.21: the lane is behind `agent.jit_hook`, so compiled rows are untouched). In
+the new profile the driver closure drops off the list; the remaining cost is the
+frame push itself (`try_push_inline_call` 24%), the op program
+(`run_body_segment` 24.5%), and the pop (`pop_inline_call` 13%). Rows with no
+self-call are instruction-identical to HEAD (`sieve` +0.004%, `fn_object`
++0.014%, `local` -0.003% on callgrind), so their wall swings in the same suite
+run are layout noise.
+
+**The trap: the in-loop lane bypasses the driver's depth bound.**
+`try_push_inline_call` is reached from `run_leaf_ops`, not the
+`VmOutcome::Call` arm where `MAX_SAME_STACK_DEPTH` is charged. A self-call with
+no arguments and no frame pushes nothing, so a recursion that grows no stack
+would climb until the heap is exhausted. `try_inline_self_call` charges the
+same `MAX_SAME_STACK_DEPTH` before pushing; the probe
+`function forever(){ return forever(); }` still throws a catchable
+`RangeError`, and a stack-overflow catch followed by an ordinary `again(15)`
+returns the same value as HEAD.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized (1155 runtime, 3324 jit, etc.); the recursion
+probe (self/mutual/named-expression/default-param/arguments/this/enclosing-try/
+per-level stack-trace/runaway-recursion) identical to HEAD in jitless, under
+`--gc-stress`, and under `--gc-verify`; test262 language 23726/23726, annexB
+1086/1086, built-ins 23821/23821 in BOTH modes; corpus 79/79 identical across
+parent/new, jit/jitless, and `--gc-stress`.

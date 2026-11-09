@@ -4287,6 +4287,11 @@ struct InlineCallFrame {
     /// The caller's body when it was a tail-call replacement; `None` means the
     /// activation's original borrowed body.
     caller: Option<std::rc::Rc<CompiledBody>>,
+    /// This frame was pushed by the register executor's in-loop self-call
+    /// lane, which parks its resume op on [`Vm::reg_self_pcs`] instead of
+    /// withdrawing to the driver. `pop_inline_call` pops that entry with it,
+    /// so the driver's error unwind stays in step with the pc stack.
+    in_loop_self: bool,
 }
 
 impl Trace for InlineCallFrame {
@@ -4651,6 +4656,12 @@ pub struct Vm {
     /// currently running in one `run_inner_impl` loop (see
     /// [`InlineCallFrame`]). Empty whenever no such call is open.
     inline_calls: Vec<InlineCallFrame>,
+    /// Resume points of the register executor's in-loop self-calls (see
+    /// `run_leaf_ops`): each entry is the op a caller continues at when the
+    /// matching self-call returns. Plain `u32`s with no GC edges, so no trace.
+    /// It persists across a withdrawn (non-self) call for the same reason the
+    /// frames do: activations nest LIFO.
+    reg_self_pcs: Vec<u32>,
 }
 
 impl Trace for Vm {
@@ -4864,6 +4875,7 @@ impl Vm {
             current_new_target: None,
             saved_control: Vec::new(),
             inline_calls: Vec::new(),
+            reg_self_pcs: Vec::new(),
         }
     }
 
@@ -5235,6 +5247,7 @@ impl Vm {
         self.current_new_target = None;
         self.saved_control.clear();
         self.inline_calls.clear();
+        self.reg_self_pcs.clear();
     }
 
     /// Re-point a pooled Vm at a new run's env and strictness. The pool hands
@@ -8445,16 +8458,45 @@ impl Vm {
         if agent.realm_count.get() != 1 || agent.is_terminating() {
             return Ok(None);
         }
-        let Some(entry) = agent.same_stack_lookup(function.id()) else {
-            return Ok(None);
+        // A call to the closure this activation is running reuses everything
+        // the cache entry would supply: the caller body IS the callee body,
+        // `env_constant` fixes the environment at the activation's base, and
+        // the running execution context carries the same realm and source.
+        // Skip the same-stack cache probe and its entry clone.
+        let (ir, old_env, realm, strict, parse_text) = if let Some(running) = caller.as_ref()
+            && self
+                .current_function
+                .is_some_and(|current| current.bits() == callee.bits())
+            && running.env_constant
+            && running
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.context_names.is_empty())
+            && running.same_stack_eligible()
+            && agent.field_initializer_depth == 0
+        {
+            let Some(context) = agent.roots.execution_context_stack.last() else {
+                return Ok(None);
+            };
+            (
+                running.clone(),
+                self.lexical_env,
+                context.realm,
+                self.strict,
+                context.source.clone(),
+            )
+        } else {
+            let Some(entry) = agent.same_stack_lookup(function.id()) else {
+                return Ok(None);
+            };
+            (
+                entry.ir,
+                entry.environment,
+                entry.realm,
+                entry.strict,
+                entry.parse_text,
+            )
         };
-        let (ir, old_env, realm, strict, parse_text) = (
-            entry.ir,
-            entry.environment,
-            entry.realm,
-            entry.strict,
-            entry.parse_text,
-        );
         let scope = ir.scope.as_ref().expect("a certified body has a scope");
         // OrdinaryCallBindThis (spec 10.2.1.1), resolved before any mutation so
         // a primitive receiver — which needs boxing, and thus allocation —
@@ -8563,6 +8605,7 @@ impl Vm {
             arg_start,
             below,
             caller,
+            in_loop_self: false,
         });
         self.leaf_frame_base = Some(base);
         self.leaf_frame_offset = 0;
@@ -8608,10 +8651,18 @@ impl Vm {
             arg_start,
             below,
             caller,
+            in_loop_self,
         } = self
             .inline_calls
             .pop()
             .expect("a same-stack frame is pushed before it is popped");
+        if in_loop_self {
+            // The register executor parked this frame's resume op on the pc
+            // stack, not on the driver. Drop it here so every pop path (the
+            // loop's own return, the driver's error unwind) keeps the two in
+            // step.
+            self.reg_self_pcs.pop();
+        }
         let control_saved = scratch.control_saved;
         // The env fields go back first: `restore_scratch`'s `env_stack` reset
         // addresses the caller's `lexical_env`.
@@ -8661,6 +8712,7 @@ impl Vm {
         &mut self,
         agent: &mut Agent,
         body: &CompiledBody,
+        caller: Option<&std::rc::Rc<CompiledBody>>,
     ) -> Result<VmOutcome, JsError> {
         let Some(ops) = body.reg_ops.as_deref() else {
             return self.run_inner_inner(agent, body);
@@ -8674,7 +8726,7 @@ impl Vm {
             self.acc = self.pop();
         }
         let stack_len = self.stack.len();
-        match self.run_leaf_ops::<true>(agent, ops, start.unwrap_or(0) as usize) {
+        match self.run_leaf_ops::<true, true>(agent, ops, start.unwrap_or(0) as usize, caller) {
             Ok(_completion) if self.reg_resume.is_some() => Ok(VmOutcome::Call),
             Ok(completion) => {
                 self.stack.truncate(stack_len);
@@ -8742,7 +8794,15 @@ impl Vm {
                         }
                     }
                 }
-                let outcome = match self.run_body_segment(agent, body) {
+                // The caller's own body when the driver owns it (a same-stack
+                // frame below the root): the register executor's in-loop
+                // self-call lane stores it in each frame it pushes so the
+                // driver's error unwind can restore `current` exactly.
+                let running = match &current {
+                    CurrentBody::Owned(rc) => Some(rc),
+                    CurrentBody::Borrowed(_) => None,
+                };
+                let outcome = match self.run_body_segment(agent, body, running) {
                     Ok(VmOutcome::TailCall(next)) => {
                         current = CurrentBody::Owned(next);
                         // The tracked body must follow the tail call (the
@@ -12031,7 +12091,12 @@ impl Vm {
                         self.acc = self.pop();
                     }
                     let stack_len = self.stack.len();
-                    match self.run_leaf_ops::<true>(agent, ops, start.unwrap_or(0) as usize) {
+                    match self.run_leaf_ops::<true, false>(
+                        agent,
+                        ops,
+                        start.unwrap_or(0) as usize,
+                        None,
+                    ) {
                         Ok(_) if self.reg_resume.is_some() => {
                             // Re-enter this step on resume: the same-stack
                             // frame's scratch restores the ip, and the record
@@ -14107,7 +14172,7 @@ impl Vm {
             debug_assert!(!ir.leaf_uses_env);
             (None, None)
         };
-        let outcome = self.run_leaf_ops::<false>(agent, ops, 0);
+        let outcome = self.run_leaf_ops::<false, false>(agent, ops, 0, None);
         self.leaf_frame_base = caller_leaf_frame_base;
         self.leaf_frame_offset = caller_leaf_frame_offset;
         // An aliased frame lives in the caller's argument region, which the
@@ -14190,12 +14255,23 @@ impl Vm {
     /// consumed the call's result — the caller pops it into `acc`, which is
     /// where the call op leaves it.
     #[inline(always)]
-    fn run_leaf_ops<const SUSPENDING: bool>(
+    fn run_leaf_ops<const SUSPENDING: bool, const WHOLE_BODY: bool>(
         &mut self,
         agent: &mut Agent,
         ops: &[LeafOp],
         start: usize,
+        // The caller's own body when the driver owns it (see `run_body_segment`),
+        // for the in-loop self-call lane. `None` everywhere else.
+        caller: Option<&std::rc::Rc<CompiledBody>>,
     ) -> Result<Completion, JsError> {
+        // The number of in-loop self-call frames this program itself pushed:
+        // a `ReturnAcc` above this depth returns from a self-call, at it
+        // returns from the activation.
+        let pc_base = if WHOLE_BODY {
+            self.reg_self_pcs.len()
+        } else {
+            0
+        };
         let mut pc = start;
         while let Some(op) = ops.get(pc) {
             pc += 1;
@@ -14678,6 +14754,25 @@ impl Vm {
                     span,
                 } => {
                     self.set_site(agent, *span);
+                    // A call to the closure this activation runs is a frame
+                    // push, not a withdrawal: the same op program restarts at
+                    // 0 for the callee and resumes at the parked op when it
+                    // returns, all without a driver round-trip.
+                    if SUSPENDING
+                        && WHOLE_BODY
+                        && self.try_inline_self_call(
+                            agent,
+                            *name,
+                            *argc as usize,
+                            *env_constant,
+                            caller,
+                        )?
+                    {
+                        debug_assert!(u32::try_from(pc).is_ok());
+                        self.reg_self_pcs.push(pc as u32);
+                        pc = 0;
+                        continue;
+                    }
                     self.do_call_fast_ident(agent, *name, *argc as usize, *env_constant)?;
                     if SUSPENDING {
                         if self.pending_call.is_some() {
@@ -14818,6 +14913,16 @@ impl Vm {
                     self.acc = Value::Number(lhs % f64::from(*divisor));
                 }
                 LeafOp::ReturnAcc => {
+                    if WHOLE_BODY && self.reg_self_pcs.len() > pc_base {
+                        // The callee's return: land its value at the call site
+                        // and continue the caller's op program where it stopped.
+                        let resume =
+                            self.reg_self_pcs.last().copied().expect("checked above") as usize;
+                        self.pop_inline_call(agent, Some(self.acc));
+                        self.acc = self.pop();
+                        pc = resume;
+                        continue;
+                    }
                     return Ok(Completion::Return(self.acc));
                 }
                 LeafOp::Jump(target) => pc = *target,
@@ -14832,6 +14937,10 @@ impl Vm {
                 }
             }
         }
+        debug_assert!(
+            !WHOLE_BODY || self.reg_self_pcs.len() == pc_base,
+            "a register program ends in ReturnAcc",
+        );
         Ok(Completion::Empty)
     }
 
@@ -16445,6 +16554,94 @@ impl Vm {
         )
     }
 
+    /// The register executor's in-loop self-call: resolve `name`, and when it
+    /// is the closure this activation runs, push the callee's frame on this
+    /// Vm so the caller's op program restarts at 0 without withdrawing to the
+    /// driver. `Ok(true)` means a frame was pushed; the caller parks its
+    /// resume op on `Vm::reg_self_pcs`. `Ok(false)` means the callee is not
+    /// the running function (or a lane gate declined) and the caller must
+    /// withdraw as usual.
+    ///
+    /// Only the warm global-cell read is attempted here: a cold or shadowed
+    /// name falls through to `do_call_fast_ident`, which has the full
+    /// resolution path and the driver's self-call lane as its backstop.
+    fn try_inline_self_call(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        argc: usize,
+        env_constant: bool,
+        caller: Option<&std::rc::Rc<CompiledBody>>,
+    ) -> Result<bool, JsError> {
+        let Some(caller) = caller else {
+            return Ok(false);
+        };
+        if !env_constant || !self.globals_unshadowed {
+            return Ok(false);
+        }
+        let Some(callee) = self.try_global_cell_read(agent, name) else {
+            return Ok(false);
+        };
+        if self
+            .current_function
+            .is_none_or(|running| running.bits() != callee.bits())
+        {
+            return Ok(false);
+        }
+        if agent.jit_hook.is_some() || agent.debug_attached.get() || agent.realm_count.get() != 1 {
+            return Ok(false);
+        }
+        if agent.is_terminating() {
+            return Err(crate::agent::termination_error());
+        }
+        // The in-loop lane grows `inline_calls` without passing through the
+        // driver's bound, so it charges the same depth budget here: a call
+        // that pushes no stack slots (no arguments, no frame) would otherwise
+        // recurse until the heap is exhausted.
+        if self.inline_calls.len() >= MAX_SAME_STACK_DEPTH {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "Maximum call stack size exceeded".into(),
+            ));
+        }
+        let Some(scope) = caller.scope.as_ref() else {
+            return Ok(false);
+        };
+        // The same gates `try_push_inline_call`'s self fast path requires, so
+        // it is guaranteed to take that path (and keep this body).
+        if !caller.env_constant
+            || !scope.context_names.is_empty()
+            || !caller.same_stack_eligible()
+            || agent.field_initializer_depth != 0
+        {
+            return Ok(false);
+        }
+        let arg_start = self.stack.len() - argc;
+        let pushed = self.try_push_inline_call(
+            agent,
+            callee,
+            Value::Undefined,
+            arg_start,
+            argc,
+            0,
+            Some(caller.clone()),
+        )?;
+        match pushed {
+            Some(ir) => {
+                debug_assert!(
+                    std::rc::Rc::ptr_eq(&ir, caller),
+                    "the self fast path keeps the running body",
+                );
+                self.inline_calls
+                    .last_mut()
+                    .expect("the frame was just pushed")
+                    .in_loop_self = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// The `CallFastIdent` handler: the callee resolves through the environment
     /// (landing in the global-value cell when the chain is clean) and the
     /// arguments already sit on the value stack.
@@ -16465,6 +16662,28 @@ impl Vm {
         } else {
             self.load_ident_value(agent, name, env_constant)?
         };
+        // A call to the closure this activation is running cannot be a leaf
+        // (its body holds this call step), so the leaf probe and the general
+        // callee classification are both skippable: withdraw the activation
+        // directly. The driver's same-stack lane resolves the frame from the
+        // running body, so nothing here needs the record.
+        if self
+            .current_function
+            .is_some_and(|running| running.bits() == callee.bits())
+        {
+            if agent.is_terminating() {
+                return Err(crate::agent::termination_error());
+            }
+            debug_assert!(self.pending_call.is_none());
+            self.pending_call = Some(PendingCall::Function {
+                callee,
+                this: Value::Undefined,
+                arg_start: self.stack.len() - argc,
+                argc,
+                below: 0,
+            });
+            return Ok(());
+        }
         let mut leaf_known_not = false;
         if let Some(payload) = callee.heap_payload() {
             let index = Self::value_leaf_index(payload);
