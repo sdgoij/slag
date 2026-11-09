@@ -18426,3 +18426,68 @@ per-level stack-trace/runaway-recursion) identical to HEAD in jitless, under
 `--gc-stress`, and under `--gc-verify`; test262 language 23726/23726, annexB
 1086/1086, built-ins 23821/23821 in BOTH modes; corpus 79/79 identical across
 parent/new, jit/jitless, and `--gc-stress`.
+
+## LANDED (2026-11-09): a minor's job-region scan resolves the young cohort, not the live heap
+
+The queued-job regions are the one imprecise root source: a `Box<dyn FnOnce>`
+closure holds its captured `Value`s as raw bytes no `Trace` can reach, so
+`scan_regions` walks each region's words and needs to answer "is this word a box
+address?". It answered with a hash map built from `for_each_live` — every live
+box in the arena — on every collection, both generations.
+
+A minor does not need that set. An old box named from a region is not swept by
+this collection, and a young child stored *into* it was recorded by the write
+barrier at the store, so the minor's own remembered-set seeding covers it. The
+minor's membership set is therefore the young cohort list, which
+`collect_minor_inner` is about to build anyway. The generation comes from a
+`RegionScanScope` the runtime opens around `collect_with` when `minor` is set;
+the major keeps the full set (as the arena walk's ascending address list, which
+`live_sorted` already produces for its stack scan, so no hashing there either).
+
+The shape that exposes it is a job queue that retains everything it names: a
+`then` loop never draining its microtasks. There every minor was O(live) for a
+cohort of 1035 against 275k live boxes, 441 times per 20k iterations.
+
+Same-session interleaved control (base = HEAD built by `tools/build.sh` in this
+session, final = this tree; min of 3 rounds):
+
+| probe (N = 20000) | base | final |
+| --- | ---: | ---: |
+| promise creation + `then` churn | 9569 ms | **1398** (6.8x) |
+| async-function call + `await` park | 15299 ms | **9392** (1.63x) |
+
+`--gc-trace`, same probe: minor pause avg **4904 -> 70 us** (max 11923 -> 229) on
+the promise row, **6836 -> 4551 us** on the async row. The end-of-run live counts
+are unchanged (245088 vs 245085 on the async probe) and the collection counts are
+identical (539/537), so this is the scan's own work, not a retention change.
+
+The corpus rows (N = 2000, so the queue is short and GC is a small share), min of
+5 interleaved rounds: `promise_churn` 61.8 -> 58.7 ms (-5.0%), `async_churn`
+159.3 -> 154.0 (-3.3%), `for_of_dense` +0.9%, `map_get` +1.4% (flat).
+
+**The layout trap, again.** The intermediate binary read `async_churn` +16.7% and
+`concat_loop` +16.5% in the unflagged suite. Rebuilt both sides with
+`-align-all-functions=5` and the pair read -0.7% and -5.6%, i.e. the whole swing
+was native layout on rows with no mechanism in common with the change. Do not
+attribute a corpus swing without the aligned pair.
+
+Two neutral-by-measurement trims ride along:
+
+- `new_promise_capability` and `create_resolving_functions` read
+  `%Function.prototype%` with `Intrinsics::get` (SipHash over the name) per
+  promise; they now take the realm's cached `function_prototype` slot (Cut 66's
+  array), which is the accessor closure creation already uses.
+- `Symbol::well_known(name)` allocated a `String` and SipHash-ed it per read, on
+  paths that read one per `for-of` begin (`iterator`), per capability
+  (`species`) and per `Symbol.toPrimitive` coercion. The known names now take a
+  slot indexed by `WELL_KNOWN_SYMBOLS` (a position scan over 15 short names —
+  no allocation, no hashing); only a name outside that list falls back to the
+  map.
+  Measured flat on `for_of_dense` and `map_get` (the for-of verdict cache skips
+  the symbol read when it holds), kept as a strict work reduction.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
+parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress` (the barrier
+audit); `built-ins --filter '*Promise*' --gc-verify` 732/732.

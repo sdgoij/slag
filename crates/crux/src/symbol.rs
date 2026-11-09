@@ -65,21 +65,51 @@ pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
 /// "unscopables"), creating it on first use. The table belongs to the entered
 /// heap: each realm gets its own set (well-known symbols are per-realm), and a
 /// cache that outlived its arena would hand a later isolate a swept symbol.
+///
+/// The known names take a slot indexed by [`WELL_KNOWN_SYMBOLS`]; only a name
+/// outside that list falls back to the keyed map. The lookup is read on hot
+/// paths — the iterator protocol reads "iterator" per `for-of` begin, the
+/// `then` path reads "species" per capability, and every `Symbol.toPrimitive`
+/// coercion reads "toPrimitive" — and the keyed form allocated a `String` and
+/// SipHash-ed it on each one.
 pub fn well_known(name: &str) -> Handle<Symbol> {
+    if let Some(slot) = WELL_KNOWN_SYMBOLS.iter().position(|known| *known == name) {
+        return well_known_slot(slot);
+    }
     crate::heap::with_heap_cell(
         || std::cell::RefCell::new(HashMap::new()),
         |table| {
-            table
-                .borrow_mut()
+            let mut table = table.borrow_mut();
+            *table
                 .entry(name.to_string())
-                .or_insert_with(|| {
-                    Handle::new(Symbol::new(Some(JsString::from_utf8(&format!(
-                        "Symbol.{name}"
-                    )))))
-                })
-                .to_owned()
+                .or_insert_with(|| Handle::new(Symbol::new(Some(well_known_description(name)))))
         },
     )
+}
+
+/// One well-known symbol by its slot in [`WELL_KNOWN_SYMBOLS`].
+fn well_known_slot(slot: usize) -> Handle<Symbol> {
+    crate::heap::with_heap_cell(
+        || std::cell::RefCell::new(Vec::new()),
+        |slots| {
+            let mut slots = slots.borrow_mut();
+            if slots.len() <= slot {
+                slots.resize(slot + 1, None);
+            }
+            if let Some(symbol) = slots[slot] {
+                return symbol;
+            }
+            let symbol = Handle::new(Symbol::new(Some(well_known_description(
+                WELL_KNOWN_SYMBOLS[slot],
+            ))));
+            slots[slot] = Some(symbol);
+            symbol
+        },
+    )
+}
+
+fn well_known_description(name: &str) -> JsString {
+    JsString::from_utf8(&format!("Symbol.{name}"))
 }
 
 /// %Symbol.unscopables%: consulted by `with`-statement environment records

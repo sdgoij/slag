@@ -1012,6 +1012,7 @@ pub struct HeapState {
     remembered: RefCell<Vec<usize>>,
     verify_barrier: Cell<bool>,
     verify_minor: Cell<bool>,
+    region_scan_young: Cell<bool>,
     collection_gen: Cell<u32>,
     pinned: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     root_sources: RefCell<Vec<&'static dyn RootSource>>,
@@ -1056,6 +1057,7 @@ impl HeapState {
             remembered: RefCell::new(Vec::new()),
             verify_barrier: Cell::new(cfg!(debug_assertions)),
             verify_minor: Cell::new(false),
+            region_scan_young: Cell::new(false),
             collection_gen: Cell::new(1),
             pinned: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             root_sources: RefCell::new(Vec::new()),
@@ -1524,6 +1526,31 @@ per_heap!(
 );
 
 per_heap!(
+    /// The membership set the enclosing collection's imprecise region scan
+    /// needs (see [`scan_regions`]).
+    REGION_SCAN_YOUNG = RegionScanYoung => region_scan_young: Cell<bool>;
+);
+
+/// Scope marker: the collection driving the current trace is a minor, so
+/// [`scan_regions`] resolves words against the young cohort only.
+pub struct RegionScanScope {
+    previous: bool,
+}
+
+impl Drop for RegionScanScope {
+    fn drop(&mut self) {
+        REGION_SCAN_YOUNG.with(|flag| flag.set(self.previous));
+    }
+}
+
+/// Declare the current collection a minor for [`scan_regions`]'s benefit; the
+/// previous setting is restored when the returned scope drops.
+pub fn region_scan_young_only() -> RegionScanScope {
+    let previous = REGION_SCAN_YOUNG.with(|flag| flag.replace(true));
+    RegionScanScope { previous }
+}
+
+per_heap!(
     /// A5.1: the current collection interval's stamp. A type that bounds its
     /// dirty slots stamps a mark with it, so a mark from a previous interval
     /// reads as stale — and stale correctly means "no dirty slots", because
@@ -1743,29 +1770,25 @@ fn drain_young_work(work: &mut Vec<GcAny>) {
 /// raw bytes that no precise `Trace` can reach; scanning the closure's
 /// allocation roots those captures. Imprecise by design: it may retain
 /// garbage, never frees a live box.
+///
+/// The membership set is the one the enclosing collection needs, not the whole
+/// heap. A minor needs the young cohort alone: an old box named here is not
+/// swept, and a young child stored into it was recorded by the write barrier
+/// (the remembered set) at the store, so the minor's own seeding covers it. A
+/// major sweeps both generations and needs every live box. Building the young
+/// set is O(young) from the cohort list; the major's is the arena walk.
+///
+/// This used to build a hash map over every live box for both generations.
+/// On the promise-churn row (a job queue that retains everything it names) that
+/// map was 56% of every minor's pause, rebuilt 441 times for a cohort of 1035
+/// against 275k live boxes.
 pub fn scan_regions(regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
     with_state(|state| {
         let heap = state.heap.borrow();
-        let mut by_addr: AddrMap = AddrMap::default();
-        heap.for_each_live(|header| {
-            by_addr.insert(header as usize, GcAny(header));
-        });
-        for (base, len) in regions {
-            let mut addr = *base as usize;
-            let end = addr + *len;
-            while addr + std::mem::size_of::<usize>() <= end {
-                // SAFETY: the region is the live allocation of a queued or
-                // running job closure; reads are unaligned.
-                let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
-                if let Some(&any) = by_addr.get(&word) {
-                    visit(any);
-                } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
-                    && let Some(&any) = by_addr.get(&box_addr)
-                {
-                    visit(any);
-                }
-                addr += std::mem::size_of::<usize>();
-            }
+        if state.region_scan_young.get() {
+            heap.scan_regions_young(regions, visit);
+        } else {
+            heap.scan_regions_all(regions, visit);
         }
     });
 }
@@ -3756,6 +3779,87 @@ impl Heap {
             words += 1;
         }
         self.stack_words.set(words);
+    }
+
+    /// Visit every box the given heap-buffered regions name, from the young
+    /// cohort's membership table (a minor collection, which sweeps young boxes
+    /// alone).
+    fn scan_regions_young(&self, regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
+        if self.young.is_empty() {
+            return;
+        }
+        let cap = (self.young.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut table = vec![0usize; cap];
+        for &addr in &self.young {
+            let mut index = young_slot(addr, mask);
+            while table[index] != 0 {
+                index = (index + 1) & mask;
+            }
+            table[index] = addr;
+        }
+        let find = |addr: usize| {
+            let mut index = young_slot(addr, mask);
+            loop {
+                let slot = table[index];
+                if slot == 0 {
+                    return None;
+                }
+                if slot == addr {
+                    return Some(GcAny(addr as *mut GcHeader));
+                }
+                index = (index + 1) & mask;
+            }
+        };
+        self.scan_region_words(regions, &find, visit);
+    }
+
+    /// Visit every box the given heap-buffered regions name, from the live
+    /// arena (a major collection, which sweeps both generations).
+    fn scan_regions_all(&self, regions: &[(*const u8, usize)], visit: &mut dyn FnMut(GcAny)) {
+        let live = self.live_sorted();
+        if live.is_empty() {
+            return;
+        }
+        let find = |addr: usize| {
+            live.binary_search(&addr)
+                .ok()
+                .map(|index| GcAny(live[index] as *mut GcHeader))
+        };
+        self.scan_region_words(regions, &find, visit);
+    }
+
+    /// The word walk [`scan_regions`] shares between generations; `find`
+    /// resolves a word to the box the enclosing collection cares about.
+    fn scan_region_words(
+        &self,
+        regions: &[(*const u8, usize)],
+        find: &dyn Fn(usize) -> Option<GcAny>,
+        visit: &mut dyn FnMut(GcAny),
+    ) {
+        // GC-5: most words are not box addresses — two compares beat the
+        // membership probe for the rest.
+        let (live_low, live_high) = self.live_range();
+        for (base, len) in regions {
+            let mut addr = *base as usize;
+            let end = addr + *len;
+            while addr + std::mem::size_of::<usize>() <= end {
+                // SAFETY: the region is the live allocation of a queued or
+                // running job closure; reads are unaligned.
+                let word = unsafe { std::ptr::read_unaligned::<usize>(addr as *const usize) };
+                if (live_low..=live_high).contains(&word)
+                    && let Some(any) = find(word)
+                {
+                    visit(any);
+                } else if let Some(box_addr) = crate::value::Value::encoded_box_address(word as u64)
+                    && (live_low..=live_high).contains(&box_addr)
+                    && let Some(any) = find(box_addr)
+                {
+                    visit(any);
+                }
+                addr += std::mem::size_of::<usize>();
+            }
+        }
     }
 }
 

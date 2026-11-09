@@ -4125,6 +4125,11 @@ impl Agent {
         } else {
             crux::heap::GcGeneration::Major
         };
+        // The job closures' captured regions are scanned conservatively while
+        // the roots are gathered, and a minor needs only the young cohort
+        // there: an old box named from a region is not swept, and its young
+        // children are the write barrier's remembered set.
+        let _region_scan = minor.then(crux::heap::region_scan_young_only);
         // Taken out for the duration: an observer runs host code, and this list
         // must not be borrowed while that runs. A collection an observer
         // triggers therefore runs none of its own (see the field's note).

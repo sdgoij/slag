@@ -235,7 +235,7 @@ pub fn new_promise_capability(
     let function_proto = agent
         .current_realm()
         .ok()
-        .and_then(|realm| realm.intrinsics.get("%Function.prototype%"))
+        .and_then(|realm| realm.intrinsics.function_prototype("%Function.prototype%"))
         .and_then(|v| crate::context::as_object(&v));
     let executor = Function::create_builtin(
         Some(JsString::from_utf8("")),
@@ -303,7 +303,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
     let function_proto = agent
         .current_realm()
         .ok()
-        .and_then(|realm| realm.intrinsics.get("%Function.prototype%"))
+        .and_then(|realm| realm.intrinsics.function_prototype("%Function.prototype%"))
         .and_then(|v| crate::context::as_object(&v));
     // The promise resolving functions are anonymous (spec 27.2.1.3.1): the
     // `name` property is the empty string. The two share one [[AlreadyResolved]]
