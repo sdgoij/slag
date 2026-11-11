@@ -511,9 +511,9 @@ pub(crate) fn is_generator_object(value: &api::Local) -> bool {
     in_table(value, |agent, id| agent.is_generator_object(id))
 }
 
-/// A promise object: the engine keys its record by object identity.
+/// A promise object: the object's own kind carries the record.
 pub(crate) fn is_promise(value: &api::Local) -> bool {
-    in_table(value, |agent, id| agent.is_promise_object(id))
+    object_matches(value, |kind| matches!(kind, ObjectKind::Promise(_)))
 }
 
 /// A native error. The engine's notion is `[[ErrorData]]`, which is the one the

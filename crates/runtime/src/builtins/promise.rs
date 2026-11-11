@@ -387,8 +387,8 @@ pub fn dispatch_call(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    if let Some((flag, is_reject)) = function.resolver() {
-        return Some(dispatch_resolver(agent, flag, is_reject, args));
+    if let Some((flag, data, is_reject)) = function.resolver() {
+        return Some(dispatch_resolver(agent, flag, data, is_reject, args));
     }
     let state = agent
         .roots
@@ -500,6 +500,7 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
 fn dispatch_resolver(
     agent: &mut Agent,
     flag: Handle<crux::function::ResolverFlag>,
+    data: Handle<crux::heap::GcCell<crate::promise::PromiseData>>,
     is_reject: bool,
     args: &[Value],
 ) -> Result<Value, JsError> {
@@ -507,7 +508,7 @@ fn dispatch_resolver(
         return Ok(Value::Undefined);
     }
     flag.set_resolved();
-    let promise = flag.promise();
+    let promise = data.borrow().promise;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if is_reject {
         reject_promise(agent, &promise, value)?;
@@ -568,7 +569,7 @@ pub(crate) fn get_prototype_from_constructor(
 
 /// Promise.prototype.then (spec 27.2.5.4).
 fn promise_then(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {
-    if !crate::promise::is_promise(agent, this) {
+    if !crate::promise::is_promise(this) {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "Promise.prototype.then called on a non-promise".into(),
@@ -1605,7 +1606,7 @@ fn promise_try(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
         Ok(value) => {
             // spec 27.2.4.11 step 6.b: a promise value is returned unwrapped
             // (no adoption), even for a subclass receiver.
-            if is_promise(agent, &value) {
+            if is_promise(&value) {
                 return Ok(value);
             }
             crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
@@ -1723,29 +1724,31 @@ mod tests {
         evaluate(source)
     }
 
-    /// A dropped promise is reclaimed. Its record holds the settled value and
-    /// the reaction lists, so a churn loop that never reaped them grew without
-    /// bound; the [[Promise]] edge on the resolver function (not the resolver
-    /// record) is what keeps a promise alive, so both die in the collection
-    /// that frees the resolver.
+    /// A dropped promise is reclaimed with its record. The record — settled
+    /// value, reaction lists, resolving-function flag — is the object's own
+    /// payload, so it dies in the collection that frees the object; nothing is
+    /// left for a reap pass to find, and nothing on the agent holds the
+    /// promise alive except the resolvers (whose functions die with it).
     #[test]
-    fn dropped_promises_are_reaped() {
+    fn dropped_promises_are_reclaimed_with_their_records() {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm().unwrap();
         agent.set_nursery_threshold(1024);
+        agent.run_script("0").unwrap();
+        agent.collect_garbage();
+        let before = crux::heap::with_heap(|heap| heap.live_count());
         agent
             .run_script("for (var i = 0; i < 4000; i++) { Promise.resolve({ x: i }); }")
             .unwrap();
-        // The second script entry reaps the resolver records (their functions
-        // died at the last sweep); the major sweeps the promises, and the
-        // third entry drains the ids it queued into the promise table.
         agent.run_script("0").unwrap();
         agent.collect_garbage();
         agent.run_script("0").unwrap();
+        let after = crux::heap::with_heap(|heap| heap.live_count());
         assert!(
-            agent.roots.promises.borrow().len() < 500,
-            "{} promise records survived the churn",
-            agent.roots.promises.borrow().len()
+            after < before + 500,
+            "{} boxes survived the promise churn ({} before)",
+            after - before,
+            before
         );
     }
 
@@ -1764,7 +1767,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(*value);
         };
-        let Some(data) = agent.promise_data(obj.id()) else {
+        let Some(data) = agent.promise_data(&obj) else {
             return Ok(*value);
         };
         match &data.borrow().state {

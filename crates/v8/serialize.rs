@@ -473,6 +473,7 @@ impl<'a> ValueSerializerHeap<'a> {
             // object, an `External`, `$262.IsHTMLDDA`.
             ObjectKind::String(_)
             | ObjectKind::Arguments(_)
+            | ObjectKind::Promise(_)
             | ObjectKind::Proxy(_)
             | ObjectKind::ModuleNamespace(_)
             | ObjectKind::IsHTMLDDA

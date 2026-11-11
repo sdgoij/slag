@@ -592,7 +592,7 @@ pub fn promise_settle(
             "a promise resolver is a function".into(),
         )
     })?;
-    let flag = resolver.resolver().map(|(flag, _)| flag);
+    let flag = resolver.resolver().map(|(flag, _, _)| flag);
     let fired_before = flag.is_some_and(|flag| flag.is_resolved());
     let args = [value.into_value()];
     crate::function::call(agent, function.value(), Value::Undefined, &args)?;
@@ -623,7 +623,7 @@ pub fn promise_result(agent: &Agent, promise: JsValue) -> Result<JsValue, JsErro
 /// [[IsHandled]] (`v8::Promise::MarkAsHandled`): the bookkeeping a host does
 /// when it takes a rejection it is not reacting to.
 pub fn promise_mark_handled(agent: &Agent, promise: JsValue) -> Result<(), JsError> {
-    promise_data(agent, promise)?.borrow_mut().is_handled = true;
+    promise_data(agent, promise)?.borrow().is_handled.set(true);
     Ok(())
 }
 
@@ -631,9 +631,9 @@ pub fn promise_mark_handled(agent: &Agent, promise: JsValue) -> Result<(), JsErr
 fn promise_data(
     agent: &Agent,
     promise: JsValue,
-) -> Result<Rc<RefCell<crate::promise::PromiseData>>, JsError> {
+) -> Result<Handle<crux::heap::GcCell<crate::promise::PromiseData>>, JsError> {
     let object = promise.as_object().ok_or_else(not_a_promise)?;
-    agent.promise_data(object.id()).ok_or_else(not_a_promise)
+    agent.promise_data(&object.0).ok_or_else(not_a_promise)
 }
 
 fn no_promise() -> JsError {
@@ -4409,7 +4409,7 @@ fn value_type_mask_with(value: &JsValue, agent: Option<&Agent>) -> u32 {
                 if agent.roots.set_data.borrow().contains_key(&id) {
                     mask |= VALUE_SET;
                 }
-                if agent.is_promise_object(id) {
+                if agent.is_promise_object(&object) {
                     mask |= VALUE_PROMISE;
                 }
                 if let Some(state) = agent.buffer_state(id) {

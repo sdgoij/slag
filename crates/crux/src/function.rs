@@ -253,43 +253,42 @@ pub struct Function {
     /// retained its object literal and closure. The edge lives on the box so
     /// the cycle is collectable once the program drops the method.
     home_object: Cell<Option<crate::heap::GcAny>>,
-    /// The [[Promise]] edge of a promise resolving function (spec 27.2.1.3.1),
-    /// as an erased heap edge. The runtime's resolver record holds the typed
-    /// value and does not trace it: a record is an Agent root and outlives its
-    /// function by one collection, so an edge on the record kept a dead
-    /// function's promise (with its settled value and reactions) alive for that
-    /// extra collection, promoting it to the old generation where only a major
-    /// could reclaim it. The edge lives here so it disappears in the same
-    /// collection that frees the function.
-    resolving_promise: Cell<Option<crate::heap::GcAny>>,
-    /// `(the capability's shared [[AlreadyResolved]] slot, reject arm)` for a
-    /// promise resolving function (spec 27.2.1.3.1); `None` on every other
-    /// function. The slot is a box of its own — one per capability, held by
-    /// both arms — rather than a side table entry per resolver: the runtime
-    /// used to keep a `promise_resolvers` map keyed by function id, which cost
-    /// a Rust allocation and a map insert per capability and made every minor
-    /// trace the whole table.
-    resolver: Cell<Option<(Handle<ResolverFlag>, bool)>>,
+    /// `(the pair's shared [[AlreadyResolved]] slot, the promise record the
+    /// pair settles, reject arm)` for a promise resolving function (spec
+    /// 27.2.1.3.1); `None` on every other function. Both live on this box so
+    /// the edges die in the same collection that frees the function, and the
+    /// record is the promise object's own payload, so a dispatch needs no side
+    /// table.
+    resolver: Cell<Option<ResolverRecord>>,
 }
 
-/// One capability's [[AlreadyResolved]] slot (spec 27.2.1.3.1), shared by the
-/// resolve and reject functions it was created for. It also carries the
-/// promise they resolve, so a resolver dispatch needs no side table.
+/// What a resolving function carries: the [[AlreadyResolved]] slot its pair
+/// shares, the Promise Record the pair settles, and which arm it is
+/// (spec 27.2.1.3.1).
+pub type ResolverRecord = (
+    Handle<ResolverFlag>,
+    Handle<crate::heap::GcCell<crate::promise::PromiseData>>,
+    bool,
+);
+
+/// One resolving-function pair's [[AlreadyResolved]] slot (spec 27.2.1.3.1),
+/// shared by the resolve and reject functions it was created for.
+///
+/// A box per *pair*, not per promise: NewPromiseResolveThenableJob
+/// (spec 27.2.1.8) creates a second pair for the same promise, and the two
+/// pairs' flags are independent — the first call of each pair settles the
+/// promise, and the pair created for a thenable must be able to call its
+/// resolve. (The promise itself is reachable from the pair's function through
+/// the record in `ObjectKind::Promise`, so the flag carries no value edge.)
 pub struct ResolverFlag {
-    promise: crate::value::Value,
     resolved: Cell<bool>,
 }
 
 impl ResolverFlag {
-    pub fn new(promise: crate::value::Value) -> Handle<Self> {
+    pub fn new() -> Handle<Self> {
         Handle::new(Self {
-            promise,
             resolved: Cell::new(false),
         })
-    }
-
-    pub fn promise(&self) -> crate::value::Value {
-        self.promise
     }
 
     pub fn is_resolved(&self) -> bool {
@@ -302,9 +301,7 @@ impl ResolverFlag {
 }
 
 impl Trace for ResolverFlag {
-    fn trace(&self, visit: &mut dyn FnMut(crate::heap::GcAny)) {
-        self.promise.trace(visit);
-    }
+    fn trace(&self, _visit: &mut dyn FnMut(crate::heap::GcAny)) {}
 }
 
 impl Trace for Function {
@@ -326,11 +323,9 @@ impl Trace for Function {
         }
         // A resolving function's [[Promise]] is reachable exactly while the
         // function is (see the field).
-        if let Some(promise) = self.resolving_promise.get() {
-            visit(promise);
-        }
-        if let Some((flag, _)) = self.resolver.get() {
+        if let Some((flag, data, _)) = self.resolver.get() {
             flag.trace(visit);
+            data.trace(visit);
         }
         // A bound function's target, bound `this`, and bound argument list
         // are Values — heap edges (GC-2; a swept target turned `extends`
@@ -396,19 +391,20 @@ impl Function {
         self.home_object.set(home_object);
     }
 
-    /// Attach the promise a resolving function settles (see the field).
-    pub fn set_resolving_promise(&self, promise: crate::heap::GcAny) {
-        self.resolving_promise.set(Some(promise));
+    /// Mark this function as a promise resolving function: the pair's
+    /// [[AlreadyResolved]] slot, the promise record it settles, and which arm
+    /// it is.
+    pub fn set_resolver(
+        &self,
+        flag: Handle<ResolverFlag>,
+        data: Handle<crate::heap::GcCell<crate::promise::PromiseData>>,
+        is_reject: bool,
+    ) {
+        self.resolver.set(Some((flag, data, is_reject)));
     }
 
-    /// Mark this function as a promise resolving function: the capability's
-    /// shared `flag` and which arm it is.
-    pub fn set_resolver(&self, flag: Handle<ResolverFlag>, is_reject: bool) {
-        self.resolver.set(Some((flag, is_reject)));
-    }
-
-    /// `(flag, is_reject)` when this function is a resolving function.
-    pub fn resolver(&self) -> Option<(Handle<ResolverFlag>, bool)> {
+    /// `(flag, record, is_reject)` when this function is a resolving function.
+    pub fn resolver(&self) -> Option<ResolverRecord> {
         self.resolver.get()
     }
 
@@ -436,7 +432,6 @@ impl Function {
             self_handle: Cell::new(None),
             environment: Cell::new(None),
             home_object: Cell::new(None),
-            resolving_promise: Cell::new(None),
             resolver: Cell::new(None),
         });
         function.self_handle.set(Some(function));
@@ -476,7 +471,6 @@ impl Function {
             self_handle: Cell::new(None),
             environment: Cell::new(None),
             home_object: Cell::new(None),
-            resolving_promise: Cell::new(None),
             resolver: Cell::new(None),
         });
         Self::link_self_handle(&function);
@@ -535,7 +529,6 @@ impl Function {
             self_handle: Cell::new(None),
             environment: Cell::new(None),
             home_object: Cell::new(None),
-            resolving_promise: Cell::new(None),
             resolver: Cell::new(None),
         });
         Self::link_self_handle(&function);

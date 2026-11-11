@@ -10,12 +10,19 @@ use std::rc::Rc;
 use crux::error::{ErrorKind, JsError};
 use crux::function::Function;
 use crux::handle::Handle;
-use crux::heap::{GcAny, Trace};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
-use crate::job::{JobCallback, host_make_job_callback};
+use crate::job::host_make_job_callback;
+
+/// The promise records live on the promise object's own `ObjectKind`
+/// (`ObjectKind::Promise`), so their types are crux's: the collector traces a
+/// promise's reactions from the object that owns them, and there is no
+/// identity-keyed table to reap.
+pub use crux::promise::{
+    PromiseCapability, PromiseData, PromiseReaction, PromiseState, ReactionKind,
+};
 
 /// Which promise hook is running (`v8::PromiseHookType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,120 +88,24 @@ pub fn run_promise_hook(
     Ok(())
 }
 
-/// [[PromiseState]] plus the reaction lists (spec 27.2.1.3).
-pub enum PromiseState {
-    Pending {
-        fulfill_reactions: Vec<PromiseReaction>,
-        reject_reactions: Vec<PromiseReaction>,
-    },
-    Fulfilled(Value),
-    Rejected(Value),
-}
-
-impl std::fmt::Debug for PromiseState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PromiseState::Pending { .. } => f.write_str("pending"),
-            PromiseState::Fulfilled(_) => f.write_str("fulfilled"),
-            PromiseState::Rejected(_) => f.write_str("rejected"),
-        }
-    }
-}
-
-impl Trace for PromiseState {
-    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        match self {
-            PromiseState::Pending {
-                fulfill_reactions,
-                reject_reactions,
-            } => {
-                fulfill_reactions.trace(visit);
-                reject_reactions.trace(visit);
-            }
-            PromiseState::Fulfilled(value) | PromiseState::Rejected(value) => value.trace(visit),
-        }
-    }
-}
-
-/// The agent-side Promise Record: the [[PromiseState]] plus the reaction
-/// lists.
-#[derive(Debug)]
-pub struct PromiseData {
-    pub state: PromiseState,
-    /// [[IsHandled]]: whether any reaction was attached (unhandled-rejection
-    /// tracking).
-    pub is_handled: bool,
-}
-
-impl Trace for PromiseData {
-    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.state.trace(visit);
-    }
-}
-
-/// A PromiseReaction Record (spec 27.2.1.5).
-#[derive(Clone)]
-pub struct PromiseReaction {
-    /// The result capability of the `then` that created this reaction; `None`
-    /// for internal reactions (async/await resumptions) that only run the
-    /// handler.
-    pub capability: Option<PromiseCapability>,
-    /// [[Type]]: which reaction list the reaction came from.
-    pub kind: ReactionKind,
-    /// [[Handler]]; empty for non-callable arguments (the default behavior).
-    pub handler: Option<JobCallback>,
-}
-
-impl std::fmt::Debug for PromiseReaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromiseReaction")
-            .field("capability", &self.capability.is_some())
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-impl Trace for PromiseReaction {
-    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.capability.trace(visit);
-        // JobCallback (job.rs) has no Trace impl of its own; trace its Value
-        // fields directly.
-        if let Some(handler) = &self.handler {
-            handler.callback.trace(visit);
-            handler.host_defined.trace(visit);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReactionKind {
-    Fulfill,
-    Reject,
-}
-
-/// A PromiseCapability Record (spec 27.2.1.1): the promise plus its
-/// resolving functions.
-#[derive(Debug, Clone)]
-pub struct PromiseCapability {
-    pub promise: Value,
-    pub resolve: Value,
-    pub reject: Value,
-}
-
-impl Trace for PromiseCapability {
-    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
-        self.promise.trace(visit);
-        self.resolve.trace(visit);
-        self.reject.trace(visit);
+/// [[IsHandled]]/state accessors are the record's own fields.
+///
+/// The record is the promise's, so reading it is one `kind` match.
+fn promise_record(
+    promise: &Value,
+) -> Option<Handle<crux::heap::GcCell<crux::promise::PromiseData>>> {
+    let ValueKind::Object(obj) = promise.kind() else {
+        return None;
+    };
+    match &obj.kind {
+        crux::object::ObjectKind::Promise(data) => Some(*data),
+        _ => None,
     }
 }
 
 /// IsPromise (spec 27.2.1.4): the value is an object with a Promise Record.
-pub fn is_promise(agent: &Agent, value: &Value) -> bool {
-    let ValueKind::Object(obj) = value.kind() else {
-        return false;
-    };
-    agent.roots.promises.borrow().contains_key(&obj.id())
+pub fn is_promise(value: &Value) -> bool {
+    promise_record(value).is_some()
 }
 
 /// The promise object of spec 27.2.4.1 steps 3-9, without the executor: the
@@ -212,24 +123,9 @@ pub(crate) fn create_promise_object(
         new_target,
         crate::builtins::promise::PROMISE_PROTO,
     )?;
-    let promise = crux::object::JsObject::ordinary_object_create(Some(proto));
+    let (promise, data) = crux::object::JsObject::promise_object_create(Some(proto));
     let promise_value = Value::Object(promise);
-    let (resolve, reject) = create_resolving_functions(agent, &promise_value);
-    agent.roots.promises.borrow_mut().insert(
-        promise.id(),
-        Rc::new(RefCell::new(PromiseData {
-            state: PromiseState::Pending {
-                fulfill_reactions: Vec::new(),
-                reject_reactions: Vec::new(),
-            },
-            is_handled: false,
-        })),
-    );
-    agent
-        .roots
-        .promise_addrs
-        .borrow_mut()
-        .insert(promise.id(), promise.as_any());
+    let (resolve, reject) = create_resolving_functions(agent, data);
     run_promise_hook(agent, PromiseHookKind::Init, &promise_value, None)?;
     Ok((promise_value, resolve, reject))
 }
@@ -333,7 +229,10 @@ pub fn new_promise_capability(
 
 /// CreateResolvingFunctions (spec 27.2.1.3.1): two built-in functions whose
 /// identity the call dispatcher routes back here.
-pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value, Value) {
+pub fn create_resolving_functions(
+    agent: &mut Agent,
+    data: Handle<crux::heap::GcCell<crux::promise::PromiseData>>,
+) -> (Value, Value) {
     let function_proto = agent
         .current_realm()
         .ok()
@@ -342,9 +241,10 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
     // The promise resolving functions are anonymous (spec 27.2.1.3.1): the
     // `name` property is the empty string. The two share one [[AlreadyResolved]]
     // flag, so resolve-then-throw or reject-then-resolve is a no-op. The flag
-    // (and the promise it resolves) is one box per capability, held by both
-    // resolver functions, so a dispatch needs no side table.
-    let flag = crux::function::ResolverFlag::new(*promise);
+    // and the promise it resolves are the promise's own record, held by both
+    // resolver functions, so a dispatch needs no side table and the pair costs
+    // no box of its own.
+    let flag = crux::function::ResolverFlag::new();
     let make = |is_reject: bool, name: &str| -> Value {
         let resolver = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -359,10 +259,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
             function_proto,
         )
         .expect("builtin creation cannot fail");
-        if let Some(promise) = crate::agent::value_box_addr(promise) {
-            resolver.set_resolving_promise(promise);
-        }
-        resolver.set_resolver(flag, is_reject);
+        resolver.set_resolver(flag, data, is_reject);
         Value::Function(resolver)
     };
     (make(false, ""), make(true, ""))
@@ -415,19 +312,14 @@ pub fn resolve_promise(
 
 /// The Promise Reject Function algorithm: reject `promise` with `reason`.
 pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Result<(), JsError> {
-    let ValueKind::Object(obj) = promise.kind() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "reject called on a non-object promise".into(),
-        ));
-    };
-    let Some(data) = agent.promise_data(obj.id()) else {
+    let Some(data) = promise_record(promise) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "reject called on a non-promise object".into(),
         ));
     };
-    let (reactions, was_handled) = {
+    let was_handled = data.borrow().is_handled.get();
+    let reactions = {
         let mut data = data.borrow_mut();
         let PromiseState::Pending {
             reject_reactions, ..
@@ -435,9 +327,12 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
         else {
             return Ok(());
         };
-        (std::mem::take(reject_reactions), data.is_handled)
+        std::mem::take(reject_reactions)
     };
     data.borrow_mut().state = PromiseState::Rejected(reason);
+    // The record is a GC box now, so a settled value stored into an OLD
+    // promise has to be remembered: nothing else roots the value.
+    crux::heap::write_barrier_box(&*data);
     run_promise_hook(agent, PromiseHookKind::Resolve, promise, None)?;
     if !was_handled {
         crate::host::promise_rejection_tracker(agent, promise, Some(&reason), false)?;
@@ -451,13 +346,7 @@ pub fn reject_promise(agent: &mut Agent, promise: &Value, reason: Value) -> Resu
 /// FulfillPromise (spec 27.2.1.4): settle with a value and run the
 /// fulfill reactions.
 pub fn fulfill_promise(agent: &mut Agent, promise: &Value, value: Value) -> Result<(), JsError> {
-    let ValueKind::Object(obj) = promise.kind() else {
-        return Err(JsError::new(
-            ErrorKind::TypeError,
-            "fulfill called on a non-object promise".into(),
-        ));
-    };
-    let Some(data) = agent.promise_data(obj.id()) else {
+    let Some(data) = promise_record(promise) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
             "fulfill called on a non-promise object".into(),
@@ -474,6 +363,7 @@ pub fn fulfill_promise(agent: &mut Agent, promise: &Value, value: Value) -> Resu
         std::mem::take(fulfill_reactions)
     };
     data.borrow_mut().state = PromiseState::Fulfilled(value);
+    crux::heap::write_barrier_box(&*data);
     run_promise_hook(agent, PromiseHookKind::Resolve, promise, None)?;
     for reaction in reactions {
         enqueue_reaction_job(agent, *promise, reaction, value);
@@ -504,20 +394,16 @@ pub fn perform_promise_then(
         kind: ReactionKind::Reject,
         handler: on_rejected.map(host_make_job_callback),
     };
-    let ValueKind::Object(obj) = promise.kind() else {
+    let Some(data) = promise_record(promise) else {
         return Err(JsError::new(
             ErrorKind::TypeError,
-            "promise is not an object".into(),
+            "promise is not a promise".into(),
         ));
     };
-    let id = obj.id();
     let promise_again = *promise;
     // Attach the reactions, or take the settled value; the borrow ends before
     // jobs are enqueued (they need `&mut agent`).
     let outcome = {
-        let data = agent
-            .promise_data(id)
-            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "promise is not a promise".into()))?;
         let mut data = data.borrow_mut();
         match &mut data.state {
             PromiseState::Pending {
@@ -532,6 +418,12 @@ pub fn perform_promise_then(
             PromiseState::Rejected(value) => Some((ReactionKind::Reject, *value)),
         }
     };
+    if outcome.is_none() {
+        // The reactions just pushed carry values (the capability, the handler),
+        // and the record is a GC box: an old promise that gains a young
+        // capability must be remembered or the minor sweeps it.
+        crux::heap::write_barrier_box(&*data);
+    }
     if let Some((kind, value)) = outcome {
         let reaction = match kind {
             ReactionKind::Fulfill => fulfill_reaction,
@@ -540,21 +432,16 @@ pub fn perform_promise_then(
         enqueue_reaction_job(agent, promise_again, reaction, value);
     }
     // Step 7: mark the promise handled once a reaction is attached.
-    let (was_handled, rejected_with) = match agent.promise_data(id) {
-        Some(data) => {
-            let data = data.borrow();
-            let rejected = match &data.state {
-                PromiseState::Rejected(value) => Some(*value),
-                _ => None,
-            };
-            (data.is_handled, rejected)
-        }
-        None => (true, None),
+    let (was_handled, rejected_with) = {
+        let data = data.borrow();
+        let rejected = match &data.state {
+            PromiseState::Rejected(value) => Some(*value),
+            _ => None,
+        };
+        (data.is_handled.get(), rejected)
     };
     if !was_handled {
-        if let Some(data) = agent.promise_data(id) {
-            data.borrow_mut().is_handled = true;
-        }
+        data.borrow_mut().is_handled.set(true);
         crate::host::promise_rejection_tracker(
             agent,
             &promise_again,
@@ -568,7 +455,7 @@ pub fn perform_promise_then(
 
 /// PromiseResolve (spec 27.2.4.5.1): the static `Promise.resolve` core.
 pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Result<Value, JsError> {
-    if is_promise(agent, &x) {
+    if is_promise(&x) {
         let ctor = crate::context::get_property(agent, &x, &JsString::from_utf8("constructor"), x)?;
         if crux::ops::same_value(&ctor, constructor) {
             return Ok(x);
@@ -707,7 +594,13 @@ fn enqueue_resolve_thenable_job(
     then: Value,
 ) -> Result<(), JsError> {
     let realm = agent.current_realm().ok();
-    let (resolve, reject) = create_resolving_functions(agent, &promise);
+    let Some(data) = promise_record(&promise) else {
+        return Err(JsError::new(
+            ErrorKind::TypeError,
+            "promise is not a promise".into(),
+        ));
+    };
+    let (resolve, reject) = create_resolving_functions(agent, data);
     agent.enqueue_promise_job(realm, move |agent| {
         let result = crate::function::call(agent, &then, thenable, &[resolve, reject]);
         match result {

@@ -68,11 +68,11 @@ impl<'s> LocalHandle<'s, Promise> {
     pub fn mark_as_handled(&self) {
         let realm = crate::realm_current();
         realm.with_agent(|agent| {
-            let Some(id) = self.engine().value().as_object().map(|object| object.id()) else {
+            let Some(object) = self.engine().value().as_object() else {
                 return;
             };
-            if let Some(data) = agent.promise_data(id) {
-                data.borrow_mut().is_handled = true;
+            if let Some(data) = agent.promise_data(&object) {
+                data.borrow().is_handled.set(true);
             }
         });
     }
@@ -267,7 +267,7 @@ impl<'s> LocalHandle<'s, PromiseResolver> {
             .value()
             .as_function()
             .and_then(|function| function.resolver())
-            .map(|(flag, _)| flag.promise());
+            .map(|(_, data, _)| data.borrow().promise);
         match promise {
             Some(promise) => Local::from_engine(api::Local::from(promise)),
             // The record is keyed by the resolving function, so a handle that

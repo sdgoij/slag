@@ -73,13 +73,10 @@ impl Trace for Job {
     }
 }
 
-/// A JobCallback Record (spec 9.5.1): a function object to invoke when a
-/// Job runs, plus a host-defined slot for propagating host context.
-#[derive(Debug, Clone)]
-pub struct JobCallback {
-    pub callback: Value,
-    pub host_defined: Option<Value>,
-}
+/// A JobCallback Record (spec 9.5.1), re-exported from crux: a promise
+/// reaction is a payload of the promise object's `ObjectKind`, so the record
+/// has to be traceable from there.
+pub use crux::job::JobCallback;
 
 /// HostMakeJobCallback (spec 9.5.2): the default implementation wraps the
 /// callback with an empty host-defined field.

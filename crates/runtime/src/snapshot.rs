@@ -2765,6 +2765,16 @@ fn children(agent: &Agent, object: &Handle<JsObject>) -> Result<Vec<Value>, Unsu
             ));
         }
         ObjectKind::External(_) => {}
+        // A promise's record (its state, its reactions, and the resolving
+        // functions those name) is live engine state in this process, not data
+        // the object holds: the blob would write the reactions' handlers and
+        // resolve a promise nobody can settle.
+        ObjectKind::Promise(_) => {
+            return Err(Unsupported::new(
+                "a promise",
+                "a promise's reactions and resolving functions are not carried yet",
+            ));
+        }
         // A host object carries its state like any other object: its internal
         // methods are callbacks in the process that built it, which a blob cannot
         // name, so the prototype and own properties below are the whole of what

@@ -1640,6 +1640,23 @@ pub fn write_barrier_element<T: Trace>(target: &T, value: crate::value::Value, i
     );
 }
 
+/// [`write_barrier`] for a store whose children are several values or not
+/// easily enumerated — a promise record's reaction list, say. Remembering the
+/// box is all a minor needs (it traces the whole payload), and the young target
+/// path is the same single load.
+pub fn write_barrier_box<T: Trace>(target: &T) {
+    let addr = barrier_target(target);
+    // SAFETY: `barrier_target` names a live box's header.
+    unsafe {
+        let header = addr.0;
+        if (*header).is_young() || (*header).is_remembered() {
+            return;
+        }
+        (*header).set_remembered(true);
+        REMEMBERED.with(|slot| slot.borrow_mut().push(addr.addr()));
+    }
+}
+
 /// [`write_barrier`] for a store of a GC handle — a `Gc<T>`/`Handle<T>` field
 /// (`Map::transitions`, `JsObject::prototype`, a captured environment) rather
 /// than a `Value`.

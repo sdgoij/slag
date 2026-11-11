@@ -613,11 +613,6 @@ pub(crate) struct AgentRoots {
     /// [[KeptAlive]]: objects/symbols kept alive until the end of the current
     /// Job (WeakRef, Phase 13).
     pub(crate) kept_alive: RefCell<Vec<Value>>,
-    /// The Promise Records keyed by promise-object identity (spec 27.2.1).
-    /// Boxed behind an `Rc` so a reader can take the record and release the
-    /// table's borrow before running anything that may allocate.
-    pub(crate) promises:
-        RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::promise::PromiseData>>>>,
     /// Per-element handlers created by the Promise combinators (all/
     /// allSettled/any), keyed by function identity.
     pub(crate) promise_compound: RefCell<
@@ -967,12 +962,6 @@ pub(crate) struct AgentRoots {
     /// (spec 26.1.1: the target is held weakly — `deref` returns it while it
     /// is reachable, `undefined` once a collection clears it; GC-4).
     pub(crate) weak_ref_targets: RefCell<std::collections::HashMap<u64, Value>>,
-    /// The box address of every promise, so a sweep can drop the entry of the
-    /// promises it reclaimed ([`AgentRoots::reap_promise_addrs`]).
-    pub(crate) promise_addrs: RefCell<std::collections::HashMap<u64, crux::heap::GcAny>>,
-    /// Promise ids whose address entry a sweep dropped, drained by
-    /// `Agent::reap_dead_promises` at the next run entry.
-    pending_dead_promises: RefCell<Vec<u64>>,
     /// The wasm JS-API wrapper tables (Cut 10). Their values are heap edges,
     /// so they are roots: an untraced `Value` here is freed, its object id
     /// reused, and a later lookup returns the wrong object (e.g.
@@ -1334,26 +1323,6 @@ impl AgentRoots {
         map.retain(|_, (_, _, _, iterator)| dead.binary_search(&iterator.addr()).is_err());
     }
 
-    fn reap_promise_addrs(&self, dead: &[usize]) {
-        if dead.is_empty() {
-            return;
-        }
-        let Ok(mut pending) = self.pending_dead_promises.try_borrow_mut() else {
-            return;
-        };
-        let Ok(mut addrs) = self.promise_addrs.try_borrow_mut() else {
-            return;
-        };
-        addrs.retain(|id, addr| {
-            if dead.binary_search(&addr.addr()).is_ok() {
-                pending.push(*id);
-                false
-            } else {
-                true
-            }
-        });
-    }
-
     /// Drop the states of generators whose object the sweep reclaimed. Without
     /// this every generator ever created leaves a rooted state in the table —
     /// its environment, execution context, suspended VM and arguments stay
@@ -1396,7 +1365,6 @@ impl AgentRoots {
             timeout_jobs: RefCell::new(VecDeque::new()),
             microtask_queues: RefCell::new(Vec::new()),
             kept_alive: RefCell::new(Vec::new()),
-            promises: RefCell::new(std::collections::HashMap::new()),
             promise_compound: RefCell::new(std::collections::HashMap::new()),
             promise_finally: RefCell::new(std::collections::HashMap::new()),
             async_resume: RefCell::new(std::collections::HashMap::new()),
@@ -1458,8 +1426,6 @@ impl AgentRoots {
             }),
             stack_traces: RefCell::new(std::collections::HashMap::new()),
             weak_ref_targets: RefCell::new(std::collections::HashMap::new()),
-            promise_addrs: RefCell::new(std::collections::HashMap::new()),
-            pending_dead_promises: RefCell::new(Vec::new()),
             #[cfg(feature = "wasm")]
             wasm_streaming_handlers: RefCell::new(std::collections::HashMap::new()),
             #[cfg(feature = "wasm")]
@@ -1584,7 +1550,6 @@ impl Trace for AgentRoots {
             crux::heap::note_aborted_trace();
         }
         self.kept_alive.trace(visit);
-        self.promises.trace(visit);
         self.promise_compound.trace(visit);
         self.promise_finally.trace(visit);
         self.async_resume.trace(visit);
@@ -3716,16 +3681,23 @@ impl Agent {
         ))
     }
 
-    /// The Promise Record of `id` (spec 27.2.1), when the object is a
-    /// promise. Answers an owned handle so the caller does not hold the
-    /// table's borrow across whatever it does with the record.
-    pub fn promise_data(&self, id: u64) -> Option<Rc<RefCell<crate::promise::PromiseData>>> {
-        self.roots.promises.borrow().get(&id).cloned()
+    /// The Promise Record of `promise`, when the object is a promise (spec
+    /// 27.2.1). The record is the object's own payload, so this is a match on
+    /// its kind rather than a table lookup: it cannot go stale, nothing has to
+    /// reap it, and no identity table has to be traced.
+    pub fn promise_data(
+        &self,
+        promise: &Handle<crux::object::JsObject>,
+    ) -> Option<Handle<crux::heap::GcCell<crate::promise::PromiseData>>> {
+        match &promise.kind {
+            crux::object::ObjectKind::Promise(data) => Some(*data),
+            _ => None,
+        }
     }
 
-    /// Whether `id` names a promise object (it has a Promise Record).
-    pub fn is_promise_object(&self, id: u64) -> bool {
-        self.roots.promises.borrow().contains_key(&id)
+    /// Whether `object` is a promise (it carries a Promise Record).
+    pub fn is_promise_object(&self, object: &Handle<crux::object::JsObject>) -> bool {
+        self.promise_data(object).is_some()
     }
 
     /// Whether `id` names a generator object (the engine keys each one's
@@ -4047,7 +4019,6 @@ impl Agent {
             // entry and collection trigger).
             self.reap_dead_functions();
             self.reap_dead_wrappers();
-            self.reap_dead_promises();
             let realm = self.current_realm()?;
             let script = if jsx {
                 crate::script::parse_script_jsx(source, realm, name)?
@@ -4219,19 +4190,6 @@ impl Agent {
                     // SAFETY: as above.
                     && unsafe { (&*agent_roots).array_iter_data.try_borrow().is_ok_and(|map| !map.is_empty()) }
             });
-        // Every promise ever constructed has an entry in `promise_addrs`, and
-        // `promises` (traced) retains each settled promise's result and
-        // reactions until the id is reaped.
-        let has_promise_addrs = self
-            .roots
-            .promise_addrs
-            .try_borrow()
-            .is_ok_and(|map| !map.is_empty())
-            || live.iter().any(|&agent_roots| {
-                agent_roots != self_roots
-                    // SAFETY: as above.
-                    && unsafe { (&*agent_roots).promise_addrs.try_borrow().is_ok_and(|map| !map.is_empty()) }
-            });
         let has_generators = self
             .roots
             .generators
@@ -4256,7 +4214,7 @@ impl Agent {
                                 .is_ok_and(|map| !map.is_empty())
                     }
             });
-        if has_iterators || has_promise_addrs || has_generators {
+        if has_iterators || has_generators {
             swept_addrs.sort_unstable();
         }
         if has_iterators {
@@ -4265,15 +4223,6 @@ impl Agent {
                 if agent_roots != self_roots {
                     // SAFETY: as above.
                     unsafe { (&*agent_roots).reap_dead_iterators(&swept_addrs) };
-                }
-            }
-        }
-        if has_promise_addrs {
-            self.roots.reap_promise_addrs(&swept_addrs);
-            for &agent_roots in &live {
-                if agent_roots != self_roots {
-                    // SAFETY: as above.
-                    unsafe { (&*agent_roots).reap_promise_addrs(&swept_addrs) };
                 }
             }
         }
@@ -4383,7 +4332,6 @@ impl Agent {
         // Drain the promise ids the sweep reclaimed. The entry's traced
         // `PromiseData` holds the settled result and its reactions, which is
         // the bulk of a long-lived promise's retained graph.
-        self.reap_dead_promises();
         // After the collections, so a host's heap-limit callback is not fired
         // for a heap a collection just brought back under the limit.
         self.check_heap_limit();
@@ -4468,13 +4416,6 @@ impl Agent {
             self.number_data.remove(&id);
             self.boolean_data.remove(&id);
             self.roots.bigint_data.borrow_mut().remove(&id);
-        }
-    }
-
-    fn reap_dead_promises(&mut self) {
-        let ids = std::mem::take(&mut *self.roots.pending_dead_promises.borrow_mut());
-        for id in ids {
-            self.roots.promises.borrow_mut().remove(&id);
         }
     }
 

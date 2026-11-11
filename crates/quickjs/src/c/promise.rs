@@ -73,7 +73,7 @@ pub unsafe extern "C" fn JS_IsPromise(val: abi::JSValue) -> bool {
     let Some(api_ctx) = context_api(current()) else {
         return false;
     };
-    api_ctx.with_agent(|agent| agent.promise_data(object.id()).is_some())
+    api_ctx.with_agent(|agent| agent.promise_data(&object).is_some())
 }
 
 #[unsafe(no_mangle)]

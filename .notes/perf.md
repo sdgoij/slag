@@ -18760,3 +18760,70 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
 built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
 parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress`; built-ins
 `--filter '*Promise*' --gc-verify` 732/732.
+
+## LANDED (2026-11-11): a promise's record is the promise object's own payload
+
+`PromiseData` lived in an agent-side table keyed by object id (`promises`),
+with a second table (`promise_addrs`) holding each promise's box address so a
+sweep could drop the entry of a reclaimed promise. Both are gone: the record is
+`ObjectKind::Promise(Handle<GcCell<PromiseData>>)`, so the collector traces a
+promise's reactions with the object that owns them and `promise_data` is a
+`match` on the kind instead of two hash lookups.
+
+Why this slice, from the promise row's own profile rather than a guess (60k-
+iteration probe, `SLAG_SAMPLE=200`, symbolized with `scratch/sym.py`):
+
+| share | what it was |
+| ---: | --- |
+| ~18% | `slice::sort::*` — the `swept_addrs.sort_unstable()` that `promise_addrs` forced on every major |
+| ~10-20% | SipHash on `promises`/`promise_addrs`, including their growth (nothing reaps an undrained job queue) |
+| ~8% | `alloc.rs:229` — the `Rc<RefCell<PromiseData>>` and per-capability `ResolverFlag` boxes |
+
+All three disappear by construction: the reap, its sort, and both tables are
+deleted, and the record is one GC box instead of an `Rc` plus a flag box.
+`ResolverFlag` survives as a plain `Cell<bool>` box because it belongs to a
+resolving-function *pair*, not to a promise.
+
+**The trap that made the first cut wrong.** Folding `[[AlreadyResolved]]` onto
+the promise record reads as an obvious saving (one pair per promise) and is
+wrong: NewPromiseResolveThenableJob (spec 27.2.1.8) mints a *second* pair for
+the same promise, with its own flag, so every `then` chain that returned a
+promise hung (`installed_jit_async_method_returns_nested_async_function`). The
+promise can own the state and the back edge; it cannot own the pair's flag.
+
+**The write barrier is mandatory here.** The record moved from outside the heap
+(where the root table traced it every collection) into a GC box, so storing a
+settled value or a reaction into it is a store into a possibly-OLD box.
+`crux::heap::write_barrier_box` remembers the box — one call per store site,
+because the box is traced whole — and the A2 verifier caught its absence on the
+first full `cargo test` run (`an old GcCell<PromiseData> holds a young
+JsString`). Any payload moved onto a GC box needs this, and the verifier is what
+finds it.
+
+Also: `ObjectKind::name()` now says "Promise", but `Object.prototype.toString`
+must not — `builtin_tag` groups promises with proxies, since
+`Object/prototype/toString/symbol-tag-promise-builtin.js` asserts that deleting
+`Promise.prototype[@@toStringTag]` reads `[object Object]`.
+
+| isolated row (min of 15, interleaved, one process each) | before | after |
+| --- | ---: | ---: |
+| `promise_churn` | 13.24 ms | **11.27** (-14.9%) |
+| `async_churn` | 61.97 ms | **59.01** (-4.8%) |
+| `p.then(null)` on a settled promise (20k) | 68.56 ms | **52.93** (-22.8%) |
+| `p.then(null)` on a pending promise (20k) | 45.97 ms | **35.33** (-23.2%) |
+| `new Promise(noop)` (20k) | 26.63 ms | **23.49** (-11.8%) |
+| `Promise.withResolvers()` (20k) | 19.65 ms | **17.74** (-9.7%) |
+
+The two `then` probes are the pure capability-creation path and lose the most;
+`async_churn` moves least because its mass is the drained-reaction body, not the
+record. These are ISOLATED-row numbers — no whole-corpus claim is made, and the
+aligned pair was not re-run (the journal's layout check is for suite swings;
+this measurement never used a suite delta).
+
+Verified: fmt; clippy --workspace --all-targets -D warnings; `cargo test
+--workspace` green serialized; test262 language 23726/23726, built-ins
+23821/23821, annexB 1086/1086 in BOTH modes; corpus 79/79 identical results
+across parent/new, jit/jitless, `--gc-stress`, `--nursery-stress`; built-ins
+`--filter '*Promise*' --gc-stress --gc-verify` 732/732; language
+`--filter '*async*' --gc-stress` 5981/6033 with the 52 pre-existing
+for-await-of destructuring gaps unchanged from the parent (base: 5979/6033).

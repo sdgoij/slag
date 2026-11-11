@@ -724,7 +724,7 @@ fn awaiting_body(
     let ValueKind::Object(object) = promise.kind() else {
         return None;
     };
-    let data = agent.promise_data(object.id())?;
+    let data = agent.promise_data(&object)?;
     let data = data.borrow();
     let crate::promise::PromiseState::Pending {
         fulfill_reactions,

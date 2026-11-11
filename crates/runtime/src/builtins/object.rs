@@ -368,9 +368,14 @@ pub fn builtin_tag(agent: &mut Agent, object: &Value) -> Result<String, JsError>
         // was removed from the spec).
         return Ok("RegExp".to_string());
     }
-    if matches!(obj.kind, crux::object::ObjectKind::Proxy(_)) {
-        // A proxy over a plain object has no built-in tag of its own
-        // (spec 20.1.3.6 steps 6-14 check O's own slots).
+    if matches!(
+        obj.kind,
+        crux::object::ObjectKind::Proxy(_) | crux::object::ObjectKind::Promise(_)
+    ) {
+        // Neither a proxy over a plain object nor a promise has a built-in tag
+        // of its own (spec 20.1.3.6 steps 4-14 check O's own slots, and
+        // [[PromiseState]] is not one of them), so a promise whose
+        // `@@toStringTag` was deleted reads "Object".
         return Ok("Object".to_string());
     }
     Ok(obj.kind.name().to_string())

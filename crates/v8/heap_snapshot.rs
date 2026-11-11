@@ -402,6 +402,7 @@ fn kind_label(kind: &ObjectKind) -> &'static str {
         ObjectKind::IntegerIndexed(_) => "TypedArray",
         ObjectKind::ModuleNamespace(_) => "Module",
         ObjectKind::IsHTMLDDA => "Object",
+        ObjectKind::Promise(_) => "Promise",
         ObjectKind::External(_) => "External",
         ObjectKind::Host(_) => "Object",
     }

@@ -874,7 +874,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             return Ok(value);
         };
-        let Some(data) = agent.promise_data(obj.id()) else {
+        let Some(data) = agent.promise_data(&obj) else {
             return Ok(value);
         };
         match &data.borrow().state {
@@ -1011,7 +1011,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             panic!("not a promise");
         };
-        let data = agent.promise_data(obj.id()).unwrap();
+        let data = agent.promise_data(&obj).unwrap();
         let state = data.borrow();
         match &state.state {
             PromiseState::Fulfilled(v) => assert_eq!(
@@ -1107,7 +1107,7 @@ mod tests {
         let ValueKind::Object(obj) = value.kind() else {
             panic!("not a promise");
         };
-        let data = agent.promise_data(obj.id()).unwrap();
+        let data = agent.promise_data(&obj).unwrap();
         let state = data.borrow();
         match &state.state {
             PromiseState::Fulfilled(v) => {

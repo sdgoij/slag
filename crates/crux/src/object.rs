@@ -555,6 +555,13 @@ pub enum ObjectKind {
     Arguments(Handle<ArgumentsSlots>),
     /// Proxy exotic (spec 10.5): every internal method is a handler trap.
     Proxy(Handle<crate::proxy::ProxySlots>),
+    /// A promise (spec 27.2.1): its Promise Record — [[PromiseState]], the
+    /// reaction lists, [[IsHandled]] and the shared [[AlreadyResolved]] slot —
+    /// hangs off the object so the collector traces it with the object that
+    /// owns it. Boxed rather than inline because every `JsObject` pays for the
+    /// largest variant, and a promise record is much larger than any other
+    /// kind's payload.
+    Promise(Handle<crate::heap::GcCell<crate::promise::PromiseData>>),
     /// TypedArray (Integer-Indexed) exotic shell (spec 10.4.5).
     IntegerIndexed(Handle<TypedArraySlots>),
     /// Module namespace exotic (spec 10.4.6).
@@ -889,6 +896,7 @@ impl Trace for ObjectKind {
             ObjectKind::String(s) => s.trace(visit),
             ObjectKind::Arguments(slots) => slots.trace(visit),
             ObjectKind::Proxy(slots) => slots.trace(visit),
+            ObjectKind::Promise(data) => data.trace(visit),
             ObjectKind::IntegerIndexed(slots) => slots.trace(visit),
             ObjectKind::ModuleNamespace(slots) => slots.trace(visit),
             ObjectKind::Array(slots) => slots.trace(visit),
@@ -910,6 +918,7 @@ impl ObjectKind {
             ObjectKind::Arguments(_) => "Arguments",
             ObjectKind::IsHTMLDDA => "HTMLDDA",
             ObjectKind::Proxy(_) => "Proxy",
+            ObjectKind::Promise(_) => "Promise",
             ObjectKind::IntegerIndexed(_) => "TypedArray",
             ObjectKind::ModuleNamespace(_) => "Module",
             ObjectKind::External(_) => "External",
@@ -1743,6 +1752,26 @@ impl JsObject {
         let object = Handle::new(Self::with_kind(kind, prototype));
         Self::link_self_handle(&object);
         object
+    }
+
+    /// Create a promise object (spec 27.2.1) with its Promise Record.
+    ///
+    /// The record and the object name each other — the resolvers settle the
+    /// promise, and the object owns the record — so the back edge is filled
+    /// here, before either is handed out.
+    pub fn promise_object_create(
+        prototype: Option<Handle<JsObject>>,
+    ) -> (
+        Handle<JsObject>,
+        Handle<crate::heap::GcCell<crate::promise::PromiseData>>,
+    ) {
+        let data = Handle::new(crate::heap::GcCell::new(
+            crate::promise::PromiseData::pending(),
+        ));
+        let object = Handle::new(Self::with_kind(ObjectKind::Promise(data), prototype));
+        Self::link_self_handle(&object);
+        data.borrow_mut().promise = Value::Object(object);
+        (object, data)
     }
 
     /// Retain `value` on this host object: `value` stays reachable from the
