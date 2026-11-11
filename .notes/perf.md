@@ -18540,3 +18540,64 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
 --workspace` green serialized (52 suites); test262 language 23726/23726, annexB
 1086/1086, built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical
 results across parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress`.
+
+## PROBED (2026-11-09, no code): promise *capability* creation is the async cliff, and one harness row misreports by 200x
+
+After the two GC slices the async rows are still ~20 us per call against node's
+~200 ns, so this decomposed the promise machinery itself, one variant per
+process (the corpus protocol), 20k iterations each:
+
+| variant | slag | node |
+| --- | ---: | ---: |
+| `new Promise(fn)` (resolve inside the executor) | 42 ms | 2.3 |
+| `new Promise(fn)` (reject inside the executor) | 37 ms | 10 |
+| `Reflect.construct(Promise, [fn])` | 57-68 ms | 4.4 |
+| `Promise.resolve(i)` | 389-441 ms | 1.8 |
+| `Promise.reject(i)` | 381-407 ms | 5.8 |
+| `Promise.withResolvers()` (capability only) | 401-425 ms | — |
+| `Promise.withResolvers().resolve(i)` | 394-416 ms | 2.3 |
+| `p.then(null)` | 461 ms | 1.4 |
+| `async f(i){ return i; }` | 465 ms | 1.0 |
+| `async f(i){ await i; }` | ~460 ms | 3.2 |
+
+The split is clean and does not follow "promise creation": constructing a
+promise is ~2 us, and **every** row that goes through `new_promise_capability`
+is ~20 us — including `withResolvers`, which does nothing else. So the cliff is
+capability creation, not the settle and not the resolver call.
+
+A `prof`-profile build (`cargo build --profile prof -p cli`) symbolized with
+`llvm-symbolizer` finally attributes a row properly (tools/profile.py's
+unwind+publics table cannot name an anonymous range, and the interpreter's hot
+code is anonymous — the symbolizer gives file:line for all of it): on the
+`Promise.reject` probe ~50% of samples are in `core::hash::sip`, plus
+`alloc::string::write_str` / `format_inner` ~5%. That is the shape of the
+42-module dispatch chain (`resolve_builtin_dispatch` probes every module) being
+run *per call*, and a capability's executor closure is minted per promise, so
+its id is never warm in `Agent::builtin_dispatch_cache`.
+
+**The fix to try next**: every `Function::create_builtin` closure of one source
+expression shares a vtable, so a "plain closure, not module-dispatched" verdict
+can be cached against that rather than against the function id (or a flag set at
+`create_builtin` and cleared by `Intrinsics::define`). A first attempt that
+short-circuited only the *resolver* call in `call_inner` moved `Promise.resolve`
+441 -> 389 ms and left `withResolvers` untouched — consistent with the executor
+closure being the one that pays, and not enough to keep. Reverted.
+
+**Caveat on that hypothesis**: the parts of `new_promise_capability` do not add
+up to its measured cost. `Reflect.construct(Promise, [fn])` — which runs the same
+`construct_inner` from Rust — is 3 us, and `create_builtin` is under 1 us by
+`new Promise`'s own 2 us with two of them, yet `withResolvers` (capability plus
+a 3-property result object) is 20 us. So something in that function is 15 us
+that no separate measurement accounts for. The next session should time
+`new_promise_capability`'s steps directly (a temporary `Instant` harness or a
+counter build) rather than infer from the surrounding rows, and should treat the
+SipHash attribution as a lead only — it was taken on `Promise.reject`, where the
+resolver chain is also in the path.
+
+**Trap: `opcost`-style rows can misreport by 200x.** The same binary on
+`Promise.withResolvers()` read 2.16 ms in one run and 401-425 ms in three later
+runs (node reads 2.3 ms). The first reading was taken as "capability creation is
+108 ns under the JIT, so the JIT fixes it", which is false: the JIT is not
+involved. Treat any single reading of a row whose number moves by more than the
+run-to-run band as a harness artifact, not as a tier effect, and re-read the row
+before building a story on it.
