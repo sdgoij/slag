@@ -18491,3 +18491,52 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
 built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
 parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress` (the barrier
 audit); `built-ins --filter '*Promise*' --gc-verify` 732/732.
+
+## LANDED (2026-11-09): the young-dominated minor trigger reads the cohort, not the heap
+
+`maybe_collect` fired a minor when `live > threshold && young > 0`, where
+`threshold` is twice the post-major live count. On any long-lived heap that is
+not a pacing rule at all: `live` sits above the threshold permanently (only a
+major re-derives it, and a major that swept nothing is disabled for the rest of
+the script), so the condition reduces to `young > 0` and collects at every safe
+point — a minor per 1024 allocations against a cohort of a few hundred, each one
+re-walking the whole root set.
+
+The comment already states the intent: collect when the *young* has grown past
+the major's growth budget, so a young-dominated growth is reclaimed by a minor
+instead of a major. That is `young > threshold`, which implies `live >
+threshold` (the cohort is part of the live count), so the change is a strict
+reduction in frequency and no heap collects more often than it did.
+
+| probe (N = 20000) | before | after |
+| --- | ---: | ---: |
+| async call + `await` park: wall | 9266 ms | **1925** (4.8x) |
+| async: minors per run | 537 | **78** |
+| `then` churn: wall | 1057 ms | **610** (1.7x) |
+| `then` churn: minors per run | 441 | **56** |
+
+Swept counts are unchanged (400001 vs 400002; 460000 both), so nothing is
+retained that used to be collected — the same garbage is reclaimed in 78
+collections instead of 537, at ~4.7 ms of root walk each on the async row.
+Peak live moves up toward the threshold, as the pacing intends: `json_stringify`
+7.2k -> 11.4k boxes (~1 MB at 100 B/box), and `concat_loop`'s rope peak is
+identical at 203031.
+
+The Brimstone suite is flat or slightly better on every row in both modes
+(`fib` 239 -> 234, `fn_forin` 24 -> 23, everything else within 1 ms); the
+isolated corpus reads `concat_loop` -10.8% jit / -4.4% jitless,
+`evaluation-order` -2.9% / -5.4%, `promise_churn` -1.0% / -3.2%, `object_keys`
+-1.1% / -1.7%, and `head-let`/`declarative_read`/`switch_dispatch` flat.
+
+**Trap: the whole-directory corpus run manufactured two double-digit
+"regressions".** In one process for all 79 rows it read `promise_churn` jit
++17.7% and the for-in head-let row jit +10.3%, and `concat_loop` -40%. One
+process per row puts the same rows at -1.0%, -0.6% and -10.8%: the row's
+absolute number is context-sensitive to what ran before it (the corpus README's
+caveat, in its most expensive form). Attribute a corpus delta only from
+isolated rows.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized (52 suites); test262 language 23726/23726, annexB
+1086/1086, built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical
+results across parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress`.

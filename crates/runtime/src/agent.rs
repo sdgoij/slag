@@ -4357,17 +4357,24 @@ impl Agent {
         // builtin's local `Vec` would be swept out from under the call. So the
         // window suppresses this trigger too.
         let suppressed = crate::ir::is_compiling();
-        let live = crux::heap::with_heap(|heap| heap.live_count());
         let young = crux::heap::with_heap(|heap| heap.young_count());
         let threshold = self.last_collected_live.get().max(1024).saturating_mul(2);
         // The young cohort is the minor's to collect. Pace it by its size, and
-        // also collect it when the heap has grown past the major threshold on
-        // young alone: a total-live comparison fires a full major there, but the
-        // growth is young, so a minor reclaims it for a fraction of the cost.
-        // This is the shape a churn loop hits — the young reaches the major
-        // threshold (about half the post-major live) well before the nursery
-        // threshold, so without this the major would starve the minor.
-        let young_dominated = live > threshold && young > 0;
+        // also collect it when the cohort *alone* has grown past the major's
+        // growth budget: a total-live comparison fires a full major there, but a
+        // young-dominated growth is a minor's for a fraction of the cost. This is
+        // the shape a churn loop hits — the young reaches the major threshold
+        // (about half the post-major live) well before the nursery threshold, so
+        // without this the major would starve the minor.
+        //
+        // The condition is the cohort's own size. The looser `live > threshold &&
+        // young > 0` held on any long-lived heap (`live` stays above a threshold
+        // that only a major re-derives, and a disabled major never does), so it
+        // collected at every safe point: a minor per 1024 allocations against a
+        // cohort of a few hundred, each one re-walking the whole root set. The
+        // async-churn probe paid 537 of them for 20k iterations and spent a third
+        // of its time in them.
+        let young_dominated = young > threshold;
         if !suppressed
             && (self.gc_stress.get()
                 || (!crux::heap::minor_disabled()
