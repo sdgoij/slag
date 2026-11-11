@@ -387,14 +387,8 @@ pub fn dispatch_call(
     let ValueKind::Function(function) = callee.kind() else {
         return None;
     };
-    let resolver = agent
-        .roots
-        .promise_resolvers
-        .borrow()
-        .get(&function.id())
-        .cloned();
-    if let Some(resolver) = resolver {
-        return Some(dispatch_resolver(agent, resolver, args));
+    if let Some((flag, is_reject)) = function.resolver() {
+        return Some(dispatch_resolver(agent, flag, is_reject, args));
     }
     let state = agent
         .roots
@@ -505,17 +499,15 @@ pub(crate) fn handler_for(name: &str) -> Option<crate::function::BuiltinHandler>
 /// The Promise Resolve/Reject Function algorithm (spec 27.2.1.3.2).
 fn dispatch_resolver(
     agent: &mut Agent,
-    resolver: Rc<RefCell<crate::promise::ResolverData>>,
+    flag: Handle<crux::function::ResolverFlag>,
+    is_reject: bool,
     args: &[Value],
 ) -> Result<Value, JsError> {
-    let (promise, is_reject) = {
-        let data = resolver.borrow();
-        (data.promise, data.is_reject)
-    };
-    if resolver.borrow().already_resolved.get() {
+    if flag.is_resolved() {
         return Ok(Value::Undefined);
     }
-    resolver.borrow().already_resolved.set(true);
+    flag.set_resolved();
+    let promise = flag.promise();
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if is_reject {
         reject_promise(agent, &promise, value)?;

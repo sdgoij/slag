@@ -2,11 +2,9 @@
 //! host makes into one (v8::Promise, v8::PromiseState, v8::PromiseRejectEvent,
 //! v8::Promise::Resolver).
 
-use std::cell::RefCell;
 use std::marker::PhantomData;
 
 use runtime::api;
-use runtime::promise::ResolverData;
 
 use crate::data::{Function, Promise, PromiseResolver, Value};
 use crate::handle::{Local, LocalHandle};
@@ -264,7 +262,12 @@ impl PromiseResolver {
 impl<'s> LocalHandle<'s, PromiseResolver> {
     /// The promise this resolver settles (v8::Promise::Resolver::GetPromise).
     pub fn get_promise<'a>(&self, _scope: &PinScope<'a, '_>) -> Local<'a, Promise> {
-        let promise = self.resolver_data(|data| data.borrow().promise);
+        let promise = self
+            .engine()
+            .value()
+            .as_function()
+            .and_then(|function| function.resolver())
+            .map(|(flag, _)| flag.promise());
         match promise {
             Some(promise) => Local::from_engine(api::Local::from(promise)),
             // The record is keyed by the resolving function, so a handle that
@@ -331,18 +334,12 @@ impl<'s> LocalHandle<'s, PromiseResolver> {
     }
 
     /// The `[[AlreadyResolved]]` flag the resolver pair shares.
+    ///
+    /// The flag lives on the resolving function's own payload — one box per
+    /// capability, held by both arms — so no side table is consulted.
     fn already_resolved(&self) -> Option<bool> {
-        self.resolver_data(|data| data.borrow().already_resolved.get())
-    }
-
-    /// The engine's record for the resolving function this handle names: the one
-    /// place the pair's promise and the flag they share live. The engine keys it
-    /// by the *function's* identity — a function value has no object side here —
-    /// so a handle that names anything else answers `None`.
-    fn resolver_data<T>(&self, read: impl FnOnce(&RefCell<ResolverData>) -> T) -> Option<T> {
-        let id = self.engine().value().as_function()?.id();
-        self.with_agent(|agent| agent.promise_resolver_data(id).map(|data| read(&data)))
-            .flatten()
+        let function = self.engine().value().as_function()?;
+        Some(function.resolver()?.0.is_resolved())
     }
 }
 

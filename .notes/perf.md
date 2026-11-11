@@ -18710,3 +18710,53 @@ capability, and letting a resolver be dispatched from its own payload instead of
 a side table. That removes Rust-heap allocations, two map inserts, two
 per-collection root-table scans, and two `create_builtin` name/length defines —
 i.e. it serves the allocation axis and the incremental-roots axis at once.
+
+## LANDED (2026-11-09): a capability's [[AlreadyResolved]] slot lives on its resolver
+
+The last constant-factor the promise rows still paid was the resolver record: a
+`promise_resolvers` map keyed by function id, holding one
+`Rc<RefCell<ResolverData>>` per resolving function. Two Rust allocations and two
+map entries per capability, plus a table the collector traced in full on every
+minor.
+
+The record's two remaining fields now live where the promise edge already did
+(`Function::resolving_promise`, added earlier for exactly this reason), so the
+map is gone:
+
+- `ResolverFlag` — a GC box holding the capability's promise and the
+  [[AlreadyResolved]] bit it shares with its sibling arm — one per capability;
+- each resolver `Function` carries `(Handle<ResolverFlag>, is_reject)`, traced
+  from its own payload, so both the flag and the promise disappear in the
+  collection that frees the function;
+- `dispatch_call` reads the slot off the callee instead of probing a table, and
+  `Agent::promise_resolver_data` (the host facade's accessor) reads it from the
+  function value it was already given.
+
+| probe (20k iterations, one process each) | before | after |
+| --- | ---: | ---: |
+| `p.then(null)` | 106.0 ms | **69.9** (-34%) |
+| `Promise.resolve(i)` | 23.1 ms | **19.6** (-15%) |
+| `Promise.reject(i)` | 23.4 ms | **20.0** (-15%) |
+| `Promise.withResolvers()` | 23.7 ms | **20.7** (-13%) |
+| `withResolvers().resolve(i)` | 30.0 ms | **25.8** (-14%) |
+| `new Promise(fn)` | 40.0 ms | **36.0** (-10%) |
+| `async f(i){ return i; }` | 63.2 ms | **59.1** (-6.5%) |
+
+Corpus: `promise_churn` 15.3 -> **13.1 ms** (-14%); the end-to-end probes are
+207 -> 201 ms (`then` churn) and flat on the async row (917-938 vs 921-946).
+
+`Function` grew by the new slot (`Cell<Option<(Handle<ResolverFlag>, bool)>>`),
+which every closure pays for; the Brimstone `closures` row reads 31 -> 32 ms
+(1 ms quantization) and nothing else moved.
+
+**The layout trap, once more.** The unaligned suite showed `arith` +21.7% and
+`fn_arith` +23.4% — interpreter arithmetic rows with no promise in them. The
+aligned pair (`-align-all-functions=5` on both sides) reads +3.4% and -0.4%, so
+both swings were native layout; `array` reads -8.9% in the same pair. Do not
+attribute a swing from the unflagged suite.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
+parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress`; built-ins
+`--filter '*Promise*' --gc-verify` 732/732.

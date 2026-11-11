@@ -618,10 +618,6 @@ pub(crate) struct AgentRoots {
     /// table's borrow before running anything that may allocate.
     pub(crate) promises:
         RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::promise::PromiseData>>>>,
-    /// The resolving functions created by CreateResolvingFunctions, keyed by
-    /// function identity (spec 27.2.1.3).
-    pub(crate) promise_resolvers:
-        RefCell<std::collections::HashMap<u64, Rc<RefCell<crate::promise::ResolverData>>>>,
     /// Per-element handlers created by the Promise combinators (all/
     /// allSettled/any), keyed by function identity.
     pub(crate) promise_compound: RefCell<
@@ -1401,7 +1397,6 @@ impl AgentRoots {
             microtask_queues: RefCell::new(Vec::new()),
             kept_alive: RefCell::new(Vec::new()),
             promises: RefCell::new(std::collections::HashMap::new()),
-            promise_resolvers: RefCell::new(std::collections::HashMap::new()),
             promise_compound: RefCell::new(std::collections::HashMap::new()),
             promise_finally: RefCell::new(std::collections::HashMap::new()),
             async_resume: RefCell::new(std::collections::HashMap::new()),
@@ -1590,7 +1585,6 @@ impl Trace for AgentRoots {
         }
         self.kept_alive.trace(visit);
         self.promises.trace(visit);
-        self.promise_resolvers.trace(visit);
         self.promise_compound.trace(visit);
         self.promise_finally.trace(visit);
         self.async_resume.trace(visit);
@@ -3740,15 +3734,6 @@ impl Agent {
         self.roots.generators.borrow().contains_key(&id)
     }
 
-    /// The record of the resolving function `id`, when it is one
-    /// (spec 27.2.1.3).
-    pub fn promise_resolver_data(
-        &self,
-        id: u64,
-    ) -> Option<Rc<RefCell<crate::promise::ResolverData>>> {
-        self.roots.promise_resolvers.borrow().get(&id).cloned()
-    }
-
     /// HostEnqueueGenericJob (spec 9.5.3): schedule a job without additional
     /// constraints such as priority.
     pub fn enqueue_generic_job(
@@ -4453,10 +4438,6 @@ impl Agent {
             return;
         }
         for id in dead {
-            // A resolver record is keyed by the function's id and outlives the
-            // function by one collection; release it here so the table does
-            // not accumulate stale records.
-            self.roots.promise_resolvers.borrow_mut().remove(&id);
             if self.remove_ecma_function(&id).is_none() {
                 continue;
             }

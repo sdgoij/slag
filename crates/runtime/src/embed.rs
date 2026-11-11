@@ -586,20 +586,14 @@ pub fn promise_settle(
     function: JsValue,
     value: JsValue,
 ) -> Result<bool, JsError> {
-    let id = function
-        .value()
-        .as_function()
-        .map(|function| function.id())
-        .ok_or_else(|| {
-            JsError::new(
-                ErrorKind::TypeError,
-                "a promise resolver is a function".into(),
-            )
-        })?;
-    let fired_before = agent
-        .promise_resolver_data(id)
-        .map(|data| data.borrow().already_resolved.get())
-        .unwrap_or(false);
+    let resolver = function.value().as_function().ok_or_else(|| {
+        JsError::new(
+            ErrorKind::TypeError,
+            "a promise resolver is a function".into(),
+        )
+    })?;
+    let flag = resolver.resolver().map(|(flag, _)| flag);
+    let fired_before = flag.is_some_and(|flag| flag.is_resolved());
     let args = [value.into_value()];
     crate::function::call(agent, function.value(), Value::Undefined, &args)?;
     Ok(!fired_before)

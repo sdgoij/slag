@@ -132,28 +132,6 @@ impl Trace for PromiseData {
     }
 }
 
-/// A resolving function record (spec 27.2.1.3.1): which promise it resolves
-/// and whether it has already fired.
-#[derive(Debug)]
-pub struct ResolverData {
-    pub promise: Value,
-    /// The [[AlreadyResolved]] flag, shared by the resolve and reject
-    /// functions of one capability (spec 27.2.1.3.1).
-    pub already_resolved: std::rc::Rc<std::cell::Cell<bool>>,
-    pub is_reject: bool,
-}
-
-impl Trace for ResolverData {
-    fn trace(&self, _visit: &mut dyn FnMut(GcAny)) {
-        // The [[Promise]] edge lives on the resolver function box, not on this
-        // record: a record outlives its function by one collection (its id
-        // only reaches the death queue at the sweep that frees the function),
-        // so tracing here kept every dead promise alive for that extra
-        // collection and promoted it to the old generation. See
-        // `Function::resolving_promise`.
-    }
-}
-
 /// A PromiseReaction Record (spec 27.2.1.5).
 #[derive(Clone)]
 pub struct PromiseReaction {
@@ -363,8 +341,10 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         .and_then(|v| crate::context::as_object(&v));
     // The promise resolving functions are anonymous (spec 27.2.1.3.1): the
     // `name` property is the empty string. The two share one [[AlreadyResolved]]
-    // flag, so resolve-then-throw or reject-then-resolve is a no-op.
-    let already_resolved = std::rc::Rc::new(std::cell::Cell::new(false));
+    // flag, so resolve-then-throw or reject-then-resolve is a no-op. The flag
+    // (and the promise it resolves) is one box per capability, held by both
+    // resolver functions, so a dispatch needs no side table.
+    let flag = crux::function::ResolverFlag::new(*promise);
     let make = |is_reject: bool, name: &str| -> Value {
         let resolver = Function::create_builtin(
             Some(JsString::from_utf8(name)),
@@ -382,14 +362,7 @@ pub fn create_resolving_functions(agent: &mut Agent, promise: &Value) -> (Value,
         if let Some(promise) = crate::agent::value_box_addr(promise) {
             resolver.set_resolving_promise(promise);
         }
-        agent.roots.promise_resolvers.borrow_mut().insert(
-            resolver.id(),
-            Rc::new(RefCell::new(ResolverData {
-                promise: *promise,
-                already_resolved: already_resolved.clone(),
-                is_reject,
-            })),
-        );
+        resolver.set_resolver(flag, is_reject);
         Value::Function(resolver)
     };
     (make(false, ""), make(true, ""))

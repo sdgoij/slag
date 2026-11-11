@@ -262,6 +262,49 @@ pub struct Function {
     /// could reclaim it. The edge lives here so it disappears in the same
     /// collection that frees the function.
     resolving_promise: Cell<Option<crate::heap::GcAny>>,
+    /// `(the capability's shared [[AlreadyResolved]] slot, reject arm)` for a
+    /// promise resolving function (spec 27.2.1.3.1); `None` on every other
+    /// function. The slot is a box of its own — one per capability, held by
+    /// both arms — rather than a side table entry per resolver: the runtime
+    /// used to keep a `promise_resolvers` map keyed by function id, which cost
+    /// a Rust allocation and a map insert per capability and made every minor
+    /// trace the whole table.
+    resolver: Cell<Option<(Handle<ResolverFlag>, bool)>>,
+}
+
+/// One capability's [[AlreadyResolved]] slot (spec 27.2.1.3.1), shared by the
+/// resolve and reject functions it was created for. It also carries the
+/// promise they resolve, so a resolver dispatch needs no side table.
+pub struct ResolverFlag {
+    promise: crate::value::Value,
+    resolved: Cell<bool>,
+}
+
+impl ResolverFlag {
+    pub fn new(promise: crate::value::Value) -> Handle<Self> {
+        Handle::new(Self {
+            promise,
+            resolved: Cell::new(false),
+        })
+    }
+
+    pub fn promise(&self) -> crate::value::Value {
+        self.promise
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.resolved.get()
+    }
+
+    pub fn set_resolved(&self) {
+        self.resolved.set(true);
+    }
+}
+
+impl Trace for ResolverFlag {
+    fn trace(&self, visit: &mut dyn FnMut(crate::heap::GcAny)) {
+        self.promise.trace(visit);
+    }
 }
 
 impl Trace for Function {
@@ -285,6 +328,9 @@ impl Trace for Function {
         // function is (see the field).
         if let Some(promise) = self.resolving_promise.get() {
             visit(promise);
+        }
+        if let Some((flag, _)) = self.resolver.get() {
+            flag.trace(visit);
         }
         // A bound function's target, bound `this`, and bound argument list
         // are Values — heap edges (GC-2; a swept target turned `extends`
@@ -355,6 +401,17 @@ impl Function {
         self.resolving_promise.set(Some(promise));
     }
 
+    /// Mark this function as a promise resolving function: the capability's
+    /// shared `flag` and which arm it is.
+    pub fn set_resolver(&self, flag: Handle<ResolverFlag>, is_reject: bool) {
+        self.resolver.set(Some((flag, is_reject)));
+    }
+
+    /// `(flag, is_reject)` when this function is a resolving function.
+    pub fn resolver(&self) -> Option<(Handle<ResolverFlag>, bool)> {
+        self.resolver.get()
+    }
+
     /// A bare ECMAScript function value: identity and name only, used until
     /// the Phase 7 evaluator fills in the callable body. The object starts
     /// with a null prototype.
@@ -380,6 +437,7 @@ impl Function {
             environment: Cell::new(None),
             home_object: Cell::new(None),
             resolving_promise: Cell::new(None),
+            resolver: Cell::new(None),
         });
         function.self_handle.set(Some(function));
         function.object.function_self.set(Some(function));
@@ -419,6 +477,7 @@ impl Function {
             environment: Cell::new(None),
             home_object: Cell::new(None),
             resolving_promise: Cell::new(None),
+            resolver: Cell::new(None),
         });
         Self::link_self_handle(&function);
         function.object.function_self.set(Some(function));
@@ -477,6 +536,7 @@ impl Function {
             environment: Cell::new(None),
             home_object: Cell::new(None),
             resolving_promise: Cell::new(None),
+            resolver: Cell::new(None),
         });
         Self::link_self_handle(&function);
         function.object.function_self.set(Some(function));
