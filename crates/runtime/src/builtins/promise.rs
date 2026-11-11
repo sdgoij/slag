@@ -17,13 +17,13 @@ use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::promise::{
-    PromiseData, PromiseState, error_value, is_promise, new_promise_capability,
-    perform_promise_then, promise_resolve, reject_promise, resolve_promise,
+    error_value, is_promise, new_promise_capability, perform_promise_then, promise_resolve,
+    reject_promise, resolve_promise,
 };
 use crate::realm::Realm;
 
-const PROMISE: &str = "%Promise%";
-const PROMISE_PROTO: &str = "%Promise.prototype%";
+pub(crate) const PROMISE: &str = "%Promise%";
+pub(crate) const PROMISE_PROTO: &str = "%Promise.prototype%";
 const THEN: &str = "then";
 const CATCH: &str = "catch";
 const FINALLY: &str = "finally";
@@ -538,33 +538,8 @@ fn promise_constructor(
             "Promise resolver 1 is not a function".into(),
         ));
     }
-    let proto = get_prototype_from_constructor(agent, new_target, PROMISE_PROTO)?;
-    let promise = JsObject::ordinary_object_create(Some(proto));
-    let promise_value = Value::Object(promise);
-    let (resolve, reject) = crate::promise::create_resolving_functions(agent, &promise_value);
-    agent.roots.promises.borrow_mut().insert(
-        promise.id(),
-        Rc::new(RefCell::new(PromiseData {
-            state: PromiseState::Pending {
-                fulfill_reactions: Vec::new(),
-                reject_reactions: Vec::new(),
-            },
-            is_handled: false,
-        })),
-    );
-    agent
-        .roots
-        .promise_addrs
-        .borrow_mut()
-        .insert(promise.id(), promise.as_any());
-    // The context's init hook runs once the promise exists, which is where V8
-    // fires it from the constructor and capability paths.
-    crate::promise::run_promise_hook(
-        agent,
-        crate::promise::PromiseHookKind::Init,
-        &promise_value,
-        None,
-    )?;
+    let (promise_value, resolve, reject) =
+        crate::promise::create_promise_object(agent, new_target)?;
     let result = crate::function::call(agent, &executor, Value::Undefined, &[resolve, reject]);
     if let Err(error) = result {
         let rejection = error_value(agent, &error);
@@ -573,7 +548,7 @@ fn promise_constructor(
     Ok(promise_value)
 }
 /// GetPrototypeFromConstructor (spec 10.2.4) against `intrinsic_name`.
-fn get_prototype_from_constructor(
+pub(crate) fn get_prototype_from_constructor(
     agent: &mut Agent,
     constructor: &Value,
     intrinsic_name: &str,
@@ -1801,9 +1776,9 @@ mod tests {
             return Ok(*value);
         };
         match &data.borrow().state {
-            PromiseState::Fulfilled(v) => Ok(*v),
-            PromiseState::Rejected(v) => Ok(*v),
-            PromiseState::Pending { .. } => Err(JsError::new(
+            crate::promise::PromiseState::Fulfilled(v) => Ok(*v),
+            crate::promise::PromiseState::Rejected(v) => Ok(*v),
+            crate::promise::PromiseState::Pending { .. } => Err(JsError::new(
                 ErrorKind::TypeError,
                 "promise still pending".into(),
             )),

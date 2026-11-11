@@ -18601,3 +18601,52 @@ runs (node reads 2.3 ms). The first reading was taken as "capability creation is
 involved. Treat any single reading of a row whose number moves by more than the
 run-to-run band as a harness artifact, not as a tier effect, and re-read the row
 before building a story on it.
+
+## LANDED (2026-11-09): a stock constructor's promise capability skips its executor
+
+The previous entry left a discrepancy: a capability cost ~20 us while its
+separately measured parts summed to ~4 us. A gated per-step `Instant` harness
+inside `new_promise_capability` settled it in one run (`SLAG_PROMISE_TIMING=1`,
+removed again afterwards): **`construct` was 18.3 of the 18.7 us**;
+`is_constructor` 30 ns, the cached `%Function.prototype%` read 56 ns, the
+executor's `create_builtin` 302 ns, the suppress window 27 ns, the captured-slot
+check 28 ns.
+
+Inside that `construct`, `promise_constructor` calls the executor — a builtin
+closure minted per capability. Its function id is new every time, so
+`Agent::builtin_dispatch_cache` can never warm for it and `resolve_builtin_dispatch`
+re-probes all 42 module dispatchers on every call (the `core::hash::sip` share in
+the profile). `new Promise(fn)` escapes this because the executor it runs is a
+compiled JS closure, not a fresh builtin.
+
+The executor is unobservable when the constructor is the realm's own `%Promise%`:
+it exists only to hand the resolving functions back to `NewPromiseCapability`.
+That path now builds the promise directly through a shared
+`promise::create_promise_object` (prototype, object, both resolving functions, the
+state record, the init hook) — the same body `promise_constructor` uses, so the
+two cannot drift. Every hot caller (`Promise.resolve`/`reject`, `then`'s species
+capability, the async function return) passes the stock constructor.
+
+| probe (20k iterations, one process each) | before | after | node |
+| --- | ---: | ---: | ---: |
+| capability (`withResolvers`) | 18.7 us | **0.76 us** | ~0.1 |
+| `Promise.resolve(i)` | 402 ms | **23.7 ms** | 1.8 |
+| `Promise.reject(i)` | 407 ms | **23.4 ms** | 5.8 |
+| `p.then(null)` | 461 ms | **106.0 ms** | 1.4 |
+| `async f(i){ return i; }` | 465 ms | **63.2 ms** | 1.0 |
+
+End to end: the `then`-churn probe (N=20000) 637 -> 211 ms and the async-call
+probe 2003 -> 891 ms against the parent commit (interleaved, min of three); the
+corpus rows read `promise_churn` 49.7 -> **13.1 ms** (-73.6%) and `async_churn`
+139.0 -> **61.1 ms** (-56.1%). The Brimstone suite and the non-promise corpus
+rows are unchanged (every delta inside the 1 ms quantization of a 20-240 ms row).
+
+What is left in these rows is no longer capability creation: `then` is 106 ms
+against node's 1.4 and `new Promise` (40 ms) plus `Reflect.construct` (56 ms) have
+not moved, so the next slice is the reaction/job path rather than the settle.
+
+Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
+--workspace` green serialized; test262 language 23726/23726, annexB 1086/1086,
+built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
+parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress`; built-ins
+`--filter '*Promise*' --gc-verify` 732/732.

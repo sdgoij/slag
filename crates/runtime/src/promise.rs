@@ -219,6 +219,43 @@ pub fn is_promise(agent: &Agent, value: &Value) -> bool {
     agent.roots.promises.borrow().contains_key(&obj.id())
 }
 
+/// The promise object of spec 27.2.4.1 steps 3-9, without the executor: the
+/// prototype, the object, its two resolving functions, its state record and the
+/// init hook.
+///
+/// Shared by `promise_constructor` and the capability fast path below, so the
+/// two cannot drift.
+pub(crate) fn create_promise_object(
+    agent: &mut Agent,
+    new_target: &Value,
+) -> Result<(Value, Value, Value), JsError> {
+    let proto = crate::builtins::promise::get_prototype_from_constructor(
+        agent,
+        new_target,
+        crate::builtins::promise::PROMISE_PROTO,
+    )?;
+    let promise = crux::object::JsObject::ordinary_object_create(Some(proto));
+    let promise_value = Value::Object(promise);
+    let (resolve, reject) = create_resolving_functions(agent, &promise_value);
+    agent.roots.promises.borrow_mut().insert(
+        promise.id(),
+        Rc::new(RefCell::new(PromiseData {
+            state: PromiseState::Pending {
+                fulfill_reactions: Vec::new(),
+                reject_reactions: Vec::new(),
+            },
+            is_handled: false,
+        })),
+    );
+    agent
+        .roots
+        .promise_addrs
+        .borrow_mut()
+        .insert(promise.id(), promise.as_any());
+    run_promise_hook(agent, PromiseHookKind::Init, &promise_value, None)?;
+    Ok((promise_value, resolve, reject))
+}
+
 /// NewPromiseCapability (spec 27.2.1.5): construct `constructor` with an
 /// executor that captures the resolving functions.
 pub fn new_promise_capability(
@@ -230,6 +267,25 @@ pub fn new_promise_capability(
             ErrorKind::TypeError,
             "Promise constructor is not a constructor".into(),
         ));
+    }
+    // NewPromiseCapability's executor is unobservable for the realm's own
+    // `%Promise%` — it exists only to hand the resolving functions back to the
+    // caller. Building it costs a general `function::construct` whose body
+    // calls a freshly minted builtin closure, and a fresh id is one no
+    // dispatch cache can ever warm: the module chain re-probes on every
+    // capability. Measured 2026-11-09: 18.3 us of the 18.7 us a capability
+    // took. Every hot caller (`Promise.resolve`/`reject`/`then`, the async
+    // function return) passes the stock constructor, so they all take this.
+    if let Ok(realm) = agent.current_realm()
+        && let Some(stock) = realm.intrinsics.get(crate::builtins::promise::PROMISE)
+        && crux::ops::same_value(&stock, constructor)
+    {
+        let (promise, resolve, reject) = create_promise_object(agent, constructor)?;
+        return Ok(PromiseCapability {
+            promise,
+            resolve,
+            reject,
+        });
     }
     let captured: Rc<RefCell<Option<(Value, Value)>>> = Rc::new(RefCell::new(None));
     let function_proto = agent
