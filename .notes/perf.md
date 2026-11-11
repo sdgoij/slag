@@ -18676,3 +18676,37 @@ per capability, and a reap that tests liveness instead of sorting the dead set.
 
 This also means the `then`/reaction slice is **not** the next cheap win; the
 capability was.
+
+## SCOPED (2026-11-09, no code): `then`'s residual is the drop path, and the keys are not the boxes
+
+Sharpening the entry above with line-level attribution (`llvm-symbolizer` over a
+`prof`-profile build, `p.then(null)` under `--corpus`):
+
+- 18.8% sits in `crux::heap::impl$2::VTABLE::closure$3` at **heap.rs:375** — the
+  vtable's `drop` closure, whose body is `request_finalize()` + the
+  `drop_releases_heap()` branch + the inlined `drop_in_place` for the payload
+  (instantiated for `JsString`), plus 12.0% more in its `FnOnce::call_once`
+  shim. So ~31% of the row is **destroying the per-iteration object graph during
+  the sweep**, not building it;
+- the property-key hypothesis is dead: `PropertyKey::from_js_string` interns to
+  an `AtomId` (`PropertyKey::String(AtomId)`), so `"constructor"`, `"then"` and
+  `@"species"` cost an interner lookup, never a GC box;
+- and `Function::name` is an inline `Option<JsString>`, so the resolver names
+  are not boxes either.
+
+That leaves the *count* of boxes per capability as the lever, not their shape:
+one promise object plus two resolver `Function` boxes per `then`, each with the
+`name`/`length` property values `create_builtin` defines, each traced and then
+dropped. Confirmed by the earlier attempt: replacing the collector's
+sort+binary-search reap with an O(1) dead set measured flat (promise churn
+202-209 -> 210-225 ms, `then` 98-100 -> 101-106 ms from a 5.7% sort estimate that
+did not survive), so the collector's *bookkeeping* is not the cost — the number
+of boxes is.
+
+**The change to make, scoped**: `ResolverData` and `PromiseData` move onto the
+boxes they belong to (the promise and the resolver function), replacing the
+`Rc<RefCell<..>>` pair and the two `promise_resolvers` map entries per
+capability, and letting a resolver be dispatched from its own payload instead of
+a side table. That removes Rust-heap allocations, two map inserts, two
+per-collection root-table scans, and two `create_builtin` name/length defines —
+i.e. it serves the allocation axis and the incremental-roots axis at once.
