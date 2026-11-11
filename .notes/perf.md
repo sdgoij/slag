@@ -18650,3 +18650,29 @@ Verified: clippy --workspace --all-targets -D warnings, fmt; `cargo test
 built-ins 23821/23821 in BOTH modes; corpus 79/79 with identical results across
 parent/new, jit/jitless, `--gc-stress`, and `--nursery-stress`; built-ins
 `--filter '*Promise*' --gc-verify` 732/732.
+
+## PROBED (2026-11-09, no code): after the capability slice, `then` is allocation- and vtable-bound
+
+`p.then(null)` now costs ~5.3 us per call against node's ~70 ns, so it was
+profiled the same way (a `prof`-profile build, `--corpus` so the one-off
+optimizing-tier compile stays in the warm-up, `llvm-symbolizer`):
+
+- `crux::heap::VTABLE` trace/drop closures 18.8% + the `FnOnce::call_once` shim
+  11.8% + `core::ops::function.rs:250` 14.5% — the GC vtable dispatch, most of it
+  instantiated for `JsString` (every resolving function is minted with a
+  `JsString` name);
+- `core::hash::sip` ~5.5%;
+- `core::slice::sort` ~5.7% — the collector's `swept_addrs` sort, which a run
+  with promises always takes (`has_promise_addrs`), feeding
+  `reap_promise_addrs`'s `retain` with a binary search per map entry;
+- `Gc::new` 1.6%, `ptr::copy` 1.5%, `drop_in_place<FunctionKind>` 1.5%.
+
+So the remaining `then` cost is the per-iteration object graph (one result
+promise + two resolver builtin functions, each with a `JsString` name) and the
+collector's work on it, not the reaction bookkeeping. That is the allocation
+axis the notes already record at 3-5x node, and it needs a different lever:
+promise/resolver records that do not mint a `JsString` and two builtin functions
+per capability, and a reap that tests liveness instead of sorting the dead set.
+
+This also means the `then`/reaction slice is **not** the next cheap win; the
+capability was.
