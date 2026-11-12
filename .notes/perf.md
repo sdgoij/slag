@@ -19018,3 +19018,60 @@ hot arms, which is the coupling the no-op arm swap measured at 6.8% on
 Verified: fmt; clippy --workspace --all-targets -D warnings; clippy
 `-p cli -p runtime --features step-stats`; `cargo test --workspace` green
 serialized.
+
+## LANDED (2026-11-11): the dispatch is a 682-line hot core plus ten cold handlers
+
+`run_inner_inner` was 3,368 lines and 233 arms in one function, so any edit
+re-laid every arm after it — 6.8% on `promise_churn` for a no-op arm swap. The
+census said 40 variants run 99% of dispatches, so the other 193 arms moved,
+verbatim, into `crates/runtime/src/ir/cold.rs`: ten `#[cold] #[inline(never)]`
+methods, one per family (generator, async, class, tryctl, destructure, literal,
+iteration, scope, call, misc). The dispatch keeps the 40 hot arms inline and
+gains one or-pattern arm per family:
+
+```rust
+step @ (Step::YieldStarResume { .. } | Step::AsyncYieldStarResume { .. } | ...) => {
+    match self.cold_generator(agent, body, step)? {
+        StepControl::Next => {}
+        StepControl::Outcome(outcome) => return Ok(outcome),
+    }
+}
+```
+
+`run_inner_inner` is now **682 lines, 40 arms**; `cold.rs` is 3,137 lines in ten
+methods, each its own layout unit. `StepControl` (`Next` | `Outcome`) carries the
+one thing the arms used the loop's control flow for: a `continue` that resumed
+the dispatch loop became `Next`, and `return Ok(x)` became `Outcome(x)`. The
+move is text-for-text apart from those rewrites; `StepControl` is deliberately
+not a `VmOutcome` variant, so no driver outside the loop can ever observe it.
+
+**Two traps in the move.** A blanket `continue;` rewrite is wrong: two of the
+four bare `continue` statements were inside *nested* loops (`ClassBegin`'s
+private-name scan, `ScriptGlobalFlush`'s value-compare skip) and aborting them
+silently broke every class definition ("ClassFinish without a pending class",
+caught by the runtime tests). And the last arm's span swallows the match's
+closing braces, so the extraction has to clamp spans to the match's `}`.
+
+**The acceptance test, which is the point of the refactor.** Repeat the no-op
+perturbation — swap two arms, change nothing semantically — and compare:
+
+| zero-semantics arm swap | `promise_churn` |
+| --- | ---: |
+| before the split (inside the dispatch, `Pop`/`Dup`) | **-6.8%** |
+| after the split (inside `cold_misc`, 26-line and 5-line arms) | **+1.2%** |
+
+Same perturbation class, one order of magnitude less coupling; the loop rows are
+flat in both (±0.2%). An edit to the generator machinery can no longer move the
+arithmetic arms.
+
+**Perf is neutral, as intended** (min of 9, interleaved): `promise_churn`
+11.061 -> 10.464 ms, `async_churn` 58.132 -> 61.050, `withResolvers` 13.831 ->
+13.726, `arrays/index_loop` -0.1%, `objects/warm_store` +1.5%, `calls/method_call`
+-0.0%. Every figure is inside the ±7% band those rows were shown to carry for a
+no-op edit, so the split neither wins nor loses time; it buys locality.
+
+Verified: fmt; clippy --workspace --all-targets -D warnings; `cargo test
+--workspace` (PARALLEL, as CI runs it — 52 test binaries, 0 failures); test262
+language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH modes;
+corpus 79/79 identical results across parent/new, jit/jitless, `--gc-stress`,
+`--nursery-stress`.
