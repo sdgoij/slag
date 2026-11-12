@@ -18827,3 +18827,15 @@ across parent/new, jit/jitless, `--gc-stress`, `--nursery-stress`; built-ins
 `--filter '*Promise*' --gc-stress --gc-verify` 732/732; language
 `--filter '*async*' --gc-stress` 5981/6033 with the 52 pre-existing
 for-await-of destructuring gaps unchanged from the parent (base: 5979/6033).
+
+## LANDED (2026-11-12): a captured self-name keeps nested recursion on the register lane
+
+The nested-recursion shape (`function bench(){ function rec(n){ return n < 2 ? n : rec(n-1) + rec(n-2); } return rec(26); }`) compiled `rec`'s self-reference to `LoadContextSlot { depth: 0, index: 0 }` + `CallFast` — `rec` lives in the enclosing function's capture context so the closure can see it — and never got a whole-body register program: the `reg_ops` filter rejected every context read. The read is a direct, live context-slot load, not a dynamic name walk, and every function entry installs the activation's own capture context as `body_context` (the same-stack lane saves/restores it), so a depth-0 read is safe on the register lane. `leaf_op_reads_deep_context` now rejects only depth > 0 context reads (which walk enclosing certified bodies' chains) and per-iteration reads; depth 0 lowers to `LeafOp::LoadContext`, which `run_leaf_ops` already handles against `body_context`.
+
+The in-loop self-call lane then gained the `CallFast` form (`[this, callee, args..]` on the stack, `below = 2`) through a shared `push_inline_self_frame`; the `CallFastIdent` entry point is behaviorally unchanged. This is the call op the nested body emits, so its recursion now stays in the same op loop instead of withdrawing twice per activation.
+
+Same-session rotating three-way control (nested bench, min of 9): HEAD 53 ms -> register lane only 47 ms (-11.3%) -> final **41 ms (-22.6%)**, the second step being the `CallFast` in-loop entry point. `fib` and every Brimstone suite row are instruction-identical to HEAD on callgrind (`capture`, `capture2`, `local`, `sieve`, `closures` all within 0.01%), so their wall swings in the same run are layout noise.
+
+What this does not reach: a named function expression already gets `reg_ops` and `CallFastIdent`, but its self-name resolves through the function-name environment (`try_global_cell_read` misses, then `load_ident_value`'s lookup/intern/bcmp — ~18% of its profile) and it still takes the driver round-trip. A compiler-marked self-binding call would remove both; that is the next slice.
+
+Verified: fmt; clippy --workspace --all-targets -D warnings; `cargo test --workspace` green serialized (1155 runtime, 3324 jit, etc.); recursion probes (self/mutual/nested-declaration/named-expression/default-param/arguments/this/enclosing-try/per-level stack trace/runaway recursion) identical to HEAD in jitless and under `--gc-stress`/`--gc-verify`, and in JIT mode; test262 language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH modes; corpus 79/79 identical results across parent/new, jit/jitless, and `--gc-stress`.

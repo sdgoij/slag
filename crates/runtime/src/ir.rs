@@ -14734,6 +14734,20 @@ impl Vm {
                     span,
                 } => {
                     self.set_site(agent, *span);
+                    // The stack-callee form of the in-loop self-call (the
+                    // nested recursive function shape): `[this, callee, args..]`
+                    // is already on the stack, so the callee needs no name
+                    // resolution at all.
+                    if SUSPENDING
+                        && WHOLE_BODY
+                        && !*direct_eval
+                        && self.try_inline_self_call_on_stack(agent, *argc as usize, caller)?
+                    {
+                        debug_assert!(u32::try_from(pc).is_ok());
+                        self.reg_self_pcs.push(pc as u32);
+                        pc = 0;
+                        continue;
+                    }
                     self.do_call_fast(agent, *argc as usize, *direct_eval)?;
                     if SUSPENDING {
                         if self.pending_call.is_some() {
@@ -16554,32 +16568,23 @@ impl Vm {
         )
     }
 
-    /// The register executor's in-loop self-call: resolve `name`, and when it
-    /// is the closure this activation runs, push the callee's frame on this
-    /// Vm so the caller's op program restarts at 0 without withdrawing to the
-    /// driver. `Ok(true)` means a frame was pushed; the caller parks its
-    /// resume op on `Vm::reg_self_pcs`. `Ok(false)` means the callee is not
-    /// the running function (or a lane gate declined) and the caller must
-    /// withdraw as usual.
-    ///
-    /// Only the warm global-cell read is attempted here: a cold or shadowed
-    /// name falls through to `do_call_fast_ident`, which has the full
-    /// resolution path and the driver's self-call lane as its backstop.
-    fn try_inline_self_call(
+    /// The shared tail of the in-loop self-call entry points: `callee` is
+    /// already the value the call site would invoke, so this applies the
+    /// lane's remaining gates and pushes the callee's frame on this Vm.
+    /// `Ok(true)` means a frame was pushed and the caller must park its resume
+    /// op on `Vm::reg_self_pcs`; `Ok(false)` means the callee is not the
+    /// running function (or a lane gate declined) and the caller must withdraw
+    /// as usual.
+    fn push_inline_self_frame(
         &mut self,
         agent: &mut Agent,
-        name: crux::AtomId,
+        callee: Value,
+        this: Value,
         argc: usize,
-        env_constant: bool,
+        below: usize,
         caller: Option<&std::rc::Rc<CompiledBody>>,
     ) -> Result<bool, JsError> {
         let Some(caller) = caller else {
-            return Ok(false);
-        };
-        if !env_constant || !self.globals_unshadowed {
-            return Ok(false);
-        }
-        let Some(callee) = self.try_global_cell_read(agent, name) else {
             return Ok(false);
         };
         if self
@@ -16620,10 +16625,10 @@ impl Vm {
         let pushed = self.try_push_inline_call(
             agent,
             callee,
-            Value::Undefined,
+            this,
             arg_start,
             argc,
-            0,
+            below,
             Some(caller.clone()),
         )?;
         match pushed {
@@ -16640,6 +16645,42 @@ impl Vm {
             }
             None => Ok(false),
         }
+    }
+
+    /// The `CallFastIdent` form: resolve `name` through the warm global cell
+    /// and, when it is the running closure, push its frame in-loop. Only the
+    /// warm cell read is attempted here: a cold or shadowed name falls through
+    /// to `do_call_fast_ident`, which has the full resolution path and the
+    /// driver's self-call lane as its backstop.
+    fn try_inline_self_call(
+        &mut self,
+        agent: &mut Agent,
+        name: crux::AtomId,
+        argc: usize,
+        env_constant: bool,
+        caller: Option<&std::rc::Rc<CompiledBody>>,
+    ) -> Result<bool, JsError> {
+        if !env_constant || !self.globals_unshadowed {
+            return Ok(false);
+        }
+        let Some(callee) = self.try_global_cell_read(agent, name) else {
+            return Ok(false);
+        };
+        self.push_inline_self_frame(agent, callee, Value::Undefined, argc, 0, caller)
+    }
+
+    /// The `CallFast` form: the callee and `this` are the two values under the
+    /// call's arguments on the stack (`[this, callee, args..]`).
+    fn try_inline_self_call_on_stack(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        caller: Option<&std::rc::Rc<CompiledBody>>,
+    ) -> Result<bool, JsError> {
+        let arg_start = self.stack.len() - argc;
+        let callee = self.stack[arg_start - 1];
+        let this = self.stack[arg_start - 2];
+        self.push_inline_self_frame(agent, callee, this, argc, 2, caller)
     }
 
     /// The `CallFastIdent` handler: the callee resolves through the environment
@@ -29602,6 +29643,30 @@ fn leaf_op_reads_per_iter(op: &LeafOp) -> bool {
     }
 }
 
+/// Whether a register op resolves a capture-context binding at depth > 0 (an
+/// *enclosing* certified body's context). A depth-0 read resolves against this
+/// activation's own `body_context`, which every function entry installs and the
+/// same-stack lane saves/restores, so a whole-body register program can run it;
+/// depth > 0 walks the enclosing chains and stays on the step path.
+fn leaf_op_reads_deep_context(op: &LeafOp) -> bool {
+    let deep =
+        |operand: &RegOperand| matches!(operand, RegOperand::Ctx { depth, .. } if *depth != 0);
+    match op {
+        LeafOp::LoadContext { depth, .. }
+        | LeafOp::BinContext { depth, .. }
+        | LeafOp::BinCtxReg { depth, .. } => *depth != 0,
+        LeafOp::StoreMemberName { value, .. } => deep(value),
+        LeafOp::StoreMemberComputed { key, value } => deep(key) || deep(value),
+        LeafOp::StoreMemberComputedSlot { key, value, .. } => deep(key) || deep(value),
+        LeafOp::StoreMemberComputedLocal { key, .. }
+        | LeafOp::UpdateMemberComputedLocal { key, .. }
+        | LeafOp::GetMemberComputed { key }
+        | LeafOp::GetMemberComputedLocal { key, .. } => deep(key),
+        LeafOp::CompoundMemberComputedLocal { key, rhs, .. } => deep(key) || deep(rhs),
+        _ => false,
+    }
+}
+
 /// Whether a register op resolves a capture-context binding against the
 /// leaf's own `body_context` (`LoadContext`/`BinContext`/`BinCtxReg`, or an
 /// op carrying a `Ctx` operand that `leaf_operand_value` reads).
@@ -29759,9 +29824,9 @@ pub fn compile_body(
     // program instead of a step dispatch per step. A body with handlers keeps
     // the step path — the handler table addresses step indices, and a program
     // has none — as does anything the op set cannot express, and a body that
-    // reads an environment (the ops would resolve it against the activation's
-    // `body_context`/`lexical_env`, which only the leaf lane installs for
-    // itself).
+    // reads an *enclosing* body's context (depth > 0; the activation's own
+    // depth-0 context is installed as `body_context` on every entry, so a
+    // captured binding read from it runs on the register lane).
     let reg_ops = if !leaf
         && compiler.scope.is_some()
         && env_constant
@@ -29773,7 +29838,7 @@ pub fn compile_body(
         lower_whole_body(steps, scope.as_mut().expect("checked above"), env_constant).filter(
             |ops| {
                 !ops.iter()
-                    .any(|op| leaf_op_reads_context(op) || leaf_op_reads_per_iter(op))
+                    .any(|op| leaf_op_reads_deep_context(op) || leaf_op_reads_per_iter(op))
             },
         )
     } else {
