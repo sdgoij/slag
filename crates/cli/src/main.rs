@@ -948,6 +948,10 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
     // The step census histogram, when the crate was built with
     // `--features step-stats` (one workload per process attributes it).
     runtime::step_stats::dump_buckets();
+    // The per-variant axis: which arms a row actually executes, which is what a
+    // structural split of the dispatch boundary is drawn from. Same feature
+    // gate, inert otherwise.
+    runtime::step_stats::dump_variants(40);
     Ok(())
 }
 

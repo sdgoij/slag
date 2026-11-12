@@ -18966,3 +18966,55 @@ notice. Extracting the cold arms into `#[cold] #[inline(never)]` helpers both
 removes them from the hot path's I-cache footprint and gives each one its own
 layout unit, so an edit there can no longer move the hot arms. PGO is the other
 half: placement driven by a profile instead of by source order.
+
+## CENSUSED (2026-11-11): 40 of the dispatch's 233 variants run 99% of the steps
+
+The interpreter's dispatch (`run_inner_inner`) is one function: 3,368 lines, 233
+arms, 3,327 lines of arm bodies. Drawing a structural boundary through it needs
+per-variant counts, which the bucket histogram cannot give, so the census grew a
+second axis: `Step::variant_index` (an exhaustive match generated from the enum,
+so a new variant fails the census build until it is named) plus a 233-slot atomic
+array, printed as `step-variant <name> <count> <share>` behind the same
+`--features step-stats` gate. Inert in every other build.
+
+The whole corpus in one process, `--jitless` (the mode where the step loop is the
+engine), 2.28 billion dispatched steps:
+
+| variant | share | arm lines |
+| --- | ---: | ---: |
+| `RunRegBody` | 16.21% | 46 |
+| `FastLoopHead` | 15.48% | 27 |
+| `LoadLocal` | 9.57% | 10 |
+| `Push` | 6.13% | 1 |
+| `SwitchTest` | 4.03% | 12 |
+| `GetMemberName` | 4.02% | 6 |
+| `BinaryImm` | 3.68% | 17 |
+| `ListBegin` | 3.39% | 6 |
+| `PushAcc` | 3.38% | 7 |
+| `Binary` | 3.35% | 6 |
+
+Cumulative: **90% of steps are 22 variants, 95% are 29, 99% are 40 — and those 40
+arms are 412 of the 3,327 arm lines.** The other 193 variants own ~2,900 lines
+and the remaining 1%.
+
+Two things follow, and the first is a correction to the plan above.
+
+**The two interpreters.** In a hot loop the giant match executes only two steps
+per iteration — `FastLoopHead` and `RunRegBody` (31.7% of all steps) — because a
+certified body hands the loop to the register lane, which dispatches its own
+`LeafOp` stream in a separate function. So the step match is the *uncertified*
+engine: prompt (12-15 distinct variants per iteration, all of them in the short
+list above), async, closures, constructors, setup and teardown. Counting steps
+in the default (JIT) mode shows almost nothing — 10 to 43 per row — which is
+worth knowing before anyone reads a census taken without `--jitless`.
+
+**The boundary.** Keep the 40-variant hot core inline in the trampoline (412
+lines) and move the 193-variant tail (~2,900 lines: generators, async, class,
+try/finally, destructuring, debug, scope-env) into per-family
+`#[cold] #[inline(never)]` handlers. An edit inside a family then cannot move the
+hot arms, which is the coupling the no-op arm swap measured at 6.8% on
+`promise_churn`.
+
+Verified: fmt; clippy --workspace --all-targets -D warnings; clippy
+`-p cli -p runtime --features step-stats`; `cargo test --workspace` green
+serialized.
