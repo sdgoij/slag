@@ -18828,6 +18828,51 @@ across parent/new, jit/jitless, `--gc-stress`, `--nursery-stress`; built-ins
 `--filter '*async*' --gc-stress` 5981/6033 with the 52 pre-existing
 for-await-of destructuring gaps unchanged from the parent (base: 5979/6033).
 
+## SIZED (2026-11-11): a resolver's two boilerplate defines are most of the resolver
+
+The next candidate is the three boxes a capability still mints: the promise
+object and two resolving `Function`s, each paying `create_builtin`'s `length`
+and `name` defines. Sized before building, with throwaway builds (probes
+reverted; the tree at the probe point is `b006f6f6`):
+
+| probe | cost |
+| --- | ---: |
+| `length` + `name` defines, per resolver (defines deleted entirely) | **~118 ns** |
+| one resolver box, total, including those defines (`SLAG_PROBE=one`) | 147-202 ns |
+| so: **the defines are 60-70% of a resolver** | |
+| addressable per capability (2 resolvers × ~118 ns) | **~235 ns** |
+| `Promise.withResolvers()` capability | 845-978 ns |
+| so: **20-28% of a capability is the resolver boilerplate** | |
+
+The delete-probe (`create_builtin` minus both defines, resolvers only) reads
+`withResolvers` -27.9%, `new Promise(noop)` -17.5%, `then`-on-pending -17.9%.
+The `then`-on-settled probe read **+44%** in the same pair, which is the row's
+own instability (a removal cannot cost 44%): as the earlier slice recorded, that
+row's mass is the undrained reaction-job queue and where the major lands, not
+capability creation. Do not size anything off it.
+
+A profile of the `withResolvers` row (60k iterations, `SLAG_SAMPLE=500`, four
+concatenated runs, 2487 samples) attributes the rest: map/transition/hashbrown
+lookups ~10-12% (`crux::map::Map::get_or_create_child` plus the `MapAttrs`
+compare at `core/src/cmp.rs`), key interning ~8-10% (SipHash over the global
+interner and the `encode_utf16().collect::<Vec<u16>>()` in `intern_utf8`), and
+allocation machinery ~8% (`Gc::new`, `with_state`, TLS).
+
+Implication: the batched adopt (`adopt_vector_free_fields`, the mechanism Cut
+67/73 already uses for closure boilerplate) addresses exactly the biggest
+block, and is worth ~0.2 us per capability, which is ~6-7% of `promise_churn`
+(two capabilities per iteration) — real but modest, and it touches the
+map/prototype discipline: the cached boilerplate shape is forked from
+`canonical_empty_map(None)` while a `create_builtin` object starts on
+`canonical_empty_map(Some(%Function.prototype%))`, and `adopt_vector_free_fields`
+does not check that the adopted map descends from the current one.
+
+The cheaper half is independent and safe: `intern_utf8` allocates a `Vec<u16>`
+on every call (`PropertyKey::from_utf8`), and the promise path alone calls it
+several times per capability (`prototype`, the two resolver keys, the
+`withResolvers` record's three). A stack buffer for short names removes that
+allocation for every `from_utf8` in the engine, with no shape/prototype risk.
+
 ## LANDED (2026-11-12): a captured self-name keeps nested recursion on the register lane
 
 The nested-recursion shape (`function bench(){ function rec(n){ return n < 2 ? n : rec(n-1) + rec(n-2); } return rec(26); }`) compiled `rec`'s self-reference to `LoadContextSlot { depth: 0, index: 0 }` + `CallFast` — `rec` lives in the enclosing function's capture context so the closure can see it — and never got a whole-body register program: the `reg_ops` filter rejected every context read. The read is a direct, live context-slot load, not a dynamic name walk, and every function entry installs the activation's own capture context as `body_context` (the same-stack lane saves/restores it), so a depth-0 read is safe on the register lane. `leaf_op_reads_deep_context` now rejects only depth > 0 context reads (which walk enclosing certified bodies' chains) and per-iteration reads; depth 0 lowers to `LeafOp::LoadContext`, which `run_leaf_ops` already handles against `body_context`.
@@ -18839,3 +18884,4 @@ Same-session rotating three-way control (nested bench, min of 9): HEAD 53 ms -> 
 What this does not reach: a named function expression already gets `reg_ops` and `CallFastIdent`, but its self-name resolves through the function-name environment (`try_global_cell_read` misses, then `load_ident_value`'s lookup/intern/bcmp — ~18% of its profile) and it still takes the driver round-trip. A compiler-marked self-binding call would remove both; that is the next slice.
 
 Verified: fmt; clippy --workspace --all-targets -D warnings; `cargo test --workspace` green serialized (1155 runtime, 3324 jit, etc.); recursion probes (self/mutual/nested-declaration/named-expression/default-param/arguments/this/enclosing-try/per-level stack trace/runaway recursion) identical to HEAD in jitless and under `--gc-stress`/`--gc-verify`, and in JIT mode; test262 language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH modes; corpus 79/79 identical results across parent/new, jit/jitless, and `--gc-stress`.
+
