@@ -691,7 +691,29 @@ pub fn intern(units: &[u16]) -> AtomId {
     })
 }
 
+/// Interns a UTF-8 property name.
+///
+/// Every name the engine's own paths build is short — a builtin's `length` and
+/// `name`, `prototype`, `then`, the promise capability's record keys — and
+/// `PropertyKey::from_utf8` is on enough hot paths (several calls per promise
+/// capability alone) that the `Vec<u16>` this used to build for every call
+/// showed up in a capability's profile as `Vec::spec_extend`. `encode_utf16`
+/// never yields more units than the string has UTF-8 bytes, so a stack buffer
+/// of `INLINE_UNITS` covers any string that fits in one.
 pub fn intern_utf8(text: &str) -> AtomId {
+    const INLINE_UNITS: usize = 32;
+    if text.len() <= INLINE_UNITS {
+        let mut units = [0u16; INLINE_UNITS];
+        let mut len = 0;
+        for unit in text.encode_utf16() {
+            // `encode_utf16` yields at most one unit per UTF-8 byte, so the
+            // buffer covers every string the branch admits.
+            debug_assert!(len < INLINE_UNITS);
+            units[len] = unit;
+            len += 1;
+        }
+        return intern(&units[..len]);
+    }
     let units: Vec<u16> = text.encode_utf16().collect();
     intern(&units)
 }

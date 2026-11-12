@@ -18885,3 +18885,41 @@ What this does not reach: a named function expression already gets `reg_ops` and
 
 Verified: fmt; clippy --workspace --all-targets -D warnings; `cargo test --workspace` green serialized (1155 runtime, 3324 jit, etc.); recursion probes (self/mutual/nested-declaration/named-expression/default-param/arguments/this/enclosing-try/per-level stack trace/runaway recursion) identical to HEAD in jitless and under `--gc-stress`/`--gc-verify`, and in JIT mode; test262 language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH modes; corpus 79/79 identical results across parent/new, jit/jitless, and `--gc-stress`.
 
+
+## LANDED (2026-11-11): `intern_utf8` encodes into a stack buffer
+
+`intern_utf8` built a `Vec<u16>` for every call, and `PropertyKey::from_utf8` goes
+through it. A capability calls it several times (`get_prototype_from_constructor`'s
+`prototype`, the `withResolvers` record's three keys, the builtin lookups), so a
+construct-heavy row paid a malloc/free pair per name. A string whose UTF-8 byte
+length fits a 32-unit buffer now encodes into the buffer — `encode_utf16` yields
+at most one unit per byte, so the branch can never truncate — and the `Vec` form
+stays for longer names.
+
+Measured on ONE binary with the allocating form behind `SLAG_INTERN_VEC`, which
+holds code layout constant (the journal's instrument for an env-gated feature;
+the probe is reverted):
+
+| row (min of 11, one process each) | allocating | stack buffer |
+| --- | ---: | ---: |
+| `Promise.withResolvers()` | 19.962 ms | **17.021** (-14.7%) |
+| `new Promise(noop)` | 25.395 ms | **22.683** (-10.7%) |
+| `promise_churn` | 12.917 ms | **12.034** (-6.8%) |
+| `objects/warm_store` | 34.664 ms | 34.753 (+0.3%) |
+| `calls/method_call` | 52.658 ms | 53.197 (+1.0%) |
+
+**The cross-binary A/B overstated it**, and that is the lesson worth keeping: the
+same source change measured between two builds read -21.2% (`withResolvers`),
+-15.2% (`new Promise`) and -12.3% (`promise_churn`). Six points of the
+`withResolvers` delta was native layout, on a change that is twelve lines with no
+allocation in the new path. When a small change reads large, measure it inside
+one binary before believing the size.
+
+The shape of the effect also corroborates the mechanism: construction-heavy rows
+move, loop rows do not, because `from_utf8` is on the setup paths (builtins,
+descriptors, record objects) and not on the per-operation store/read paths.
+
+Verified: fmt; clippy -D warnings; `cargo test --workspace` green serialized;
+test262 language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH
+modes; corpus 79/79 identical results across parent/new, jit/jitless,
+`--gc-stress`, `--nursery-stress`.
