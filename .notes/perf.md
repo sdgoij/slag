@@ -19103,3 +19103,34 @@ earlier `-align-all-functions` pairs (e.g. `arith` +21.7% -> +3.4%) were fixing 
 and the split removed it. Alignment is no longer part of the measurement
 environment; the noise floor of a no-op edit is ≤1% on every row measured here,
 `promise_churn` included, versus 6.8% before.
+
+## MEASURED AND REVERTED (2026-11-12): a front cache for `canonical_empty_map` is unmeasurable
+
+Every ordinary object creation goes through `canonical_empty_map`, which took the
+heap cell, borrowed it and scanned a small `Vec` for the prototype's map. The
+profile of the corpus's largest row put that path (with the transition
+`Map::find`) at ~6-8%, so it looked like a clean per-creation win: a one-entry
+front cache inside the same cell, refreshed on a miss, pruned with the entries.
+
+It is not measurable. Two interleaved runs, min of 9 and min of 15, against the
+parent binary:
+
+| row | run 1 | run 2 |
+| --- | ---: | ---: |
+| `for-in/head-let-fresh-binding-per-iteration` | -1.0% | +1.9% (median -6.7%) |
+| `template-literal/evaluation-order` | +0.3% | — |
+| `objects/warm_store` | -0.8% | — |
+| `calls/method_call` | -0.9% | — |
+| `arrays/index_loop` | -0.3% | — |
+| `promise_churn` | +16.1% | +5.6% (median -0.8%) |
+
+The `promise_churn` +16.1% is the calibration's own tail, not the change: the
+same binary across 15 runs of that row spans **10.55 to 14.09 ms** (min to max,
++33%), and the second run's median is -0.8%. Nothing here clears the noise, so
+the change was reverted rather than kept on a plausible mechanism.
+
+**Worth keeping from this probe:** the same-binary run-to-run spread of
+`promise_churn` is ~33% peak-to-peak. Min-of-N is not a stylistic preference on
+that row — with anything less, a null change reads as a double-digit win or loss.
+The `hl` row is almost as bad (475-610 ms over 15 runs), which is why the two
+runs above disagree in sign.
