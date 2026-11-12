@@ -1911,6 +1911,13 @@ pub struct ScopeInfo {
     pub context_param: Vec<Option<usize>>,
     /// Binding name → context slot (mirrors `context_names`).
     pub context_slots: HashMap<crux::AtomId, usize>,
+    /// The capture context's shared names table, built on the body's first call.
+    /// The names and their flags are fixed for the body, so every activation's
+    /// record points at this one table; rebuilding it per call cost an arena
+    /// box, a `Vec` allocation and a name lookup per captured binding, on every
+    /// call of every body that captures anything (~2/3 of the capture
+    /// context's cost, measured on a one-capture body).
+    pub context_names_shared: std::cell::Cell<Option<Handle<EnvNames>>>,
     /// The frame slot holding the body's `arguments` object (Cut 3
     /// continuation): `Some` when the body references `arguments` — the
     /// certified call fills it at entry. Arrow bodies (lexical `arguments`)
@@ -2018,13 +2025,21 @@ impl ScopeInfo {
         if self.context_names.is_empty() {
             return Ok(None);
         }
-        let entries: Vec<SlotName> = (0..self.context_names.len())
-            .map(|index| SlotName {
-                name: crux::lookup(self.context_names[index]),
-                mutable: !self.context_const[index],
-                strict: self.context_const[index],
-            })
-            .collect();
+        let shared = match self.context_names_shared.get() {
+            Some(shared) => shared,
+            None => {
+                let entries: Vec<SlotName> = (0..self.context_names.len())
+                    .map(|index| SlotName {
+                        name: crux::lookup(self.context_names[index]),
+                        mutable: !self.context_const[index],
+                        strict: self.context_const[index],
+                    })
+                    .collect();
+                let shared = Handle::new(EnvNames::fixed(entries));
+                self.context_names_shared.set(Some(shared));
+                shared
+            }
+        };
         let value_at = |index: usize| match self.context_param[index] {
             Some(position) => args.get(position).copied().unwrap_or(Value::Undefined),
             None if !self.context_tdz[index] => Value::Undefined,
@@ -2032,7 +2047,7 @@ impl ScopeInfo {
         };
         Ok(Some(crate::env::new_fixed_environment(
             Some(*outer),
-            Handle::new(EnvNames::fixed(entries)),
+            shared,
             value_at,
         )))
     }
@@ -2512,6 +2527,14 @@ impl CompiledBody {
 impl Trace for CompiledBody {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.steps.trace(visit);
+        // The capture context's shared names table is allocated on the body's
+        // first call and reused by every activation, so the body's cache is the
+        // only edge that keeps it alive.
+        if let Some(scope) = self.scope.as_ref()
+            && let Some(shared) = scope.context_names_shared.get()
+        {
+            shared.trace(visit);
+        }
         // The whole-body program's constants are the same `Value`s its steps
         // carry, but trace them where the program actually lives: a run holds
         // no other edge to the op array.
@@ -27828,6 +27851,7 @@ fn analyze_scope(function: &EcmaFunction) -> Option<ScopeInfo> {
         context_const: scan.context_const,
         context_param: scan.context_param,
         context_slots: scan.context_slots,
+        context_names_shared: std::cell::Cell::new(None),
         arguments_slot,
         arguments_formals,
         this_slot,
@@ -31594,6 +31618,7 @@ fn analyze_script_scope(
                     context_const: Vec::new(),
                     context_param: Vec::new(),
                     context_slots: HashMap::new(),
+                    context_names_shared: std::cell::Cell::new(None),
                     arguments_slot: None,
                     arguments_formals: None,
                     this_slot: None,

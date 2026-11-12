@@ -7669,6 +7669,7 @@ mod tests {
             context_const: Vec::new(),
             context_param: Vec::new(),
             context_slots: Default::default(),
+            context_names_shared: std::cell::Cell::new(None),
             arguments_slot: None,
             arguments_formals: None,
             this_slot: None,

@@ -19279,3 +19279,41 @@ now two steps.
 `evaluation-order` 251.0 -> 203.6 ms (-18.9%), jitless 366.0 -> 326.3
 (-10.8%); corpus 2601 -> 2486. Probe: `` `a${i++}b${i++}c${i++}d` `` 641 ->
 245 ns/body.
+
+## LANDED (2026-11-12): the capture context's names table is built once per body
+
+Every call of a certified body that captures a binding rebuilt the capture
+context's names table: a `Vec<SlotName>`, a name lookup per binding, and an
+`EnvNames` arena box — per activation, for a table fixed at compile time. It is
+now cached on `ScopeInfo` (traced from `CompiledBody`, the only edge between
+calls).
+
+`v2` probe (one captured local) 602 -> 511 ns/body (-15.1%); the capture's own
+cost over an uncaptured closure create fell from ~294 ns to ~188 ns.
+`evaluation-order` 200.9 -> 189.4 ms (-5.7%) and `head-let-fresh-binding`
+469.0 -> 442.0 (-5.8%) — the two rows that are 41% of the corpus total.
+
+## MEASURED (2026-11-12): where the two hot rows' time actually is
+
+Probes on the current binary (min-of-N, one row per process):
+
+| shape | per body |
+|---|---:|
+| bare `body()` call from a compiled loop | 11.8 ns |
+| closure create, no capture, not called | 306 ns |
+| + one captured local (the per-activation context) | +188 ns (was +294) |
+| closure create + call, capture from the ENCLOSING env | 320 ns |
+| tagged template, 3 substitutions, hoisted closure | 176 ns |
+| ``` `a${i++}b${i++}c${i++}d`.length ``` | 245 ns |
+
+So `evaluation-order` at ~1.9us/body is roughly: one closure create with a
+capture (~500 ns), two templates (~420 ns), ~10 JS calls (~440 ns), the rest
+member reads and increments. The tagged-template step is NOT a lever (176 ns
+for the whole thing); the closure create is, and its remaining ~306 ns is
+dispersed across the arena box, the `ecma_functions` record, the boilerplate
+shape adoption and the environment edge — no single component, as the 2026-09
+survey found.
+
+`head-let` is call-bound (44 ns/call, 112 calls/body) and `SLAG_INLINE=1`
+changes nothing measurable on it (463 vs 475 ms min-of-3, inside its ~20%
+run-to-run spread), so callee inlining is not the unlock there either.
