@@ -18923,3 +18923,46 @@ Verified: fmt; clippy -D warnings; `cargo test --workspace` green serialized;
 test262 language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH
 modes; corpus 79/79 identical results across parent/new, jit/jitless,
 `--gc-stress`, `--nursery-stress`.
+
+## CALIBRATED (2026-11-11): the layout noise floor of a no-op edit, per row class
+
+The dispatch loop (`run_inner_inner`, `crates/runtime/src/ir.rs`) is one function
+of 3,368 source lines and ~233 `Step::` arms. Purely to calibrate the
+instrument, two adjacent disjoint arms (`Step::Pop`, `Step::Dup`) were swapped —
+zero semantic change, no work added or removed — and both binaries were
+measured interleaved, min of 11, one process per row:
+
+| row | arm order A | arm order B | delta |
+| --- | ---: | ---: | ---: |
+| `arrays/index_loop` | 12.989 ms | 12.963 ms | **-0.2%** |
+| `objects/warm_store` | 34.561 ms | 34.515 ms | **-0.1%** |
+| `calls/method_call` | 52.436 ms | 52.331 ms | **-0.2%** |
+| `Promise.withResolvers()` probe | 13.381 ms | 13.470 ms | +0.7% |
+| `async_churn` | 58.280 ms | 59.115 ms | +1.4% |
+| `promise_churn` | 11.300 ms | 10.528 ms | **-6.8%** |
+
+Two conclusions, both load-bearing for how this journal is written from here.
+
+First, the loop rows are stable to ~0.2% under a pure layout perturbation, so a
+cross-build delta on them means something. The allocation-dominated rows are
+not: `promise_churn` moved **6.8% for free**, which is the same size as several
+deltas this journal has recorded as wins. Any promise/async row figure taken
+between two builds carries a band of that size, in either direction.
+
+Second, this retroactively bounds the two slices landed today. `intern_utf8`
+was measured inside one binary (`SLAG_INTERN_VEC`), so its -14.7% / -10.7% /
+-6.8% are layout-free. The `PromiseData`-on-object slice was measured between
+two builds only, so its -14.9% on `promise_churn` is real in DIRECTION (two
+tables, their growth, the reap and its sort were deleted) but its MAGNITUDE
+carries up to ~7 points of layout; the -22.8% on `then`-on-settled is the same
+caveat. Its mechanism-level claims are exact and are the ones to quote: a
+capability drops from 7 heap boxes to 5, two identity tables and one
+sort-per-major are gone.
+
+The consequence for the next work is not "measure more carefully" — it is
+"shrink the hot block". A 3,368-line match means every edit anywhere in the
+interpreter re-lays every arm after it, and the promise rows are the ones that
+notice. Extracting the cold arms into `#[cold] #[inline(never)]` helpers both
+removes them from the hot path's I-cache footprint and gives each one its own
+layout unit, so an edit there can no longer move the hot arms. PGO is the other
+half: placement driven by a profile instead of by source order.
