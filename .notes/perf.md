@@ -19075,3 +19075,31 @@ Verified: fmt; clippy --workspace --all-targets -D warnings; `cargo test
 language 23726/23726, built-ins 23821/23821, annexB 1086/1086 in BOTH modes;
 corpus 79/79 identical results across parent/new, jit/jitless, `--gc-stress`,
 `--nursery-stress`.
+
+## MEASURED AND REJECTED (2026-11-11): function alignment buys nothing after the split
+
+The proposed follow-up to the split was `-C llvm-args=-align-all-functions=5`
+(32-byte starts) in `.cargo/config.toml`, on the theory that downstream
+functions would then move in whole blocks instead of arbitrary bytes when a
+handler changes size. Measured with the same zero-semantics perturbation the
+calibration used (swap two arms, change nothing):
+
+| build | swap | `promise_churn` | `async_churn` |
+| --- | --- | ---: | ---: |
+| monolith, unaligned | hot arms (`Pop`/`Dup`) | **-6.8%** | — |
+| split, unaligned | hot arms | +0.5% | -0.7% |
+| split, aligned | hot arms | -0.8% | -0.9% |
+| split, unaligned | cold arms | +1.2% | -0.5% |
+| split, aligned | cold arms | +0.6% | +0.9% |
+
+The split is what bought the stability: with the hot arms in a 682-line function
+of their own, the same swap that cost 6.8% costs under 1% with or without
+alignment. Alignment costs 246,784 bytes (+1.5% of the binary) and reads +0.0%
+to +1.4% across the rows (`withResolvers` +1.4%), so it was not adopted.
+
+Recorded because it is easy to re-propose: alignment mattered when the hot arms
+shared a function with ~3,000 lines of neighbours — that is the condition the
+earlier `-align-all-functions` pairs (e.g. `arith` +21.7% -> +3.4%) were fixing —
+and the split removed it. Alignment is no longer part of the measurement
+environment; the noise floor of a no-op edit is ≤1% on every row measured here,
+`promise_churn` included, versus 6.8% before.
