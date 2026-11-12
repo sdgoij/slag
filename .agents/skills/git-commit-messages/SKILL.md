@@ -7,6 +7,14 @@ description: Write proper Git commit messages with subject line and descriptive 
 
 When asked to write a commit message, produce the entire message (subject + body) in your response. **Do not ask for clarification** — read the staged files or the diff and write the message yourself.
 
+## One commit per change, documentation included
+
+A commit that changes behavior carries its own documentation — the `.notes/` section, the area doc, the README row — in the **same** commit. Never split "the code" and "the docs for the code" into two commits: a revert of the code then leaves the docs describing a mechanism that no longer exists, and the next reader has no reason to distrust them. The same applies to a test, a benchmark row, or a skill: the text that explains the change is part of the change.
+
+If work has already been committed as a docs-only follow-up, fold it back — `git reset`/rebase while the commit is unpushed — rather than leaving the pair.
+
+A commit that is *only* documentation is legitimate when the documentation is the deliverable (a plan, a measurement record, a policy). What is not legitimate is documenting someone else's change in a later commit.
+
 ## Format
 
 ```
