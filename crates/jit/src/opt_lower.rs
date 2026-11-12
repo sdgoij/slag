@@ -1215,8 +1215,8 @@ fn lower_inst(
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
-        // The template-literal literals (`PushStr`/`ConcatStr`/
-        // `ConcatStrConst`) and `TaggedTemplate`: the same helpers the
+        // The template-literal literals (`PushStr`/`TemplateSub`/
+        // `TemplateJoin`) and `TaggedTemplate`: the same helpers the
         // per-step route calls, with the quasi payload read back from the
         // running body by step index.
         Op::StringPush => {
@@ -1233,32 +1233,26 @@ fn lower_inst(
                 &[step_imm],
             )?
         }
-        Op::StringConcat => {
+        Op::StringSub => {
             let value = arg!(0);
-            let acc = arg!(1);
             call_helper(
                 builder,
                 helpers,
                 abi,
                 abi.sig_unary,
-                Helper::ConcatStr,
-                &[value, acc],
+                Helper::TemplateSub,
+                &[value],
             )?
         }
-        Op::StringConcatConst => {
+        Op::StringTemplate => {
             let Imm::Int(step) = &inst.imm else {
                 return Err(Unsupported::Step("opt:string"));
             };
-            let acc = arg!(0);
-            let step_imm = builder.ins().iconst(types::I64, *step as i64);
-            call_helper(
-                builder,
-                helpers,
-                abi,
-                abi.sig_unary,
-                Helper::ConcatStrConst,
-                &[acc, step_imm],
-            )?
+            let mut values = Vec::with_capacity(inst.args.len());
+            for i in 0..inst.args.len() {
+                values.push(arg!(i));
+            }
+            emit_template_join(builder, helpers, abi, *step, &values)?
         }
         Op::TaggedTemplate => {
             let Imm::Int(step) = &inst.imm else {
@@ -3079,6 +3073,38 @@ fn emit_new_object(
         abi,
         abi.sig_unary,
         Helper::ObjectFast,
+        &[step_imm, sp],
+    )
+}
+
+/// The fused template-literal assembly, the mirror of the per-step
+/// `Step::TemplateJoin`: the `quasis` payload is read back from the running body
+/// via `step`, and the substitution values are materialized at the
+/// working-region base below the `sp` passed here (`work + 8n`).
+fn emit_template_join(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    step: i32,
+    values: &[ClifValue],
+) -> Result<ClifValue, Unsupported> {
+    let n = values.len();
+    for (k, v) in values.iter().enumerate() {
+        builder.ins().store(
+            MemFlagsData::new(),
+            *v,
+            abi.work,
+            Offset32::new((k * 8) as i32),
+        );
+    }
+    let step_imm = builder.ins().iconst(types::I64, step as i64);
+    let sp = builder.ins().iadd_imm_u(abi.work, (n * 8) as i64);
+    call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_unary,
+        Helper::TemplateJoin,
         &[step_imm, sp],
     )
 }

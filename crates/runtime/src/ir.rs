@@ -788,9 +788,23 @@ pub enum Step {
         span: crux::Span,
     },
     ObjectSpread,
+    /// A string literal on the operand stack (a template literal's text when it
+    /// has no substitutions).
     PushStr(JsString),
-    ConcatStr,
-    ConcatStrConst(JsString),
+    /// A template substitution's `ToString` fence (spec 13.2.8.6), which runs
+    /// in evaluation order so a coercion's side effect cannot be deferred past
+    /// the next substitution's expression. A primitive whose `ToString` is
+    /// side-effect free passes through unchanged — [`template_join`] spells it
+    /// into the result buffer, so a `\`...${i}...\`` pays no intermediate box.
+    TemplateSub,
+    /// The fused assembly of a whole template literal (spec 13.2.8.6): the
+    /// `quasis.len() - 1` substitution values below the top of the stack, in
+    /// source order, are interleaved with `quasis` into ONE string allocated
+    /// at its exact size. Replaces the per-substitution concat chain, which
+    /// boxed an intermediate node per quasi and per substitution.
+    TemplateJoin {
+        quasis: Box<[JsString]>,
+    },
     // ----- arguments -----
     /// Record the current argument-vector length: a call's arguments are
     /// appended after it and the call takes exactly the appended slice, so
@@ -1376,7 +1390,11 @@ impl Trace for Step {
                 flags.trace(visit);
             }
             Step::PushStr(text) => text.trace(visit),
-            Step::ConcatStrConst(text) => text.trace(visit),
+            Step::TemplateJoin { quasis } => {
+                for quasi in quasis.iter() {
+                    quasi.trace(visit);
+                }
+            }
             Step::CreateFunction {
                 named: Some(name), ..
             }
@@ -10044,8 +10062,8 @@ impl Vm {
                 | Step::TypeofTop
                 | Step::TypeofIdent { .. }
                 | Step::PushStr(..)
-                | Step::ConcatStr
-                | Step::ConcatStrConst(..)
+                | Step::TemplateSub
+                | Step::TemplateJoin { .. }
                 | Step::ArgsSpread
                 | Step::SaveCompletion
                 | Step::RestoreCompletion
@@ -15652,53 +15670,142 @@ pub(crate) fn nullish_error(what: &str) -> JsError {
     JsError::new(ErrorKind::TypeError, what.into())
 }
 
-/// The template-literal append (spec 13.2.8.6): the accumulator concatenated
-/// with `value`'s `ToString`, as a ROPE concat (`JsString::concat`), NOT the
-/// flat `units`/`from_utf16` rebuild it used to be. The content is identical
-/// — UTF-16 throughout, so lone surrogates survive either way — but a k-part
-/// template costs O(k) instead of O(k·len): the old pair copied the whole
-/// accumulator per substitution, making an 18-part template build loop
-/// quadratic (measured ~4.6us/iteration, 2026-09-28). A result at or under
-/// `JsString::concat`'s flat threshold still comes back flat, so a short
-/// template keeps the leaf representation it had, and unit readers (`length`
-/// is cached; `as_slice` materializes once through the box's flatten cache)
-/// pay nothing extra.
-pub(crate) fn concat_template(
-    agent: &mut Agent,
-    acc: &Value,
-    value: &Value,
-) -> Result<Value, JsError> {
-    let right = match value.as_string() {
-        Some(text) => text,
-        None => Handle::new(crate::context::to_string(agent, value)?),
-    };
-    Ok(Value::String(JsString::concat(
-        &acc_string(agent, acc)?,
-        &right,
-    )))
+/// Whether a value is a template piece the join can spell directly — the
+/// primitive whose `ToString` runs no user code. A [`Step::TemplateSub`]
+/// fence passes exactly these through.
+fn template_piece(value: &Value) -> bool {
+    matches!(
+        value.kind(),
+        ValueKind::String(_)
+            | ValueKind::Number(_)
+            | ValueKind::Boolean(_)
+            | ValueKind::Null
+            | ValueKind::Undefined
+    )
 }
 
-/// [`concat_template`] for a `ConcatStrConst` step's constant quasi.
-pub(crate) fn concat_template_const(
-    agent: &mut Agent,
-    acc: &Value,
-    text: &JsString,
-) -> Result<Value, JsError> {
-    let right = Handle::new(text.clone());
-    Ok(Value::String(JsString::concat(
-        &acc_string(agent, acc)?,
-        &right,
-    )))
-}
-
-/// The accumulator side of a template append as a handle. Defensive: the
-/// accumulated value is a string on every path (the head quasi, then these
-/// appends), so the conversion arm is unreachable in practice.
-fn acc_string(agent: &mut Agent, acc: &Value) -> Result<Handle<JsString>, JsError> {
-    match acc.as_string() {
-        Some(text) => Ok(text),
-        None => Ok(Handle::new(crate::context::to_string(agent, acc)?)),
+/// A template substitution's `ToString`, the fence `Step::TemplateSub` runs
+/// (spec 13.2.8.6). It must run here — before the next substitution's
+/// expression — so a coercion's side effect (or a Symbol's `TypeError`)
+/// cannot be reordered. A primitive whose `ToString` is side-effect free is
+/// passed through: [`template_join`] spells it into the result buffer, so
+/// `\`abc${i}def\`` needs no intermediate string at all.
+pub(crate) fn template_sub(agent: &mut Agent, value: &Value) -> Result<Value, JsError> {
+    if template_piece(value) {
+        return Ok(*value);
     }
+    Ok(Value::String(Handle::new(crate::context::to_string(
+        agent, value,
+    )?)))
+}
+
+/// The fused assembly of a whole template literal (`Step::TemplateJoin`, spec
+/// 13.2.8.6): `quasis[0] values[0] quasis[1] ... values[n-1] quasis[n]` into
+/// ONE string, sized exactly and allocated once. The per-piece concat chain it
+/// replaces boxed one node per quasi and per substitution (a 3-substitution
+/// template: ten arena boxes) and re-copied the accumulator.
+pub(crate) fn template_join(
+    agent: &mut Agent,
+    quasis: &[JsString],
+    values: &[Value],
+) -> Result<Value, JsError> {
+    debug_assert_eq!(quasis.len(), values.len() + 1);
+    // A substitution the fence left alone (the LAST one needs none: the join
+    // follows it immediately) may still be an arbitrary value, and a join
+    // measures every piece before it writes them — so convert such a value
+    // ONCE here, or its `ToString` would run twice.
+    let owned: Vec<Value>;
+    let values = if values.iter().all(template_piece) {
+        values
+    } else {
+        let mut coerced = Vec::with_capacity(values.len());
+        for value in values {
+            coerced.push(template_sub(agent, value)?);
+        }
+        owned = coerced;
+        &owned[..]
+    };
+    let mut total = 0usize;
+    for quasi in quasis {
+        total = total.saturating_add(quasi.len());
+    }
+    for value in values {
+        with_piece_units(agent, value, &mut |units| {
+            total = total.saturating_add(units.len());
+        })?;
+    }
+    if total > crux::string::MAX_STRING_LENGTH {
+        return Err(crux::string::invalid_string_length());
+    }
+    if total <= crux::string::SMALL_STRING_CAP {
+        let mut buf = [0u16; crux::string::SMALL_STRING_CAP];
+        let mut at = 0usize;
+        for (index, quasi) in quasis.iter().enumerate() {
+            let units = quasi.as_slice();
+            buf[at..at + units.len()].copy_from_slice(units);
+            at += units.len();
+            if let Some(value) = values.get(index) {
+                with_piece_units(agent, value, &mut |piece| {
+                    buf[at..at + piece.len()].copy_from_slice(piece);
+                    at += piece.len();
+                })?;
+            }
+        }
+        return Ok(Value::String(Handle::new(JsString::from_utf16(
+            &buf[..total],
+        ))));
+    }
+    let mut units: Vec<u16> = Vec::new();
+    units
+        .try_reserve_exact(total)
+        .map_err(|_| crux::string::invalid_string_length())?;
+    for (index, quasi) in quasis.iter().enumerate() {
+        units.extend_from_slice(quasi.as_slice());
+        if let Some(value) = values.get(index) {
+            with_piece_units(agent, value, &mut |piece| units.extend_from_slice(piece))?;
+        }
+    }
+    Ok(Value::String(Handle::new(JsString::Flat(units.into()))))
+}
+
+/// One template piece's code units. The join normalizes its values first
+/// (see `template_join`), so every value here is a [`template_piece`]; the
+/// general conversion remains as the defensive arm.
+fn with_piece_units(
+    agent: &mut Agent,
+    value: &Value,
+    emit: &mut impl FnMut(&[u16]),
+) -> Result<(), JsError> {
+    let mut buf = [0u16; crux::number::SPELLING_CAP];
+    match value.kind() {
+        ValueKind::String(text) => emit(text.as_slice()),
+        ValueKind::Number(number) => match crux::number::units_into(number, &mut buf) {
+            Some(len) => emit(&buf[..len]),
+            None => emit(crux::number::to_string(number).as_slice()),
+        },
+        ValueKind::Boolean(true) => emit(&[b't' as u16, b'r' as u16, b'u' as u16, b'e' as u16]),
+        ValueKind::Boolean(false) => emit(&[
+            b'f' as u16,
+            b'a' as u16,
+            b'l' as u16,
+            b's' as u16,
+            b'e' as u16,
+        ]),
+        ValueKind::Null => emit(&[b'n' as u16, b'u' as u16, b'l' as u16, b'l' as u16]),
+        ValueKind::Undefined => emit(&[
+            b'u' as u16,
+            b'n' as u16,
+            b'd' as u16,
+            b'e' as u16,
+            b'f' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'e' as u16,
+            b'd' as u16,
+        ]),
+        _ => emit(crate::context::to_string(agent, value)?.as_slice()),
+    }
+    Ok(())
 }
 
 pub(crate) fn error_message_value(error: &JsError) -> Value {
@@ -23828,22 +23935,35 @@ impl Compiler {
     }
 
     fn compile_template(&mut self, template: &syntax::ast::TemplateLiteral) -> Result<(), JsError> {
-        let first = template
-            .quasis
-            .first()
-            .map(|q| q.cooked.clone().unwrap_or_else(|| JsString::from_utf8("")))
-            .unwrap_or_else(|| JsString::from_utf8(""));
-        self.emit(Step::PushStr(first));
+        let cooked = |index: usize| {
+            template
+                .quasis
+                .get(index)
+                .map(|quasi| {
+                    quasi
+                        .cooked
+                        .clone()
+                        .unwrap_or_else(|| JsString::from_utf8(""))
+                })
+                .unwrap_or_else(|| JsString::from_utf8(""))
+        };
+        if template.exprs.is_empty() {
+            // No substitutions: the literal IS the result.
+            self.emit(Step::PushStr(cooked(0)));
+            return Ok(());
+        }
+        let last = template.exprs.len() - 1;
         for (index, expr) in template.exprs.iter().enumerate() {
             self.compile_expr(expr)?;
-            self.emit(Step::ConcatStr);
-            let quasi = template
-                .quasis
-                .get(index + 1)
-                .map(|q| q.cooked.clone().unwrap_or_else(|| JsString::from_utf8("")))
-                .unwrap_or_else(|| JsString::from_utf8(""));
-            self.emit(Step::ConcatStrConst(quasi));
+            // ToString of a substitution runs before the NEXT substitution's
+            // expression (spec 13.2.8.6), so every one needs the fence except
+            // the last — the join follows it immediately and spells it itself.
+            if index < last {
+                self.emit(Step::TemplateSub);
+            }
         }
+        let quasis: Box<[JsString]> = (0..=template.exprs.len()).map(cooked).collect();
+        self.emit(Step::TemplateJoin { quasis });
         Ok(())
     }
 
@@ -24319,13 +24439,16 @@ pub fn max_stack_usage(steps: &[Step]) -> usize {
             Step::ObjectKeyToPropertyKey
             | Step::ObjectMethodName { .. }
             | Step::ObjectAccessorName { .. } => {}
-            // String literals (Cut 54): `PushStr` pushes the literal;
-            // `ConcatStr` pops the value + accumulator and pushes the
-            // concatenation; `ConcatStrConst` swaps the accumulator for the
-            // concatenation.
+            // String literals (Cut 54): `PushStr` pushes the literal; a template
+            // substitution's fence is net-neutral; the join pops the `n`
+            // substitution values and pushes the assembled string.
             Step::PushStr(_) => depth += 1,
-            Step::ConcatStr => depth = depth.saturating_sub(2).saturating_add(1),
-            Step::ConcatStrConst(_) => {}
+            Step::TemplateSub => {}
+            Step::TemplateJoin { quasis } => {
+                depth = depth
+                    .saturating_sub(quasis.len().saturating_sub(1))
+                    .saturating_add(1)
+            }
             // A local read pushes its value; closure creation, `new.target`,
             // and regexp literals each push one too. These are all compiled by
             // the JIT, so omitting them undercounts the working region.
@@ -25418,11 +25541,11 @@ fn steps_are_leaf(steps: &[Step]) -> bool {
 /// body via `JitCallContext::body` (a step-index helper). An inlined leaf's
 /// helpers see the CALLER's body, so these must not inline — they run on the
 /// general path with their own Vm/context instead (where `ctx.body` is the
-/// callee's own). `ConcatStr` is safe (it takes both operands by value); the
-/// const forms carry their `JsString`/`Value` payload in the step.
+/// callee's own). `TemplateSub` is safe (it takes its operand by value); the
+/// join carries its `quasis` payload in the step.
 fn string_literal_step_reads_body(step: &Step) -> bool {
     match step {
-        Step::PushStr(_) | Step::ConcatStrConst(_) => true,
+        Step::PushStr(_) | Step::TemplateJoin { .. } => true,
         Step::Push(value) => value_is_heap(value),
         // Cut 72's fused literal create reads its `names` payload back from
         // the running body. An inlined leaf's helper would see the caller's

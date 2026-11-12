@@ -608,7 +608,7 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
         | Step::FusedStoreLocal { .. }
-        | Step::ConcatStr
+        | Step::TemplateSub
         | Step::TaggedTemplate(_)
         | Step::Binary(_)
         | Step::GetMemberComputed
@@ -620,7 +620,6 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         Step::BinaryImm { .. }
         | Step::GetMemberName { .. }
         | Step::Unary(_)
-        | Step::ConcatStrConst(_)
         | Step::ResetCompletion
         | Step::NormalizeCompletion
         | Step::ListBegin
@@ -685,6 +684,9 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         // the created array/object.
         Step::ArrayFast { count } => -(*count as i32) + 1,
         Step::ObjectFast { names } => -(names.len() as i32) + 1,
+        // The template join pops its N substitution values and pushes the
+        // assembled string.
+        Step::TemplateJoin { quasis } => -(quasis.len() as i32) + 2,
         // The non-fused literal steps (I6-0b): the create steps push the
         // container, an element/init pops it and its value and pushes it back
         // (net -1), and `ArrayEnd` is net-neutral.
@@ -1205,10 +1207,11 @@ fn emit_step(
                 Imm::Int(index as i32),
             );
         }
-        // Template-literal literals: `PushStr` pushes the quasi, `ConcatStr`
-        // flattens `acc + ToString(value)`, and `ConcatStrConst` appends the
-        // following quasi. The quasi payloads stay in the running body and the
-        // helpers read them back by step index.
+        // Template literals: `PushStr` pushes a quasi, `TemplateSub` runs a
+        // substitution's `ToString` fence in evaluation order, and
+        // `TemplateJoin` assembles the whole literal in ONE helper call (its
+        // `quasis` payload stays in the running body, read back by step
+        // index).
         Step::PushStr(_) => {
             let v = builder.emit(
                 block,
@@ -1220,27 +1223,30 @@ fn emit_step(
             );
             stack.push(v);
         }
-        Step::ConcatStr => {
+        Step::TemplateSub => {
             let value = stack.pop().ok_or(Unsupported::Stack)?;
-            let acc = stack.pop().ok_or(Unsupported::Stack)?;
             let v = builder.emit(
                 block,
-                Op::StringConcat,
-                &[value, acc],
+                Op::StringSub,
+                &[value],
                 Type::Unknown,
-                Op::StringConcat.default_effects(),
+                Op::StringSub.default_effects(),
                 Imm::None,
             );
             stack.push(v);
         }
-        Step::ConcatStrConst(_) => {
-            let acc = stack.pop().ok_or(Unsupported::Stack)?;
+        Step::TemplateJoin { quasis } => {
+            let n = quasis.len().saturating_sub(1);
+            if stack.len() < n {
+                return Err(Unsupported::Stack);
+            }
+            let values = stack.split_off(stack.len() - n);
             let v = builder.emit(
                 block,
-                Op::StringConcatConst,
-                &[acc],
+                Op::StringTemplate,
+                &values,
                 Type::Unknown,
-                Op::StringConcatConst.default_effects(),
+                Op::StringTemplate.default_effects(),
                 Imm::Int(index as i32),
             );
             stack.push(v);
@@ -2642,7 +2648,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ObjectAccessorComputed { .. }
         | Step::ObjectSpread => "ObjectLiteral",
         Step::RegExpLiteral { .. } => "RegExpLiteral",
-        Step::PushStr(_) | Step::ConcatStr | Step::ConcatStrConst(_) => "String",
+        Step::PushStr(_) | Step::TemplateSub | Step::TemplateJoin { .. } => "String",
         // I4a: name the intrinsic call (the `Math.*`/array/collection sweep),
         // so the coverage probe can count bodies gated on it.
         Step::CallIntrinsic { .. } => "CallIntrinsic",
@@ -2904,14 +2910,20 @@ mod tests {
 
     #[test]
     fn lifts_a_template_literal() {
-        // `$ {f[0]}x`: the quasi, the substitution, the flatten concat, then
-        // the trailing quasi.
+        // `$ {f[0]}x`: the head quasi, the substitution, its `ToString` fence,
+        // then ONE fused join for the whole literal.
         let b = body(
             vec![
                 Step::PushStr(crux::JsString::from_utf8("")),
                 Step::LoadLocal { slot: 0 },
-                Step::ConcatStr,
-                Step::ConcatStrConst(crux::JsString::from_utf8("x")),
+                Step::TemplateSub,
+                Step::TemplateJoin {
+                    quasis: vec![
+                        crux::JsString::from_utf8(""),
+                        crux::JsString::from_utf8("x"),
+                    ]
+                    .into_boxed_slice(),
+                },
                 Step::Return,
             ],
             1,
@@ -2923,17 +2935,17 @@ mod tests {
             vec![
                 Op::StringPush,
                 Op::FrameLoad,
-                Op::StringConcat,
-                Op::StringConcatConst
+                Op::StringSub,
+                Op::StringTemplate
             ]
         );
-        // The quasi payloads stay in the body: the step index rides the imm.
+        // The quasi payloads stay in the body: the join's step index rides
+        // the imm.
         assert_eq!(func.block(entry).insts[0].imm, Imm::Int(0));
         assert_eq!(func.block(entry).insts[3].imm, Imm::Int(3));
-        // `ConcatStr` takes `[value, acc]`, mirroring the interpreter's pops.
-        let value = func.block(entry).insts[1].result.unwrap();
-        let acc = func.block(entry).insts[0].result.unwrap();
-        assert_eq!(func.block(entry).insts[2].args, vec![value, acc]);
+        // The join takes the substitution values in source order.
+        let value = func.block(entry).insts[2].result.unwrap();
+        assert_eq!(func.block(entry).insts[3].args, vec![value]);
     }
 
     #[test]

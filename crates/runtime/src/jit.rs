@@ -1200,12 +1200,13 @@ pub struct JitSlowPaths {
     /// `Step::PushStr`: push a string literal — the `JsString` payload is
     /// read back from the running body at `step` and wrapped in a value.
     pub push_str: extern "C" fn(ctx: *mut c_void, step: u64) -> u64,
-    /// `Step::ConcatStr`: ToString the top value and append its units to the
-    /// accumulator below it (the template-literal flatten concat).
-    pub concat_str: extern "C" fn(ctx: *mut c_void, value: u64, acc: u64) -> u64,
-    /// `Step::ConcatStrConst`: append a string-literal constant's units to
-    /// the accumulator; the `JsString` payload is read back at `step`.
-    pub concat_str_const: extern "C" fn(ctx: *mut c_void, acc: u64, step: u64) -> u64,
+    /// `Step::TemplateSub`: the substitution's `ToString`, run in evaluation
+    /// order (a primitive is passed through for the join to spell).
+    pub template_sub: extern "C" fn(ctx: *mut c_void, value: u64) -> u64,
+    /// `Step::TemplateJoin`: assemble a whole template literal into one string.
+    /// The `quasis` payload is read back from the running body at `step`; the
+    /// substitution values sit below the working `sp` in source order.
+    pub template_join: extern "C" fn(ctx: *mut c_void, step: u64, sp: u64) -> u64,
     /// `Step::Push` with a heap constant (a plain string/bigint literal —
     /// `compile_literal` emits `Push(Value::String(...))`, only templates use
     /// `PushStr`): return the payload's bits (the step holds the strong ref,
@@ -1543,8 +1544,8 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     object_accessor_computed,
     object_spread,
     push_str,
-    concat_str,
-    concat_str_const,
+    template_sub,
+    template_join,
     push_const,
     load_const,
     enter_block,
@@ -4928,25 +4929,35 @@ extern "C" fn push_str(ctx: *mut c_void, step: u64) -> u64 {
     Value::String(crux::Handle::new(text.clone())).bits()
 }
 
-extern "C" fn concat_str(ctx: *mut c_void, value: u64, acc: u64) -> u64 {
+extern "C" fn template_sub(ctx: *mut c_void, value: u64) -> u64 {
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
     let value = Value::from_bits(value);
-    let acc = Value::from_bits(acc);
-    match crate::ir::concat_template(agent, &acc, &value) {
+    match crate::ir::template_sub(agent, &value) {
         Ok(out) => out.bits(),
         Err(error) => slow_error(ctx, error),
     }
 }
 
-extern "C" fn concat_str_const(ctx: *mut c_void, acc: u64, step: u64) -> u64 {
+extern "C" fn template_join(ctx: *mut c_void, step: u64, sp: u64) -> u64 {
+    // The compiled `Step::TemplateJoin` whole-literal assembly. The `quasis`
+    // payload is read back from the running body; the substitution values sit
+    // below the machine-code working `sp` in source order (they are rooted
+    // there, in the JIT buffer). The machine code drops the consumed values
+    // and pushes the returned string.
     let ctx = unsafe { ctx_of(ctx) };
     let agent = unsafe { &mut *ctx.agent };
-    let acc = Value::from_bits(acc);
-    let Some(crate::ir::Step::ConcatStrConst(text)) = step_at(ctx, step) else {
-        unreachable!("concat_str_const on a non-ConcatStrConst step");
+    let Some(crate::ir::Step::TemplateJoin { quasis }) = step_at(ctx, step) else {
+        unreachable!("template_join on a non-TemplateJoin step");
     };
-    match crate::ir::concat_template_const(agent, &acc, text) {
+    let n = quasis.len().saturating_sub(1);
+    let base = (sp as usize).saturating_sub(n * 8);
+    // SAFETY: `sp` points into the machine-code working region (the rooted
+    // JIT buffer) with the n substitution values below it — the compiled
+    // template steps pushed exactly one value per substitution, in source
+    // order.
+    let values: &[Value] = unsafe { std::slice::from_raw_parts(base as *const Value, n) };
+    match crate::ir::template_join(agent, quasis, values) {
         Ok(out) => out.bits(),
         Err(error) => slow_error(ctx, error),
     }
@@ -7780,8 +7791,8 @@ mod tests {
         assert_ne!(JIT_SLOW_PATHS.object_accessor_computed as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.object_spread as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.push_str as usize, 0);
-        assert_ne!(JIT_SLOW_PATHS.concat_str as usize, 0);
-        assert_ne!(JIT_SLOW_PATHS.concat_str_const as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.template_sub as usize, 0);
+        assert_ne!(JIT_SLOW_PATHS.template_join as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.push_const as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.load_const as usize, 0);
         assert_ne!(JIT_SLOW_PATHS.create_arguments as usize, 0);

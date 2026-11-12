@@ -2204,15 +2204,16 @@ impl Vm {
             Step::PushStr(text) => {
                 self.stack.push(Value::String(Handle::new(text.clone())));
             }
-            Step::ConcatStr => {
+            Step::TemplateSub => {
                 let value = self.pop();
-                let acc = self.pop();
-                let out = concat_template(agent, &acc, &value)?;
+                let out = crate::ir::template_sub(agent, &value)?;
                 self.stack.push(out);
             }
-            Step::ConcatStrConst(text) => {
-                let acc = self.pop();
-                let out = concat_template_const(agent, &acc, text)?;
+            Step::TemplateJoin { quasis } => {
+                let subs = quasis.len().saturating_sub(1);
+                let base = self.stack.len().saturating_sub(subs);
+                let out = crate::ir::template_join(agent, quasis, &self.stack[base..])?;
+                self.stack.truncate(base);
                 self.stack.push(out);
             }
             Step::ArgsSpread => {

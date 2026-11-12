@@ -532,7 +532,7 @@ fn step_name(step: &Step) -> &'static str {
         | Step::ObjectAccessorName { .. }
         | Step::ObjectAccessorComputed { .. }
         | Step::ObjectSpread => "ObjectLiteral",
-        Step::PushStr(_) | Step::ConcatStr | Step::ConcatStrConst(_) => "StringLiteral",
+        Step::PushStr(_) | Step::TemplateSub | Step::TemplateJoin { .. } => "StringLiteral",
         Step::ForOfBind { .. }
         | Step::ForInBind { .. }
         | Step::ForOfRestore
@@ -9221,26 +9221,29 @@ impl<'a> Lowerer<'a> {
             }
             // String literals (Cut 54): `PushStr` reads the literal's
             // `JsString` back from the running body and wraps it in a value;
-            // `ConcatStr`/`ConcatStrConst` run the interpreter's flatten
-            // template concat (the accumulator below the value).
+            // `TemplateSub` runs a substitution's `ToString` in place and
+            // `TemplateJoin` assembles the whole literal in ONE helper call
+            // from the substitution values below the working `sp`.
             Step::PushStr(_) => {
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                 let value = self.call_slow(self.sig_step, Helper::PushStr, &[step_imm])?;
                 self.push(value);
                 self.fall_through(index);
             }
-            Step::ConcatStr => {
+            Step::TemplateSub => {
                 let value = self.pop();
-                let acc = self.pop();
-                let text = self.call_slow(self.sig_get_comp, Helper::ConcatStr, &[value, acc])?;
-                self.push(text);
+                let coerced = self.call_slow(self.sig_bool, Helper::TemplateSub, &[value])?;
+                self.push(coerced);
                 self.fall_through(index);
             }
-            Step::ConcatStrConst(_) => {
-                let acc = self.pop();
+            Step::TemplateJoin { quasis } => {
+                let n = quasis.len().saturating_sub(1);
+                let sp = self.builder.use_var(self.sp_var);
                 let step_imm = self.builder.ins().iconst(types::I64, index as i64);
                 let text =
-                    self.call_slow(self.sig_get_name, Helper::ConcatStrConst, &[acc, step_imm])?;
+                    self.call_slow(self.sig_step_sp, Helper::TemplateJoin, &[step_imm, sp])?;
+                let base = self.builder.ins().iadd_imm_s(sp, -8 * (n as i64));
+                self.builder.def_var(self.sp_var, base);
                 self.push(text);
                 self.fall_through(index);
             }

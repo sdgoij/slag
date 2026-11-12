@@ -333,14 +333,15 @@ pub enum Op {
     /// `JsString` payload back from the running body via `imm`'s step index
     /// and yields the value. Net stack +1.
     StringPush,
-    /// A template substitution concat (`Step::ConcatStr`): `args = [value,
-    /// acc]`, the flattening `concat_template` path the per-step route runs.
-    /// Net stack −1.
-    StringConcat,
-    /// A template quasi append (`Step::ConcatStrConst`): `args = [acc]`, the
-    /// literal read back from the running body via `imm`'s step index. Net
-    /// stack 0.
-    StringConcatConst,
+    /// A template substitution's `ToString` fence (`Step::TemplateSub`):
+    /// `args = [value]`. A primitive with a side-effect-free `ToString`
+    /// passes through, and the join spells it; Net stack 0.
+    StringSub,
+    /// The fused assembly of a whole template literal (`Step::TemplateJoin`):
+    /// `args` are the substitution values in source order, with the `quasis`
+    /// payload read back from the running body via `imm`'s step index. Net
+    /// stack `-(args.len()) + 1`.
+    StringTemplate,
     /// A tagged-template call (`Step::TaggedTemplate`): `args = [this, tag]`,
     /// with the (substitution-consuming) payload read back via `imm`'s step
     /// index. Net stack −1.
@@ -492,8 +493,8 @@ impl Op {
             | Op::ContextStore
             | Op::ContextInit
             | Op::StringPush
-            | Op::StringConcat
-            | Op::StringConcatConst
+            | Op::StringSub
+            | Op::StringTemplate
             | Op::TaggedTemplate
             | Op::ForOfBegin
             | Op::ForOfNextBindLocal

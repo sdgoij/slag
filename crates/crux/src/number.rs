@@ -128,6 +128,31 @@ fn small_integer_string(x: f64) -> JsString {
     JsString::from_utf16(units)
 }
 
+/// The most code units [`to_string`] can produce for a finite double: the
+/// longest spellings are `-1.2345678901234567e-308` (24) and
+/// `-1.7976931348623157e+308` (24).
+pub const SPELLING_CAP: usize = 32;
+
+/// [`to_string`] written into `buf` instead of boxed, as `(units at the front
+/// of buf, length)`. `None` when the spelling does not fit, which the caller
+/// answers with the boxed form. A concat builder (a template literal) writes a
+/// number's digits straight into the result buffer this way — the box would be
+/// immediately copied and dropped.
+pub fn units_into(x: f64, buf: &mut [u16; SPELLING_CAP]) -> Option<usize> {
+    let mut integer = [0u16; 22];
+    if let Some(units) = integer_units(x, &mut integer) {
+        buf[..units.len()].copy_from_slice(units);
+        return Some(units.len());
+    }
+    let text = to_string(x);
+    let units = text.as_slice();
+    if units.len() > buf.len() {
+        return None;
+    }
+    buf[..units.len()].copy_from_slice(units);
+    Some(units.len())
+}
+
 /// spec 6.1.6.1.1 Number::add.
 pub fn add(a: f64, b: f64) -> f64 {
     a + b

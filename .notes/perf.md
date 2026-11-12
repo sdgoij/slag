@@ -19251,3 +19251,31 @@ touching the promise or GC paths.
   above): same no-op perturbation, -0.8% aligned vs +0.5% unaligned.
 - **Micro-slices below the noise floor** on the two big rows — 1-3% profile
   entries cannot be attributed on them.
+
+## LANDED (2026-11-12): a template literal assembles into one string
+
+The compiled template was a per-piece concat chain: `PushStr` boxed every quasi
+per execution, and each substitution cost a `ToString` box plus two
+`JsString::concat` nodes — ten arena boxes for `` `a${i}b${j}c${k}d` ``. It is
+now two steps.
+
+- `Step::TemplateSub` is the substitution's `ToString` fence and runs in
+  evaluation order (before the next substitution's expression, so a coercion's
+  side effect or a Symbol's `TypeError` cannot move). A primitive whose
+  `ToString` is side-effect free passes through untouched. The LAST substitution
+  needs no fence: the join follows it immediately, and it normalizes a
+  non-primitive itself — the double-coercion this nearly shipped shows up as an
+  extra `toString` get in `built-ins/BigInt/wrapper-object-ordinary-toprimitive`.
+- `Step::TemplateJoin { quasis }` pops the `n` values and interleaves them with
+  the quasis into ONE string, sized exactly, allocated once (`Small` under 16
+  units, else one flat buffer). `crux::number::units_into` spells a number's
+  digits straight into that buffer instead of boxing them first.
+- Lowered on all three tiers (per-step JIT helper reading `quasis` from the
+  running body and the values below the working `sp`, the `ObjectFast` pattern;
+  `Op::StringSub`/`Op::StringTemplate` for the optimizing tier).
+  `TemplateJoin` must stay in `string_literal_step_reads_body`, or a leaf-inline
+  would run it against the caller's body.
+
+`evaluation-order` 251.0 -> 203.6 ms (-18.9%), jitless 366.0 -> 326.3
+(-10.8%); corpus 2601 -> 2486. Probe: `` `a${i++}b${i++}c${i++}d` `` 641 ->
+245 ns/body.

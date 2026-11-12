@@ -498,8 +498,8 @@ fn runtime_helpers() -> JitHelpers {
         object_accessor_computed: Some(rt.object_accessor_computed),
         object_spread: Some(rt.object_spread),
         push_str: Some(rt.push_str),
-        concat_str: Some(rt.concat_str),
-        concat_str_const: Some(rt.concat_str_const),
+        template_sub: Some(rt.template_sub),
+        template_join: Some(rt.template_join),
         push_const: Some(rt.push_const),
         load_const: Some(rt.load_const),
         enter_block: Some(rt.enter_block),
@@ -768,8 +768,8 @@ mod tests {
             object_accessor_computed: Some(helpers::test_object_accessor_computed),
             object_spread: Some(helpers::test_object_spread),
             push_str: Some(helpers::test_push_str),
-            concat_str: Some(helpers::test_concat_str),
-            concat_str_const: Some(helpers::test_concat_str_const),
+            template_sub: Some(helpers::test_template_sub),
+            template_join: Some(helpers::test_template_join),
             push_const: Some(helpers::test_push_const),
             load_const: Some(helpers::test_load_const),
             enter_block: Some(helpers::test_enter_block),
@@ -1521,22 +1521,30 @@ mod tests {
     #[test]
     fn string_literal_lowers_through_the_helpers() {
         // Cut 54: the string literal steps lower to the helpers — `PushStr`
-        // returns the literal (the double returns 80), the concat steps echo
-        // the accumulator, and the body returns the value.
+        // returns the literal (the double returns 80), `TemplateSub` echoes its
+        // operand, and the fused `TemplateJoin` assembly returns 82 (the
+        // machine code drops the substitution values below the working sp).
         let engine = JitEngine::with_opt(false).expect("native isa");
         let body = make_body(
             vec![
                 Step::PushStr(crux::JsString::from_utf8("a")),
                 Step::PushStr(crux::JsString::from_utf8("b")),
-                Step::ConcatStr,
+                Step::TemplateSub,
                 Step::PushStr(crux::JsString::from_utf8("c")),
-                Step::ConcatStrConst(crux::JsString::from_utf8("d")),
+                Step::TemplateJoin {
+                    quasis: vec![
+                        crux::JsString::from_utf8("a"),
+                        crux::JsString::from_utf8("b"),
+                        crux::JsString::from_utf8("c"),
+                    ]
+                    .into_boxed_slice(),
+                },
                 Step::Return,
             ],
             0,
         );
         let compiled = engine.compile(&body, &helpers_all()).expect("lowers");
-        assert_eq!(run(&compiled, 0), Value::Number(80.0).bits());
+        assert_eq!(run(&compiled, 0), Value::Number(82.0).bits());
     }
 
     #[test]
@@ -4769,9 +4777,9 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
 
     #[test]
     fn installed_jit_runs_a_template_literal_body() {
-        // Cut 54: a template literal — `PushStr` + `ConcatStr` +
-        // `ConcatStrConst` — compiles. Cut 69: `f` is straight-line, so the
-        // call repeats 17×.
+        // Cut 54: a template literal — `PushStr` for the quasis, a
+        // `TemplateSub` fence per substitution, and one `TemplateJoin` —
+        // compiles. Cut 69: `f` is straight-line, so the call repeats 17×.
         let (value, compiled) = with_jit_agent(|agent| {
             agent
                 .run_script(

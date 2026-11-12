@@ -141,8 +141,12 @@ pub enum Helper {
     ObjectAccessorComputed,
     ObjectSpread,
     PushStr,
-    ConcatStr,
-    ConcatStrConst,
+    /// A template substitution's `ToString` fence (`Step::TemplateSub`).
+    TemplateSub,
+    /// The fused template assembly (`Step::TemplateJoin`): the `quasis` payload
+    /// is read back from the running body and the substitution values from the
+    /// working region below the `sp` passed in.
+    TemplateJoin,
     PushConst,
     LoadConst,
     EnterBlock,
@@ -302,8 +306,8 @@ impl Helper {
             Helper::ObjectAccessorComputed => "object_accessor_computed",
             Helper::ObjectSpread => "object_spread",
             Helper::PushStr => "push_str",
-            Helper::ConcatStr => "concat_str",
-            Helper::ConcatStrConst => "concat_str_const",
+            Helper::TemplateSub => "template_sub",
+            Helper::TemplateJoin => "template_join",
             Helper::PushConst => "push_const",
             Helper::LoadConst => "load_const",
             Helper::EnterBlock => "enter_block",
@@ -788,11 +792,12 @@ pub struct JitHelpers {
         Option<extern "C" fn(vm: *mut c_void, object: u64, key: u64, step: u64) -> u64>,
     pub object_spread: Option<extern "C" fn(vm: *mut c_void, object: u64, from: u64) -> u64>,
     /// String literal steps (Cut 54): `PushStr` pushes a literal (the
-    /// `JsString` payload is read back from the running body);
-    /// `ConcatStr`/`ConcatStrConst` run the template flatten concat.
+    /// `JsString` payload is read back from the running body); `TemplateSub`
+    /// runs a substitution's `ToString` and `TemplateJoin` assembles the whole
+    /// literal into one string.
     pub push_str: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
-    pub concat_str: Option<extern "C" fn(vm: *mut c_void, value: u64, acc: u64) -> u64>,
-    pub concat_str_const: Option<extern "C" fn(vm: *mut c_void, acc: u64, step: u64) -> u64>,
+    pub template_sub: Option<extern "C" fn(vm: *mut c_void, value: u64) -> u64>,
+    pub template_join: Option<extern "C" fn(vm: *mut c_void, step: u64, sp: u64) -> u64>,
     /// `Step::Push` with a heap constant (a plain string/bigint literal):
     /// the payload is read back from the running body at `step`.
     pub push_const: Option<extern "C" fn(vm: *mut c_void, step: u64) -> u64>,
@@ -1029,8 +1034,8 @@ impl JitHelpers {
             object_accessor_computed: None,
             object_spread: None,
             push_str: None,
-            concat_str: None,
-            concat_str_const: None,
+            template_sub: None,
+            template_join: None,
             push_const: None,
             load_const: None,
             enter_block: None,
@@ -1189,8 +1194,8 @@ impl JitHelpers {
             }
             Helper::ObjectSpread => self.object_spread.map(|f| f as usize as u64),
             Helper::PushStr => self.push_str.map(|f| f as usize as u64),
-            Helper::ConcatStr => self.concat_str.map(|f| f as usize as u64),
-            Helper::ConcatStrConst => self.concat_str_const.map(|f| f as usize as u64),
+            Helper::TemplateSub => self.template_sub.map(|f| f as usize as u64),
+            Helper::TemplateJoin => self.template_join.map(|f| f as usize as u64),
             Helper::PushConst => self.push_const.map(|f| f as usize as u64),
             Helper::LoadConst => self.load_const.map(|f| f as usize as u64),
             Helper::EnterBlock => self.enter_block.map(|f| f as usize as u64),
@@ -1778,12 +1783,12 @@ pub extern "C" fn test_push_str(_vm: *mut c_void, _step: u64) -> u64 {
     Value::Number(80.0).bits()
 }
 
-pub extern "C" fn test_concat_str(_vm: *mut c_void, _value: u64, acc: u64) -> u64 {
-    acc
+pub extern "C" fn test_template_sub(_vm: *mut c_void, value: u64) -> u64 {
+    value
 }
 
-pub extern "C" fn test_concat_str_const(_vm: *mut c_void, acc: u64, _step: u64) -> u64 {
-    acc
+pub extern "C" fn test_template_join(_vm: *mut c_void, _step: u64, _sp: u64) -> u64 {
+    Value::Number(82.0).bits()
 }
 
 /// `push_const` double: returns 81 (the heap-constant payload value).
