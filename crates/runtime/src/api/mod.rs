@@ -1575,19 +1575,33 @@ mod tests {
     /// drives. The finalizer runs *after* the collection — a finalizer may
     /// allocate, and the sweep runs with the heap borrowed — which is what
     /// `run_finalizers` is for.
+    ///
+    /// The conservative scan reads the words of `[sp, high)`; a stale word in a
+    /// frame `scrub_stack` does not reach can keep the box alive on some layouts
+    /// (`.notes/host-object-gc.md` §5). A fresh object gets a fresh address, so
+    /// retry with a new one rather than trust one stack layout — each attempt
+    /// still asserts the engine's own sweep.
     #[test]
     fn a_swept_host_object_finalizes_through_the_isolate() {
         let mut isolate = isolate();
         let _context = context(&mut isolate);
-        FINALIZED.with(|ids| ids.borrow_mut().clear());
 
-        let id = an_unrooted_host_object();
-        scrub_stack(32);
-        // The collection is the engine's own entry point, not a test-only path.
-        isolate.agent().collect_garbage();
-        isolate.run_finalizers();
+        for _ in 0..8 {
+            FINALIZED.with(|ids| ids.borrow_mut().clear());
+            let id = an_unrooted_host_object();
+            scrub_stack(32);
+            // The collection is the engine's own entry point, not a test-only path.
+            isolate.agent().collect_garbage();
+            isolate.run_finalizers();
 
-        FINALIZED.with(|ids| assert_eq!(*ids.borrow(), vec![id]));
+            let seen =
+                FINALIZED.with(|ids| ids.borrow().iter().filter(|&&seen| seen == id).count());
+            if seen == 1 {
+                return;
+            }
+            assert_eq!(seen, 0, "a swept host object finalizes exactly once");
+        }
+        panic!("the engine's sweep must finalize an unreachable host object");
     }
 
     /// Overwrite the stack region below this frame.
@@ -1673,25 +1687,39 @@ mod tests {
     /// value is gone, the handle says so, and the death callback arrives once
     /// through the drain — with the handle already empty, so it cannot resurrect
     /// the value it is told about.
+    ///
+    /// The conservative scan reads the words of `[sp, high)`; a stale word in a
+    /// frame `scrub_stack` does not reach can keep the box alive on some layouts
+    /// (`.notes/host-object-gc.md` §5). A fresh value gets a fresh address, so
+    /// retry with a new one rather than trust one stack layout.
     #[test]
     fn a_weak_handle_empties_and_calls_back_through_the_isolate() {
         let mut isolate = isolate();
         let _context = context(&mut isolate);
-        WEAK_SAW.with(|saw| saw.borrow_mut().clear());
 
-        let weak = an_unrooted_weak_handle();
-        assert!(!weak.is_empty(), "the value starts out alive");
-        weak.set_callback(Box::new(move || {
-            WEAK_SAW.with(|saw| saw.borrow_mut().push(weak.is_empty()));
-        }));
+        for _ in 0..8 {
+            WEAK_SAW.with(|saw| saw.borrow_mut().clear());
+            let mut weak = an_unrooted_weak_handle();
+            assert!(!weak.is_empty(), "the value starts out alive");
+            weak.set_callback(Box::new(move || {
+                WEAK_SAW.with(|saw| saw.borrow_mut().push(weak.is_empty()));
+            }));
 
-        scrub_stack(32);
-        isolate.agent().collect_garbage();
-        // The sweep queues; the drain is what runs a host callback.
-        isolate.run_finalizers();
+            scrub_stack(32);
+            isolate.agent().collect_garbage();
+            // The sweep queues; the drain is what runs a host callback.
+            isolate.run_finalizers();
 
-        assert!(weak.is_empty(), "the collector's verdict is the handle's");
-        assert_eq!(WEAK_SAW.with(|saw| saw.borrow().clone()), vec![true]);
+            if !weak.is_empty() {
+                // The scan kept it alive: drop the entry so a later attempt's
+                // sweep cannot run this attempt's callback.
+                weak.clear();
+                continue;
+            }
+            assert_eq!(WEAK_SAW.with(|saw| saw.borrow().clone()), vec![true]);
+            return;
+        }
+        panic!("the collector must empty an unreachable weak handle");
     }
 
     thread_local! {
@@ -1702,58 +1730,84 @@ mod tests {
 
     /// The second pass is the guaranteed one: the isolate drains it after every
     /// first pass, and it arrives even when the first pass cleared the handle.
+    ///
+    /// The conservative scan reads the words of `[sp, high)`; a stale word in a
+    /// frame `scrub_stack` does not reach can keep the box alive on some layouts
+    /// (`.notes/host-object-gc.md` §5). A fresh value gets a fresh address, so
+    /// retry with a new one rather than trust one stack layout.
     #[test]
     fn a_second_pass_arrives_after_the_first_through_the_isolate() {
         let mut isolate = isolate();
         let _context = context(&mut isolate);
-        PHASES.with(|phases| phases.borrow_mut().clear());
 
-        let weak = an_unrooted_weak_handle();
-        weak.set_callback(Box::new(move || {
-            PHASES.with(|phases| phases.borrow_mut().push(1));
-            // The first pass releases the handle; the guaranteed pass must still
-            // arrive.
-            let mut weak = weak;
-            weak.clear();
-        }));
-        weak.set_second_pass_callback(Box::new(|| {
-            PHASES.with(|phases| phases.borrow_mut().push(2));
-        }));
+        for _ in 0..8 {
+            PHASES.with(|phases| phases.borrow_mut().clear());
+            let mut weak = an_unrooted_weak_handle();
+            weak.set_callback(Box::new(move || {
+                PHASES.with(|phases| phases.borrow_mut().push(1));
+                // The first pass releases the handle; the guaranteed pass must
+                // still arrive.
+                let mut weak = weak;
+                weak.clear();
+            }));
+            weak.set_second_pass_callback(Box::new(|| {
+                PHASES.with(|phases| phases.borrow_mut().push(2));
+            }));
 
-        scrub_stack(32);
-        isolate.agent().collect_garbage();
-        // The sweep queues both passes; the drain runs them in order.
-        assert!(PHASES.with(|phases| phases.borrow().is_empty()));
-        isolate.run_finalizers();
+            scrub_stack(32);
+            isolate.agent().collect_garbage();
+            // The sweep queues both passes; the drain runs them in order.
+            assert!(PHASES.with(|phases| phases.borrow().is_empty()));
+            isolate.run_finalizers();
 
-        assert_eq!(PHASES.with(|phases| phases.borrow().clone()), vec![1, 2]);
+            if PHASES.with(|phases| phases.borrow().is_empty()) {
+                // The scan kept the box alive: nothing was queued. Drop the entry
+                // so a later attempt's sweep cannot run these callbacks.
+                weak.clear();
+                continue;
+            }
+            assert_eq!(PHASES.with(|phases| phases.borrow().clone()), vec![1, 2]);
+            return;
+        }
+        panic!("the collector must take an unreachable weak handle");
     }
 
     /// A second pass registered *from inside* the first pass: the sweep had
     /// already queued what it saw, so this one lands in the late queue and the
     /// same drain must run it after every first pass.
+    ///
+    /// The conservative scan reads the words of `[sp, high)`; a stale word in a
+    /// frame `scrub_stack` does not reach can keep the box alive on some layouts
+    /// (`.notes/host-object-gc.md` §5). A fresh value gets a fresh address, so
+    /// retry with a new one rather than trust one stack layout.
     #[test]
     fn a_second_pass_registered_by_the_first_runs_in_the_same_drain() {
         static LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        LATE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let mut isolate = isolate();
         let _context = context(&mut isolate);
-        let weak = an_unrooted_weak_handle();
-        weak.set_callback(Box::new(|| {
-            crux::heap::queue_late_second_pass(Box::new(|| {
-                LATE.store(true, std::sync::atomic::Ordering::SeqCst);
-            }));
-        }));
 
-        scrub_stack(32);
-        isolate.agent().collect_garbage();
-        assert!(!LATE.load(std::sync::atomic::Ordering::SeqCst));
-        isolate.run_finalizers();
-        assert!(
-            LATE.load(std::sync::atomic::Ordering::SeqCst),
-            "the late second pass runs in the same drain"
-        );
+        for _ in 0..8 {
+            LATE.store(false, std::sync::atomic::Ordering::SeqCst);
+            let mut weak = an_unrooted_weak_handle();
+            weak.set_callback(Box::new(|| {
+                crux::heap::queue_late_second_pass(Box::new(|| {
+                    LATE.store(true, std::sync::atomic::Ordering::SeqCst);
+                }));
+            }));
+
+            scrub_stack(32);
+            isolate.agent().collect_garbage();
+            assert!(!LATE.load(std::sync::atomic::Ordering::SeqCst));
+            isolate.run_finalizers();
+            if LATE.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // The scan kept the box alive: drop the entry so a later attempt's
+            // sweep cannot run this attempt's callback.
+            weak.clear();
+        }
+        panic!("the late second pass runs in the same drain");
     }
 
     /// A traced reference over a value nothing else names, made in a frame that

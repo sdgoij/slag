@@ -63,6 +63,25 @@ dangling/reuse case, not a missing barrier. A quick probe is a TLS
 the offending child at the miss. The container being *unreachable* (dead
 garbage the verifier still walks) is a separate, benign false positive.
 
+## Tests that need a value to be *unreachable*
+
+A unit test that asserts the collector took a value must make the value
+unreachable, and the conservative scan makes that harder than it looks: it
+reads every word of `[sp, high)`, so a stale word the test's `scrub_stack`
+was too shallow to overwrite can keep the box alive on some stack layouts
+(`.notes/host-object-gc.md` §5). The pattern is create the value in an
+`#[inline(never)]` helper, `scrub_stack` the region below the caller, and
+**retry with a fresh object**: a fresh address cannot be named by an earlier
+attempt's stale word, so a loop that gives up on the first attempt is the
+only part of this that is deterministic. Assert the exact verdict (the id
+finalized once, `[1, 2]` in order, handle empty) on the attempt that swept.
+`crates/runtime/src/api/mod.rs`'s `a_swept_host_object_finalizes_through_the_isolate`
+and `a_second_pass_arrives_after_the_first_through_the_isolate` are the model;
+an attempt that did not sweep is not a failure, it is the next iteration.
+A test that does not retry flakes in CI instead. Do **not** "fix" it with
+`--test-threads=1` — the failure is a stack-layout property of one process,
+not parallelism.
+
 ## Diagnosing
 
 - Reproduce a single fixture: `sweep.exe built-ins --filter '<area>/<fixture>.js'
