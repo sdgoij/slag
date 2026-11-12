@@ -19134,3 +19134,120 @@ the change was reverted rather than kept on a plausible mechanism.
 that row — with anything less, a null change reads as a double-digit win or loss.
 The `hl` row is almost as bad (475-610 ms over 15 runs), which is why the two
 runs above disagree in sign.
+
+## PLAN (2026-11-12): the two call-throughput rows, in order
+
+### Where the corpus stands
+
+Re-ranked on the split binary, all 79 rows, one process (`--corpus
+tools/corpus/workloads`), node from `scratch/corpus-new/node-jit.tsv`:
+
+| slag | jitless | node | x | row |
+| ---: | ---: | ---: | ---: | --- |
+| 620.2 | 1633.0 | 52.5 | 11.8 | `for-in/head-let-fresh-binding-per-iteration` |
+| 533.6 | 673.5 | 28.7 | 18.6 | `template-literal/evaluation-order` |
+| 122.6 | 132.1 | 23.8 | 5.2 | `objects/spread_assign` |
+| 111.7 | 104.3 | 76.6 | 1.5 | `try/completion-values` |
+| 95.8 | 110.2 | 19.0 | 5.0 | `opcost/json_stringify` |
+| 86.6 | 65.5 | 8.9 | 9.8 | `builtins/object_keys` |
+| 85.4 | 149.2 | 12.0 | 7.1 | `calls/construct_churn` |
+
+Corpus total 2,833 ms against node's 718 ms (3.9x). The first two rows are **41%
+of the whole corpus**, so they are the only ones where a percentage point is
+worth anything in absolute terms.
+
+### The measurement that sets the target
+
+Isolated, one row per process:
+
+| row | jit | jitless | JIT gain | node |
+| --- | ---: | ---: | ---: | ---: |
+| `head-let-fresh-binding` | 493 ms | 2,056 ms | **4.2x** | 52 ms |
+| `template-literal/evaluation-order` | 246 ms | 376 ms | **1.5x** | 29 ms |
+
+`head-let` runs **112 calls per body over 100,000 bodies = 11.2 M calls in 493
+ms, i.e. 44 ns per call**. Node does the whole body — the same 112 calls — in
+520 ns, **4.6 ns per call**, because it inlines the assertion helpers away.
+
+Two consequences, both of which change the plan that preceded this one:
+
+- **Certification coverage is not the lever for `head-let`.** Its body already
+  compiles (4.2x over the interpreter). The register lane would not help.
+- **It is the lever for `evaluation-order`**: 1.5x says roughly half of that row
+  still runs interpreted.
+
+Both rows are therefore *call-throughput* rows: the cost is the 112 calls per
+body and the 44 ns each, not GC, not creation, not traps. Slice order below
+follows that split.
+
+### Slice 1 — `evaluation-order`: why is half of it interpreted?
+
+The row is one 90-line fixture; under the JIT it gains only 1.5x, so some body on
+its path is refused by certification (or lands below the compile threshold) and
+runs the step loop instead.
+
+Work: find the body's certification verdict (`lookup_info_for` and the gates it
+applies), and confirm with the census — the per-variant counts show what the
+interpreter executes, and `JIT_HELPER_STATS`/the compiled-body count show what
+compiled.
+
+Acceptance: the row's JIT gain rises toward the `head-let` regime (>=3x) and its
+absolute time falls with it; the census shows the interpreted share collapse.
+If the body turns out to be legitimately uncertifiable (a `try`, a getter, a
+tagged-template shape that cannot certify), record *that* — a dead end here is
+worth one paragraph, not a refactor.
+
+Risks: the fixture is 90 lines with templates, tagged templates and accessors;
+several of those individually certify (Cut 78, the accessor lanes), so the
+suspect is the combination or a per-statement gate. Do not assume; read the
+verdict.
+
+### Slice 2 — `head-let`: 44 ns per call
+
+11.2 M calls per corpus pass, 44 ns each. Node's 4.6 ns is a different strategy
+(inlining), not a faster call sequence, so the honest target is the call
+machinery, not node parity: **44 ns -> ~30 ns** is the goal, and it is worth
+~30% of a row that is 22% of the corpus.
+
+Work: decompose the 44 ns with the same-binary instrument the call-path slices
+used before (the same-stack frame, the leaf-inline lane, the context-swap elision
+— see the 2026-11-02..06 cuts, which already took this path apart once). The row
+mixes three call shapes: closure calls on per-iteration bindings, plain function
+calls into the assert harness, and `Object.create(null)`-derived receivers; the
+census says the mix is `CallFast` 112/body.
+
+Acceptance: the row's min-of-15 falls >=15%; every `calls/*` row is flat or
+better; loop rows flat (0.2% band).
+
+Ceiling, stated so it is not chased: without JIT inlining of callees, a
+call-heavy row cannot reach node, however good the call sequence gets. If the
+machinery slice lands at ~30 ns, the next question is inlining, which is a
+project, not a slice.
+
+### Measurement rules for both
+
+- `head-let` spans 475-610 ms across 15 runs of one binary (+/-5% on the median,
+  ~28% peak to peak): min of 15, and require a >=10% move before believing it.
+- Never judge these rows on `promise_churn`-class variance: that row spans
+  10.55-14.09 ms on one binary (+33%), and a null change has read +16% on it.
+- Where the change can be gated at runtime, measure inside one binary; a
+  compile-time difference gets the interleaved min-of-N and the calibration
+  band above.
+
+### Gates (unchanged)
+
+fmt; `clippy --workspace --all-targets -D warnings`; `cargo test --workspace`
+(parallel, as CI runs it); test262 `language`/`built-ins`/`annexB` in BOTH modes;
+corpus 79/79 identical results across parent/new, jit/jitless, `--gc-stress`,
+`--nursery-stress`; Promise family under `--gc-stress --gc-verify` for anything
+touching the promise or GC paths.
+
+### Not doing
+
+- **PGO.** Per-workload by nature; the user applies it to their own program (the
+  Goats project reads ~10%); a corpus-trained profile would optimize the
+  scoreboard.
+- **Function alignment.** Measured redundant after the dispatch split (see
+  above): same no-op perturbation, -0.8% aligned vs +0.5% unaligned.
+- **Micro-slices below the noise floor** on the two big rows — 1-3% profile
+  entries cannot be attributed on them.
