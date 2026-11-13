@@ -852,7 +852,7 @@ pub(crate) fn copy_data_properties(
         kept.push(Value::Object(*to));
     }
     let result = (|| -> Result<(), JsError> {
-        let keys = from_obj.own_property_keys()?;
+        let keys = crate::ir::own_keys_cached(agent, &from_obj)?;
         // The freshness test is cheap and allocation-free, so it runs before
         // the snapshot: a copy into a destination that already has properties
         // pays neither the snapshot's vectors nor a second descriptor read.
@@ -862,15 +862,15 @@ pub(crate) fn copy_data_properties(
         {
             return Ok(());
         }
-        for key in keys {
-            let property = from_obj.get_own_property_key(&key)?;
+        for key in keys.iter() {
+            let property = from_obj.get_own_property_key(key)?;
             if let Some(property) = property {
                 if !property.enumerable {
                     continue;
                 }
-                let value = from_obj.get_key(&key)?;
+                let value = from_obj.get_key(key)?;
                 agent.roots.kept_during_job.borrow_mut().push(value);
-                to.create_data_property_key(&key, value)?;
+                to.create_data_property_key(key, value)?;
             }
         }
         Ok(())

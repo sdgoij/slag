@@ -1034,22 +1034,22 @@ fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     // makes a count-first pass unsound: getters may hide later keys).
     let _stress = crate::ir::StressSuppress::new();
     let mut entries = Vec::new();
-    for key in obj.own_property_keys()? {
+    for key in crate::ir::own_keys_cached(agent, &obj)?.iter() {
         // EnumerableOwnProperties (spec 7.3.26): the descriptor's
         // enumerability is re-read for every key, so a getter hit for
-        // an earlier key can hide a later one (getter-making-future-
+        // an earlier key can hide a later key (getter-making-future-
         // key-nonenumerable.js).
         let PropertyKey::String(id) = key else {
             continue;
         };
-        let key = PropertyKey::String(id);
+        let key = PropertyKey::String(*id);
         if !obj
             .get_own_property_key(&key)?
             .is_some_and(|prop| prop.enumerable)
         {
             continue;
         }
-        let text = crux::lookup(id);
+        let text = crux::lookup(*id);
         let value = crate::context::get_property(agent, &object, &text, object)?;
         let pair = crate::builtins::array::array_create(agent, 2.0)?;
         pair.create_data_property_index(0, Value::String(Handle::new(text)))?;
@@ -1070,20 +1070,20 @@ fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     // next property read allocates — suppress `--gc-stress` for the
     // build so the half-built Vec cannot be swept.
     let _stress = crate::ir::StressSuppress::new();
-    for key in obj.own_property_keys()? {
+    for key in crate::ir::own_keys_cached(agent, &obj)?.iter() {
         // EnumerableOwnProperties re-reads each descriptor, so a
         // getter for an earlier key can hide a later one.
         let PropertyKey::String(id) = key else {
             continue;
         };
-        let key = PropertyKey::String(id);
+        let key = PropertyKey::String(*id);
         if !obj
             .get_own_property_key(&key)?
             .is_some_and(|prop| prop.enumerable)
         {
             continue;
         }
-        let text = crux::lookup(id);
+        let text = crux::lookup(*id);
         let value = crate::context::get_property(agent, &object, &text, object)?;
         values.push(value);
     }
@@ -1572,7 +1572,7 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         let Some(source) = as_object(&source_value) else {
             continue;
         };
-        let keys = source.own_property_keys()?;
+        let keys = crate::ir::own_keys_cached(agent, &source)?;
         let ordinary_source = matches!(source.kind, crux::object::ObjectKind::Ordinary);
         // Fast path: a plain-data source into a fresh destination on the
         // realm's %Object.prototype% — `Object.assign({}, o)`, the spread
@@ -1594,15 +1594,15 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         {
             continue;
         }
-        for key in keys {
-            if let Some(prop) = source.get_own_property_key(&key)?
+        for key in keys.iter() {
+            if let Some(prop) = source.get_own_property_key(key)?
                 && prop.enumerable
             {
                 // The receiver is the coerced source, so a getter sees the
                 // function rather than its object part.
                 let value =
-                    crate::context::get_property_key(agent, &source_value, &key, source_value)?;
-                target.set_key(&key, value, true)?;
+                    crate::context::get_property_key(agent, &source_value, key, source_value)?;
+                target.set_key(key, value, true)?;
             }
         }
     }
@@ -1719,6 +1719,49 @@ mod tests {
             observed,
             str(
                 "[\"2,10,b,a\",\"2,10,b,a,c\",\"2,10,a,c\",\"2,10,c\",\"2,10,a,c\",\"y\",\"0,1,2\",\"0,1,2\",\"0,1,2\",\"\"]"
+            )
+        );
+    }
+
+    /// The own-key list `CopyDataProperties` / `Object.assign` / `Object.values`
+    /// take is now cached per SHAPE, so a second object on the same map reuses
+    /// the first one's list. Everything that is not a plain own enumerable
+    /// string-or-symbol key has to keep behaving: inherited and non-enumerable
+    /// properties are not copied, symbols are (for the copying consumers) and
+    /// are not (for the string-key consumers), and a structural change between
+    /// two copies is seen by the second.
+    #[test]
+    fn a_shape_cached_own_key_list_reflects_every_property_rule() {
+        let observed = run(
+            "var proto = { inherited: 1 };\
+             var sym = Symbol('s');\
+             var out = [];\
+             for (var i = 0; i < 2; i++) {\
+               var o = Object.create(proto);\
+               o.a = i;\
+               o.b = i + 1;\
+               Object.defineProperty(o, 'hidden', { value: 9, enumerable: false });\
+               o[sym] = i + 2;\
+               var spread = { ...o };\
+               out.push(Object.keys(spread).join(','));\
+               out.push(spread[sym]);\
+               out.push(spread.hidden);\
+               out.push(spread.inherited);\
+               out.push(Object.values(o).join(','));\
+               out.push(Object.entries(o).length);\
+               out.push(Object.assign({}, o)[sym]);\
+             }\
+             var m = { x: 1, y: 2 };\
+             var firstRest = (function () { var { x, ...rest } = m; return Object.keys(rest).join(','); })();\
+             delete m.y;\
+             var secondRest = (function () { var { x, ...rest } = m; return Object.keys(rest).join(','); })();\
+             JSON.stringify([out, firstRest, secondRest, Object.keys({ 2: 1, b: 2, 1: 3, a: 4 }).join()])",
+        )
+        .unwrap();
+        assert_eq!(
+            observed,
+            str(
+                "[[\"a,b\",2,null,null,\"0,1\",2,2,\"a,b\",3,null,null,\"1,2\",2,3],\"y\",\"\",\"1,2,b,a\"]"
             )
         );
     }

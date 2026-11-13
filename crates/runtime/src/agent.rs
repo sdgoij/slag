@@ -919,6 +919,12 @@ pub(crate) struct AgentRoots {
     /// makes a per-iteration `for (k in {...})` re-enumerating free.
     pub(crate) for_in_shape_cells:
         RefCell<Box<[Option<crate::ir::ForInShapeCache>; crate::ir::FOR_IN_CELLS]>>,
+    /// `OrdinaryOwnPropertyKeys` per base SHAPE (live map id), for the
+    /// `CopyDataProperties` consumers (spread, `Object.assign`, object rest)
+    /// that enumerate a fresh source every iteration — see
+    /// [`crate::ir::OwnKeysShapeCache`].
+    pub(crate) own_keys_shape_cells:
+        RefCell<Box<[Option<crate::ir::OwnKeysShapeCache>; crate::ir::OWN_KEYS_SHAPE_CELLS]>>,
     /// The eight `typeof` result strings, boxed once per agent (see
     /// `crux::value::type_of_kind`). `typeof x === "…"` is everywhere, and
     /// every evaluation of the step used to box the same five-to-nine
@@ -1428,6 +1434,7 @@ impl AgentRoots {
             spread_cells: std::array::from_fn(|_| Cell::new(None)),
             for_in_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             for_in_shape_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            own_keys_shape_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             type_strings: RefCell::new(std::array::from_fn(|_| None)),
             empty_string: std::cell::Cell::new(None),
             atom_string_cells: Box::new(std::array::from_fn(|_| std::cell::Cell::new(None))),
@@ -1640,6 +1647,9 @@ impl Trace for AgentRoots {
             cell.trace(visit);
         }
         for cell in self.for_in_shape_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
+        for cell in self.own_keys_shape_cells.borrow().iter().flatten() {
             cell.trace(visit);
         }
         for value in self.type_strings.borrow().iter().flatten() {
@@ -4460,6 +4470,9 @@ impl Agent {
             *cell = None;
         }
         for cell in self.roots.for_in_shape_cells.borrow_mut().iter_mut() {
+            *cell = None;
+        }
+        for cell in self.roots.own_keys_shape_cells.borrow_mut().iter_mut() {
             *cell = None;
         }
     }

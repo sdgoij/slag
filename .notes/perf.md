@@ -19947,3 +19947,67 @@ gaps in the `opcost` family (`release`, 100k iterations, node v24): `slice` 174
 vs 12 ns, `forEach` 214 vs 18, `Map.forEach` 227 vs 21, `TypedArray.forEach`
 258 vs 25, `RegExp.test` 306 vs 15, `toSorted` 322 vs 96, `stringify` 656 vs
 190.
+
+## LANDED (2026-11-13): the own-key list of a shape, shared by the copying builtins
+
+`OrdinaryOwnPropertyKeys` is a *structural* consumer: it materializes a
+vector-free object's property vector and rebuilds an ordered key list from it.
+`Object.keys` had a cache for that (`enum_key_cells`) but it is identity-keyed,
+so a fresh object — the source of every `{...o}`, `Object.assign({}, o)` and
+`var {...rest} = o` inside a loop — never hit it. Measured: `Object.keys` on a
+fresh 3-key object cost 702 ns against 222 for the same object hoisted, and
+`{...o}` 329 against 200.
+
+`OwnKeysShapeCache` (`agent.roots.own_keys_shape_cells`, 64 direct-mapped slots)
+keys the list on the base's **live map id** with the same gate `ForInShapeCache`
+uses (`ir::for_in_shape_map`: an ordinary object whose map describes its own
+string data properties, i.e. no vector-only extras). No prototype snapshot is
+needed — this list is own keys only. `ir::own_keys_cached` returns an
+`Rc<Vec<PropertyKey>>` and every consumer only reads it:
+
+- `CopyDataProperties` (object spread), `Object.assign`, and object rest
+  (`copy_data_properties_excluding`);
+- `Object.values` and `Object.entries`.
+
+Two properties make it sound and cheap: a live map's descriptors are exactly the
+object's own string keys in insertion order, so the ordered list is a function of
+the map id (map ids are never reused); and `EnumerableOwnProperties` already
+re-reads each key's descriptor after taking the snapshot, so a key hidden or
+deleted by a getter mid-build is still filtered — the cached list is the same
+snapshot the uncached path would have taken. Symbol keys ride in the list (they
+are `Trace`d), so `Object.assign`/spread still copy them; the string-only
+consumers filter them as before. Arrays, proxies, typed arrays, an object with
+vector-only properties and a dictionary-mode object all fall back.
+
+The second-order effect is the one that pays on a *hoisted* source too: the copy
+no longer materializes the source's property vector, so its later reads keep
+serving from the map + inline fields.
+
+| probe (100k iterations) | before | after | delta |
+|---|---:|---:|---:|
+| `{ ...fresh }` | 32.0 | 16.9 | **-47.0%** |
+| `Object.assign({}, fresh)` | 36.2 | 21.5 | **-40.6%** |
+| `{ ...hoisted }` | 20.0 | 11.5 | -42.4% |
+| object rest, fresh | 38.9 | 25.3 | -35.1% |
+
+| row | before | after | delta |
+|---|---:|---:|---:|
+| `objects/spread_assign` | 80.9 | 50.6 | **-37.5%** |
+| `builtins/object_keys` (values/entries) | 46.8 | 40.6 | -13.2% |
+| `opcost/map_get` (control) | 2.856 | 2.858 | +0.1% |
+| **corpus total** | **2101** | **2020** | **-3.9%** |
+
+(Per-row isolated, interleaved min-of-6/8, the two binaries ~60 lines apart; the
+control row holding at +0.1% is what makes the total readable.) Gates: corpus
+results identical 79/79 in jit, jitless, `--gc-stress` and `--nursery-stress`;
+test262 `language` 23726, `built-ins` 23821, `annexB` 1086 — 0 fail both modes;
+`cargo test --workspace`; clippy; fmt. One new unit test covers the sharing:
+inherited and non-enumerable keys are excluded, symbols are copied by
+spread/assign and filtered by `keys`/`values`/`entries`, and a delete between
+two rest-copies is seen by the second.
+
+### Still on this path
+
+`Object.keys`'s identity cache (`enum_key_cells`) is still keyed on the object;
+a *shape*-keyed value list would make a fresh-object `Object.keys` (702 ns, not
+in the corpus today) cost what a hoisted one does. The same gate applies.

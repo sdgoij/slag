@@ -361,11 +361,11 @@ pub fn copy_data_properties_excluding(
         kept.push(Value::Object(*to));
     }
     let result = (|| -> Result<(), JsError> {
-        for key in from_obj.own_property_keys()? {
-            if excluded.contains(&key) {
+        for key in crate::ir::own_keys_cached(agent, &from_obj)?.iter() {
+            if excluded.contains(key) {
                 continue;
             }
-            let property = from_obj.get_own_property_key(&key)?;
+            let property = from_obj.get_own_property_key(key)?;
             if let Some(property) = property {
                 if !property.enumerable {
                     continue;
@@ -374,9 +374,9 @@ pub fn copy_data_properties_excluding(
                 // enumerable check (spec 7.3.25 step 6.c.i-ii): for proxies this
                 // is what invokes the `get` trap, and the descriptor's data value
                 // would be a trap artifact.
-                let value = from_obj.get_key(&key)?;
+                let value = from_obj.get_key(key)?;
                 agent.roots.kept_during_job.borrow_mut().push(value);
-                to.create_data_property_key(&key, value)?;
+                to.create_data_property_key(key, value)?;
             }
         }
         Ok(())

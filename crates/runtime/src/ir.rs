@@ -3188,6 +3188,64 @@ pub(crate) fn for_in_shape_cache_put(
     Ok(())
 }
 
+/// A cached `OrdinaryOwnPropertyKeys` list keyed by the base's SHAPE.
+///
+/// The identity-keyed `enum_key_cells` can never hit for a fresh object, and
+/// the consumers that matter (`CopyDataProperties` for a spread or
+/// `Object.assign`, object rest) call `own_property_keys` on a *fresh* source
+/// every iteration. That call is a structural consumer: it materializes a
+/// vector-free object's property vector, then rebuilds an ordered list from
+/// it. A live map already describes exactly those keys, so a same-shape object
+/// reuses the list and the source stays vector-free (its later reads keep
+/// serving from the map + fields).
+pub struct OwnKeysShapeCache {
+    map_id: u64,
+    keys: std::rc::Rc<Vec<crux::property::PropertyKey>>,
+}
+
+impl Trace for OwnKeysShapeCache {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for key in self.keys.iter() {
+            key.trace(visit);
+        }
+    }
+}
+
+/// The direct-mapped size of the Agent's shape-keyed own-key cache.
+pub(crate) const OWN_KEYS_SHAPE_CELLS: usize = 64;
+
+fn own_keys_shape_slot(map_id: u64) -> usize {
+    map_id as usize & (OWN_KEYS_SHAPE_CELLS - 1)
+}
+
+/// `obj`'s own key list, through the shape cache when the object's live map
+/// describes its own keys exactly (see [`for_in_shape_map`]).
+pub(crate) fn own_keys_cached(
+    agent: &Agent,
+    obj: &Handle<crux::object::JsObject>,
+) -> Result<std::rc::Rc<Vec<crux::property::PropertyKey>>, JsError> {
+    let Some(map_id) = for_in_shape_map(obj) else {
+        return Ok(std::rc::Rc::new(obj.own_property_keys()?));
+    };
+    let slot = own_keys_shape_slot(map_id);
+    let cached = {
+        let cells = agent.roots.own_keys_shape_cells.borrow();
+        match cells[slot].as_ref() {
+            Some(entry) if entry.map_id == map_id => Some(entry.keys.clone()),
+            _ => None,
+        }
+    };
+    if let Some(keys) = cached {
+        return Ok(keys);
+    }
+    let keys = std::rc::Rc::new(obj.own_property_keys()?);
+    agent.roots.own_keys_shape_cells.borrow_mut()[slot] = Some(OwnKeysShapeCache {
+        map_id,
+        keys: keys.clone(),
+    });
+    Ok(keys)
+}
+
 /// The (id, generation) of every object in `obj`'s prototype chain, when
 /// every link is generation-tracked (`None` otherwise — such a chain must
 /// not be cached).
