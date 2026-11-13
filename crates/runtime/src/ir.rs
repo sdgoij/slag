@@ -2125,6 +2125,11 @@ pub struct CompiledBody {
     /// set it on the first lookup so a hot call skips the cache
     /// consultation entirely.
     pub jit_info: std::cell::Cell<usize>,
+    /// How many times this body's compiled code has deopted. A deopt means a
+    /// speculation in the compiled code was wrong, so the cache rebuilds the
+    /// body with the typer's read guards off on the next consult: the same
+    /// guard cannot strand the run twice (`scratch/row/h7`).
+    pub deopt_retries: std::cell::Cell<u32>,
     /// Cut 69: the number of JIT consultations this body received while
     /// below `crate::jit::JIT_COMPILE_THRESHOLD` (saturating). A
     /// straight-line body (`has_loop` false) is run interpreted until the
@@ -27328,6 +27333,7 @@ pub fn compile_body(
             reg_ops,
             script_globals: None,
             jit_info: std::cell::Cell::new(0),
+            deopt_retries: std::cell::Cell::new(0),
             jit_calls: std::cell::Cell::new(0),
             jit_evictions: std::cell::Cell::new(0),
             jit_used: std::cell::Cell::new(0),
@@ -27423,6 +27429,7 @@ pub fn compile_statements(
         reg_ops: None,
         script_globals: compiler.script_globals,
         jit_info: std::cell::Cell::new(0),
+        deopt_retries: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
         jit_evictions: std::cell::Cell::new(0),
         jit_used: std::cell::Cell::new(0),
@@ -27479,6 +27486,7 @@ pub(crate) fn compile_eval_in_frame(
         reg_ops: None,
         script_globals: None,
         jit_info: std::cell::Cell::new(0),
+        deopt_retries: std::cell::Cell::new(0),
         jit_calls: std::cell::Cell::new(0),
         jit_evictions: std::cell::Cell::new(0),
         jit_used: std::cell::Cell::new(0),

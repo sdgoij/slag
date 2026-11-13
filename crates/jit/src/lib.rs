@@ -256,6 +256,9 @@ struct Entry {
     body: Rc<CompiledBody>,
     compiled: Option<Rc<Compiled>>,
     last_used: u64,
+    /// The body's deopt generation when this code was built. A mismatch means
+    /// the code deopted, and it is rebuilt without the speculation that failed.
+    retries: u32,
 }
 
 /// The cache's capacity: beyond this many entries the least-used body is
@@ -316,6 +319,23 @@ impl JitCache {
     pub fn lookup(&mut self, body: &Rc<CompiledBody>, in_flight: bool) -> *const JitCompiledInfo {
         let key = Rc::as_ptr(body) as usize;
         self.clock = self.clock.wrapping_add(1);
+        // A body whose code deopted since this entry was built is rebuilt: the
+        // deopt means a speculation in that code was wrong, so re-running it
+        // would deopt again, and a deopt has no way back into compiled code (the
+        // rest of the run falls to the VM lane). Not while a frame is in flight:
+        // the entry's code is live on the native stack, so the rebuild waits for
+        // the next consult.
+        let stale = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.retries != body.deopt_retries.get());
+        if stale
+            && !in_flight
+            && let Some(entry) = self.entries.remove(&key)
+        {
+            entry.body.jit_info.set(0);
+            runtime::jit::record_evicted();
+        }
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.clock;
         } else {
@@ -331,6 +351,7 @@ impl JitCache {
                     body: body.clone(),
                     compiled,
                     last_used: self.clock,
+                    retries: body.deopt_retries.get(),
                 },
             );
         }
@@ -663,6 +684,7 @@ mod tests {
             handlers: Vec::new(),
             strict: false,
             script: std::cell::Cell::new(None),
+            deopt_retries: std::cell::Cell::new(0),
             scope: Some(scope(frame_size)),
             env_constant: true,
             leaf: false,

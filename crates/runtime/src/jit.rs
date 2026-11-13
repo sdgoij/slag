@@ -7344,6 +7344,14 @@ pub(crate) fn run_jit_body(
         // frame.
         vm.stack.truncate(work_base + depth);
         JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The speculation this guard carried was wrong for this body. Mark the
+        // body and clear its fast pointer so the next consult rebuilds it with
+        // the typer's read guards off (`opt::lift::lift`), keeping the remaining
+        // iterations compiled instead of leaving them to the VM lane for the
+        // rest of the run.
+        ir.deopt_retries
+            .set(ir.deopt_retries.get().saturating_add(1));
+        ir.jit_info.set(0);
         if JIT_DEOPT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("jit-deopt step={} depth={}", vm.ip, depth);
         }
@@ -8087,6 +8095,7 @@ mod tests {
             handlers: Vec::new(),
             strict: false,
             script: std::cell::Cell::new(None),
+            deopt_retries: std::cell::Cell::new(0),
             scope: None,
             env_constant: true,
             leaf: false,

@@ -92,7 +92,18 @@ pub fn lift(body: &CompiledBody) -> Result<Function, Unsupported> {
     // `s += new Item(i).sum()` is 1.5x slower in the opt tier with the guard,
     // the leaf lane falling to `call_slow`). Only a non-leaf body, which no
     // caller inlines, takes the guard.
-    lift_impl(body, typer_reads_enabled() && !body.leaf)
+    //
+    // A body that has already deopted drops the guard: the speculation was
+    // wrong on this body, and a deopt resumes at the guard's step, which has no
+    // way back into compiled code — the rest of the run falls to the VM lane
+    // (~5x on a 1M-iteration loop; `scratch/row/h7`). Rebuilding without the
+    // guard keeps every step compiled and cannot violate `narrow`: `narrow`
+    // runs inside this same lift, so it never sees an annotation that is not
+    // there.
+    lift_impl(
+        body,
+        typer_reads_enabled() && !body.leaf && body.deopt_retries.get() == 0,
+    )
 }
 
 /// [`lift`] with the typer's read guard forced on or off (tests).
@@ -2770,6 +2781,7 @@ mod tests {
             handlers: Vec::new(),
             strict: false,
             script: std::cell::Cell::new(None),
+            deopt_retries: std::cell::Cell::new(0),
             scope: Some(scope(frame_size)),
             env_constant: true,
             leaf: false,

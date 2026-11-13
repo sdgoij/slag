@@ -19317,3 +19317,31 @@ survey found.
 `head-let` is call-bound (44 ns/call, 112 calls/body) and `SLAG_INLINE=1`
 changes nothing measurable on it (463 vs 475 ms min-of-3, inside its ~20%
 run-to-run spread), so callee inlining is not the unlock there either.
+
+## LANDED (2026-11-12): a deopt rebuilds its body instead of stranding the run
+
+A failing typer read guard returns `DISPATCH_DEOPT`, and the driver turned that
+into `vm.start` — so the rest of the body, a 1M-iteration loop included, ran in
+the VM lane for the remainder of the call. Measured on `scratch/row/h7` (callee
+held in a local slot, read out of an object): **48.68 -> 9.47 ms** (min-of-7),
+against 9.38 for the same body with the guard never planted (`SLAG_TYPER=0`) —
+the deopt was the whole gap, not the guard's own cost. Controls flat: `h6` 5.24,
+`h1` 14.20.
+
+- `CompiledBody::deopt_retries` counts the deopts; the deopt bumps it and clears
+  `jit_info`.
+- The JIT cache entry records the generation it was built at and rebuilds the
+  body on a mismatch (not while a frame is in flight — that code is live on the
+  native stack).
+- `lift` drops the read guard once the body has deopted. Sound by construction:
+  `narrow` runs inside the same lift and never sees an annotation that is not
+  there. (Pruning the guard *after* `narrow` is unsound — that is the ordering
+  `cbcfbb70` protects, and it is what killed the first attempt at this.)
+
+Deopts per row run: 7 -> **1**. The corpus is unchanged, and that is the honest
+result: a full corpus pass records **0 deopts**, so this removes a 5x cliff for
+any program that hits that shape rather than adding corpus speed.
+
+Gates run: `cargo test -p jit -p runtime` (380 / 1151 green), `clippy
+--workspace --all-targets -D warnings` clean, corpus results identical in jit
+and jitless. **Pending:** test262 `language`/`built-ins`/`annexB` sweeps.
