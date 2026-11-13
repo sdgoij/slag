@@ -19493,3 +19493,62 @@ Empty-array `forEach` loop (entry cost only, 100k calls): **8.43 -> 5.75 ms
 (-31.7%)**, min-of-4 interleaved. On top of the callback landing the same
 binary reads `hof_methods` 21.31, `array_for_each` 25.14, `map_for_each` 26.00,
 `typed_array_for_each` 29.47.
+
+## MEASURED (2026-11-13): the optimizing tier is not the lever — `SLAG_OPT=0`
+
+A 25-of-79-row `opt bail` census looked like the unlock: `calls/method_call`,
+`globals/*`, `objects/{own,proto}_read`, `json_roundtrip`, `recursive_fib`,
+`split_join`, `head-let` and `evaluation-order` all refuse the optimizing tier.
+The refusal was traced to two named causes — the LICM hoist guard
+(`HoistMemberGuard`/`HoistGlobalGuard` in a fused-loop test, refused on purpose
+because modelling it "always miss" measured +571%) and `!=`/`!==` missing from
+the lift's `binary_op`.
+
+Filling the second one (`NotEqual`/`StrictNotEqual` lift as
+`Not(StrictEq)` — exact, `Op::Not` on a `Bool` is a bit flip) does remove the
+`Step("Binary")` bail from `head-let`, `evaluation-order` and
+`completion-values`. **It changes nothing measurable:**
+
+| row | before | after | delta |
+|---|---:|---:|---:|
+| `try/completion-values` | 105.78 | 106.16 | +0.4% |
+| `template-literal/evaluation-order` | 208.01 | 208.44 | +0.2% |
+| `for-in/head-let-fresh-binding` | 567.86 | 570.33 | +0.4% |
+
+(min-of-4 interleaved, one row per process.) Reverted, because a change that
+buys nothing is risk without payoff.
+
+The reason is the same reason the hoist guard is not worth modelling: **the
+optimizing tier is worth almost nothing on this corpus.** Same binary, one row
+per process, optimizing tier on versus `SLAG_OPT=0`:
+
+| row | `SLAG_OPT` on | `SLAG_OPT=0` |
+|---|---:|---:|
+| `for-in/head-let-fresh-binding` | 531.84 | 540.61 |
+| `template-literal/evaluation-order` | 207.04 | 230.88 |
+| `opcost/json_stringify` | 107.62 | 110.85 |
+| `calls/method_call` | 56.89 | 55.75 |
+| `objects/proto_read` | 61.40 | 62.21 |
+
+So: **do not chase `opt bail` rows as a performance item.** A body that bails
+runs the per-step tier, and on these shapes the per-step tier is within 0-10% of
+the optimizing tier. The cost that makes a row 5-20x node is in the *operations*
+the steps call (allocation, GC, closure creation, the member/call helpers), not
+in which tier executes them.
+
+### Where a per-op row's time actually goes (worked example: `set_churn`)
+
+`builtins/set_churn` is 600k × (`has` + `add`) = 1.2M Set operations in 56 ms,
+i.e. **47 ns per operation** against node's 3.2 ns. Its profile has no item over
+15%: `Value::kind` 14.9 (cross-crate in `iter`), `SetCollection::slot` 13.8
+(the hash probe), `Vm::get_member_name` 12.0 (reading `.has`/`.add`),
+`set_has_fast` 7.8 (includes the `map_data` id→collection hash lookup),
+`call_slow` 5.6, `handler_for` 5.0 + `builtin_call_lookup` 3.5 (dispatch),
+`same_value` 4.7, `warm_store_put` 4.6, `key_word` 3.9. Every component is 2-6
+ns of a 47 ns operation: the gap is ~8 equally-weighted constants, not one
+cliff. `Map`/`Set` is still the best next target — it is one mechanism shared by
+`{map,set}_churn`, `opcost/{map,set}_*` and `{map,set}_for_each` (~130 ms of
+excess) — but the win has to be taken from all of them at once: the `.get`/`.has`
+member read wants the same treatment the callback lane got, the id→collection
+lookup wants a cell (safe only because `map_data` never drops an entry and the
+roots trace every collection), and the probe wants integer-key specialization.
