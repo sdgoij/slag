@@ -76,6 +76,16 @@ codegen-units = 1
 # dispatch loop is a single 100 KB function — reports as whatever public symbol
 # precedes it. `debug = 1` adds the line table and nothing else, so codegen, and
 # therefore the timings taken from this build, are the release ones.
+# Fast-iteration profile: release codegen without LTO and with parallel
+# codegen units. Builds in roughly a third of the time; use it for `cargo
+# test`, sweeps and A/Bs in which BOTH sides use it. Never for absolute
+# corpus numbers: the layout differs from `release`.
+[profile.iter]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = 0
+
 [profile.prof]
 inherits = "release"
 debug = 1
