@@ -2089,13 +2089,12 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         let ValueKind::Object(src) = object.kind() else {
             unreachable!("dense gate matched an object")
         };
-        while k < final_index {
-            // The range was verified dense-present: every element exists.
-            let value = src.dense_element(k).expect("range verified dense");
-            array.create_data_property_index(n, value)?;
-            k += 1;
-            n += 1;
-        }
+        // One bulk copy instead of a define per index: the range was verified
+        // dense-present, so its elements are the result's elements in order.
+        // (An intermediate `Vec` per call measured +5.7% on a 4-element slice —
+        // it cost more than the four defines it replaced — so the copy happens
+        // inside crux, straight from the source's element vector.)
+        array.array_copy_dense_from(&src, k as usize, final_index as usize)?;
     } else {
         while k < final_index {
             if has_property(&object, &key(k))? {

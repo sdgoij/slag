@@ -19379,3 +19379,30 @@ The corpus figure is called out as noise on purpose: three interleaved pairs
 read -9.8%, a fourth read +0.3%, and the corpus swings +-8% run to run in this
 profile. The two async rows are the honest signal, and they are what the change
 touches (promise_churn never awaits, so only the leak half applies there).
+
+## LANDED (2026-11-12): a dense slice run is copied, not defined per index
+
+Profiling the 4-element `slice` loop (`tools/profile.py`, now exact) put
+`crux::object::dense_index_define` at **11.8%** of samples, with `dense_element`,
+`SmallProps::push` and the per-box heap TLS access behind it: the dense path was
+defining one index at a time.
+
+`JsObject::array_copy_dense_from` replaces the run in one pass (same barriers and
+generation bump as `array_extend_dense`). An intermediate `Vec` per call measured
+**+5.7%** — it cost more than the four defines it replaced — so the copy runs
+inside crux from the source's element vector.
+
+`slice` probe (1M x 4-element slice): **238.9 -> 215.8 ms (-9.6%)**, min-of-5
+interleaved, same profile. crux 283/283, runtime 1151/1151.
+
+**The same per-index define is still in `map`, `filter`, `concat`, `splice`,
+`to_spliced` and `to_sorted`** (`create_data_property_index` at six sites) — the
+next step is a single-element dense-slot writer those result loops can share.
+
+### tools/profile.py now symbolizes exactly
+
+It named a PE unwind range after the *nearest preceding public symbol*, which
+with sparse publics lands in another crate: it reported `ryu::pretty::format64`
+for `crux::object::ArraySlots::refresh`. It now asks `llvm-symbolizer`
+(`--output-style=JSON`, one object per line) and takes the outermost frame, so a
+sample is named after the engine function that contains the instruction.

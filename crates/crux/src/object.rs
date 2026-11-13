@@ -2007,6 +2007,77 @@ impl JsObject {
         Ok(())
     }
 
+    /// Fill this already-sized dense array from another array's dense run
+    /// `[start, end)` in one copy: the bulk form of a result loop that would
+    /// otherwise define one index at a time (`Array.prototype.slice`'s dense
+    /// path — `dense_index_define` was 11.8% of a 4-element `slice` loop). The
+    /// caller has sized `length` to `end - start`, which is what species
+    /// create does, so the run replaces the elements and the length stands.
+    pub fn array_copy_dense_from(
+        &self,
+        src: &Self,
+        start: usize,
+        end: usize,
+    ) -> Result<(), JsError> {
+        let ObjectKind::Array(dst) = &self.kind else {
+            return Err(JsError::new(ErrorKind::TypeError, "not an array".into()));
+        };
+        let ObjectKind::Array(source) = &src.kind else {
+            return Err(JsError::new(ErrorKind::TypeError, "not an array".into()));
+        };
+        if !dst.dense.get() || !source.dense.get() {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "not a dense array".into(),
+            ));
+        }
+        let count = end.saturating_sub(start);
+        if dst.length.get() as usize != count {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "array_copy_dense_from: length does not match the run".into(),
+            ));
+        }
+        // The two element vectors are separate `RefCell`s unless the caller
+        // passed the receiver as its own source; that case copies through a
+        // buffer so the borrows never overlap.
+        if self.id() == src.id() {
+            let run: Vec<Value> = {
+                let elements = source.elements();
+                elements.get(start..end).unwrap_or(&[]).to_vec()
+            };
+            self.array_copy_dense_run(dst, source, &run)?;
+        } else {
+            let elements = source.elements();
+            let run = elements.get(start..end).unwrap_or(&[]);
+            self.array_copy_dense_run(dst, source, run)?;
+        }
+        Ok(())
+    }
+
+    /// The shared tail of [`Self::array_copy_dense_from`]: replace `dst`'s run
+    /// with `run`, record the barriers, and bump.
+    fn array_copy_dense_run(
+        &self,
+        dst: &ArraySlots,
+        _source: &ArraySlots,
+        run: &[Value],
+    ) -> Result<(), JsError> {
+        {
+            let mut elements = dst.elements_mut();
+            elements.clear();
+            elements.extend_from_slice(run);
+        }
+        // A collection between the create and the copy can have aged the slots
+        // box already, so every young element needs its barrier (the same
+        // reason `array_extend_dense` records them).
+        for (offset, value) in run.iter().enumerate() {
+            crate::heap::write_barrier_element(dst, *value, offset as u64);
+        }
+        self.bump_generation();
+        Ok(())
+    }
+
     /// StringCreate (spec 10.4.3.2): a String exotic with the virtual
     /// code-unit index properties and the `length` data property.
     pub fn string_create(

@@ -163,6 +163,56 @@ class Symbols:
         return name
 
 
+def symbolize_llvm(exe, addresses):
+    """address -> function name via `llvm-symbolizer`.
+
+    Preferred over the unwind+publics table: that table can only name a range
+    after the *nearest preceding public symbol*, so a range whose own name is
+    not public inherits whatever came before it in the image. Measured on a
+    slice loop, that reported `ryu::pretty::format64` for `crux::object::
+    ArraySlots::refresh` — a plausible-looking name in the wrong crate, which is
+    worse than no name. `llvm-symbolizer` resolves the address exactly.
+    """
+    tool = shutil.which("llvm-symbolizer")
+    if not tool or not addresses:
+        return {}
+    request = "\n".join(f"0x{address:x}" for address in addresses) + "\n"
+    proc = subprocess.run(
+        [tool, "--obj=" + exe, "--output-style=JSON", "--functions=short"],
+        input=request,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    named = {}
+    # `--output-style=JSON` writes one JSON object per line, not an array.
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            address = int(entry.get("Address", "0"), 16)
+        except ValueError:
+            continue
+        # The frames are innermost-first. Self time belongs to the function
+        # that actually contains the sampled instruction, which is the last
+        # frame — the first is whatever short inlined helper (`core::mem::
+        # replace`) the line was attributed to, and naming the profile after
+        # those hides the engine function doing the work.
+        frames = entry.get("Symbol") or []
+        if not frames:
+            named[address] = "unknown"
+            continue
+        named[address] = frames[-1].get("FunctionName") or "unknown"
+    return named
+
+
 def load_samples(path):
     """offset -> count, plus the total and the outside-image count."""
     offsets = defaultdict(int)
@@ -212,13 +262,22 @@ def main():
     if total == 0:
         print("no samples in " + args.profile, file=sys.stderr)
         return 1
-    symbols = Symbols(build_symbols(args.obj))
+    exact = symbolize_llvm(args.obj, [IMAGE_BASE + offset for offset in offsets])
+    fallback = []
+
+    def name_of(address):
+        name = exact.get(address)
+        if name:
+            return name
+        if not fallback:
+            fallback.append(Symbols(build_symbols(args.obj)))
+        return fallback[0].name(address)
 
     by_function = defaultdict(int)
     if args.group:
         by_function["[jit/native code]"] += outside
     for offset, count in offsets.items():
-        name = symbols.name(IMAGE_BASE + offset)
+        name = name_of(IMAGE_BASE + offset)
         by_function[group_of(name) if args.group else name] += count
 
     print(f"samples {total}  outside-image (JIT) {outside} ({100 * outside / total:.1f}%)")
