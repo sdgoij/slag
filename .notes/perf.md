@@ -19424,3 +19424,31 @@ Still defining per index: `map`, `filter`, `concat`, `splice`, `to_spliced`.
 `map`/`filter` need a hole-aware gate (a skipped hole must leave a hole in the
 result), so they want the dense case as a separate loop rather than a blanket
 copy.
+
+### tools/profile.py: `--functions=short` was silently blanking every name
+
+With `llvm-symbolizer` in place, the tool still reported "unknown" for 91% of a
+`hof_methods` profile. The flag was the cause: on this crate's symbol table
+`--functions=short` returns an **empty** `FunctionName`, and an empty name was
+folded into "unknown". Dropped the flag, and the outermost non-empty frame is
+now chosen. Verified against `llvm-symbolizer` directly (`try_leaf_call_reusing`
+where the tool had printed `unknown`).
+
+### MEASURED (2026-11-12): what `arrays/hof_methods` (26-28 ms) is made of
+
+Same profile, after the fix:
+
+| share | function |
+|---:|---|
+| 27.9% | `runtime::builtins::function::try_leaf_call_reusing` |
+| 13.5% | `runtime::ir::Vm::do_call_fast` — the **interpreter's** call path |
+| 8.7% | `crux::object::set_current_realm` |
+| 6.7% | `runtime::builtins::function::CallbackVm::with` |
+| 5.8% | `runtime::jit::string_prototype_bits` |
+| 5.8% | `runtime::ir::with_leaf_run` |
+| 4.8% | `runtime::Agent::leaf_lookup` |
+
+The per-element callback in the array iterators is not taking a fast lane: it
+falls through to `do_call_fast`, the interpreter funnel, for *every* element.
+That is the builtin-entry item (W5) with a named mechanism, and it is where
+`let`-style callback rows spend two thirds of their time.

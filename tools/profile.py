@@ -178,7 +178,10 @@ def symbolize_llvm(exe, addresses):
         return {}
     request = "\n".join(f"0x{address:x}" for address in addresses) + "\n"
     proc = subprocess.run(
-        [tool, "--obj=" + exe, "--output-style=JSON", "--functions=short"],
+        # NOT `--functions=short`: on this crate's symbol table it yields an
+        # empty FunctionName (the names are already demangled with a hash
+        # suffix), and an empty name silently became "unknown" for every sample.
+        [tool, "--obj=" + exe, "--output-style=JSON"],
         input=request,
         capture_output=True,
         text=True,
@@ -209,7 +212,10 @@ def symbolize_llvm(exe, addresses):
         if not frames:
             named[address] = "unknown"
             continue
-        named[address] = frames[-1].get("FunctionName") or "unknown"
+        named[address] = next(
+            (frame.get("FunctionName") for frame in reversed(frames) if frame.get("FunctionName")),
+            "unknown",
+        )
     return named
 
 
