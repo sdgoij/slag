@@ -314,6 +314,16 @@ pub fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsErr
 
 /// LengthOfArrayLike (spec 7.3.22).
 fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError> {
+    // A genuine dense Array's length cell is authoritative (dense keeps the
+    // `length` property mirrored — see `JsObject::write_length_mirror`), so the
+    // generic [[Get]] — a string build, a prototype-chain walk and a ToNumber —
+    // is not needed. Every array builtin's prologue reads this once.
+    if let Some(length) = value
+        .as_object()
+        .and_then(|array| array.array_length_dense())
+    {
+        return Ok(length);
+    }
     let length = get_property(agent, value, &JsString::from_utf8("length"), *value)?;
     Ok(to_length(crate::context::to_number(agent, &length)?))
 }
