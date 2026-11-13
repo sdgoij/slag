@@ -20191,3 +20191,51 @@ jitless, `--gc-stress`, `--nursery-stress`; `cargo test --workspace`; clippy;
 fmt. New unit test: a fulfilled settle, a handler throw (the reject path), a
 rejected source reaching its handler, and a subclass still honouring its species
 constructor through the observable capability.
+
+## MEASURED (2026-11-13): an async call's `Vm` reserves 512 KB of value stack
+
+Chasing what is left in `async_churn` after the two promise landings turned up a
+resource problem, not an algorithmic one. `Vm::new` starts with an empty value
+stack, and the JIT entry paths (`run_jit_body`, `run_jit_resume`, `run_jit_leaf`)
+end with
+
+    vm.stack.resize(work_len, Value::Undefined);
+    vm.stack.reserve(vm.stack_cap.saturating_sub(vm.stack.len()));
+
+with `stack_cap = MAX_VALUE_STACK = 1 << 16` — **512 KB reserved per fresh Vm's
+first JIT entry**, because a nested certified call carves its region from the
+same `vm.stack` and a reallocation would dangle the outer frame's baked
+pointers. A synchronous call pays it once per *pooled* Vm
+(`Agent::take_vm`/`return_vm`), so it disappears from the steady state. An async
+call does not: `call_async_function` builds `Vm::new(...)` directly and the state
+holds it while the body is suspended, so every pending await keeps its own
+512 KB reservation alive.
+
+Evidence, `release`, per row, `--jitless` versus jit (the interpreter path never
+reserves):
+
+| probe | jit | jitless | jit premium |
+|---|---:|---:|---:|
+| `async function f(i){ return i }` ×100k | 227 ms | 178 ms | **+490 ns/call** |
+| the same with `await i`, 1000 pending | 21.2 | 15.1 | **+6.1 µs/call** |
+| `Promise.resolve(i)` ×100k (no `Vm`) | 17.7 | 18.1 | none |
+
+The premium grows with the number of *suspended* bodies, which is what makes it
+µs-scale: 2000 concurrent pending awaits hold 1 GB of reserved address space.
+
+Two candidate fixes, neither a slice:
+
+1. **Pool it** — `call_async_function` takes `agent.take_vm(...)` and
+   `settle_async_completion` returns it, so a *sequential* async loop reuses one
+   warm 512 KB stack instead of allocating and freeing one per call (a1 would go
+   from 227 ms toward 150). It does nothing for concurrently suspended bodies,
+   because the Vm cannot be returned until the body completes.
+2. **Reserve less for a suspended body** — the reservation is sized to the cap
+   so a nested carve can never reallocate; a suspended async body would need its
+   own rule (reserve `max_stack + headroom`, and make a nested carve that would
+   exceed it fall back to a fresh Vm). That is the one that helps
+   `async_churn` (2000 pending), and it touches the baked-pointer contract in
+   `run_jit_body`/`run_jit_resume`, so it needs the JIT-stack design note.
+
+`async_churn`'s remaining 46 ms is about half this reservation and half the
+per-operation allocation count the two promise landings already thinned.
