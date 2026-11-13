@@ -2090,7 +2090,12 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     let dense = match object.kind() {
         ValueKind::Object(src) => {
             src.array_length_dense().is_some()
-                && array.array_length_dense().is_some()
+                // The bulk copy replaces the result's whole run, so the result
+                // must already be exactly the copied length: a species
+                // constructor may hand back a pre-existing array of any length
+                // (`slice/create-species.js`), and that case needs the
+                // per-index defines to grow it.
+                && array.array_length_dense() == Some(final_index - k)
                 && (k..final_index).all(|i| src.dense_element(i).is_some())
         }
         _ => false,
