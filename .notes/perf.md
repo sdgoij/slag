@@ -20051,3 +20051,56 @@ with node under `bench.js`, 0 mismatches over 81 rows); test262 `language`
 clippy; fmt. One new unit test pins the shape-shared `Object.keys` list
 (inherited/non-enumerable/symbol exclusion, a delete and an add between
 objects, and a function's non-enumerable own keys).
+
+## MEASURED (2026-11-13): the promise/async path is µs-scale and goes quadratic
+
+`builtins/async_churn` is 51 ms against node's 0.3 (83x) and is the largest
+*ratio* left in the corpus, so the path was taken apart (per call, one row per
+process, `release`, node v24 in the same round):
+
+| probe (100k calls unless noted) | slag | node | ratio |
+|---|---:|---:|---:|
+| `async function f(i){ return i }` called | 2276 ns | 48 | 47x |
+| `async function f(i){ await i }` called | **354 µs** | 241 | 1472x |
+| `Promise.resolve(i)` | 675 ns | 99 | 6.8x |
+| `new Promise(r => r(i))` | 1531 ns | 106 | 14x |
+| `Promise.resolve(i).then(fn)` | 2400 ns | ~100 | 24x |
+| a plain JS call (control) | 4.8 ns | 43 | (faster) |
+
+**It is quadratic in the number of pending awaits/jobs.** One `bench()` call
+queuing N `await`s (the harness never drains between timed calls, so the queue
+and the async-state table only grow):
+
+| N | per call |
+|---:|---:|
+| 500 | 24.6 µs |
+| 1000 | 21.3 µs |
+| 2000 | 28.3 µs |
+| 4000 | 40.8 µs |
+| 8000 | 73.9 µs |
+
+Doubling N multiplies the total by 1.7x → 2.6x → 2.9x → 3.6x. The same curve
+appears with plain `.then` (no async frames): 1000 → 2.4 µs/call, 8000 → 7.9 µs,
+so the growth is in the *queued job* path, not in `AsyncFunctionState`.
+
+A `--gc-trace` census of the 8000 case rules GC out as the whole story: 8 minors
+(0.8 ms avg) + 2 majors (5.7 ms avg) ≈ 18 ms of the 64 ms, i.e. **~28%**. The
+other ~46 ms is per-operation work that itself grows with the live set — the
+queued jobs keep every promise, reaction and capability reachable (the live
+column walks 16k → 113k objects), so the remainder is allocation-path work on a
+heap that no longer fits a cache.
+
+The per-operation allocation count is the thing to cut: one capability is a
+promise object + **two `Function::create_builtin` closures** (each two arena
+boxes plus its `length`/`name` defines) + a `function::call` into the resolve
+closure, and `Promise.resolve` then settles it. For the *internal* callers of
+`new_promise_capability` (the stock `%Promise%` path: `Promise.resolve`/`reject`/
+`then`, the async return, `attach_await`) the executor is never user code, so the
+resolving closures cannot be observed — the settle can be direct. That is W6(b)
+in `.notes/plan-2x.md` and it is a promise-machinery refactor, not a slice.
+
+Also landed while measuring: nothing — this section is a diagnosis. `head-let`'s
+per-iteration environment (~68 ns, dominated by the arena box) was measured too
+and is *not* worth optimizing: the compiler already omits the per-iteration steps
+when nothing captures the head binding, and every iteration that does capture
+needs a distinct environment.
