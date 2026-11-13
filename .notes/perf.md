@@ -20321,3 +20321,51 @@ Both were reverted. The cliff is real but the fix is not the threshold: the
 form that keeps its units in the box (a tail after the enum, like
 `EnvRecord`'s slots) rather than an `Arc<[u16]>` behind it. That is a `JsString`
 representation change, not a constant.
+
+## LANDED (2026-11-13): `JSON.stringify` stops rebuilding an empty indent, and reuses the shape-keyed key list
+
+Two leftovers in the serializer, both per container:
+
+- `state.indent = format!("{}{}", state.indent, state.gap)` ran for every object
+  and every array. With the default (no `space` argument) `gap` is empty, so the
+  indent never grows — the `format!` was one Rust `String` allocation per
+  container for nothing. It is now guarded on `gap.is_empty()`.
+- `JSON.stringify`'s own `enumerable_string_keys` walked `own_property_keys`
+  (a structural consumer: it materializes a vector-free object and rebuilds an
+  ordered key list) while `Object.values`/`entries` already read the
+  shape-keyed list. It uses `ir::own_keys_cached` now, so a repeated stringify of
+  the same shape reuses the list and the source stays vector-free.
+
+| row | before | after |
+|---|---:|---:|
+| `opcost/json_stringify` | 64.5 ms | **53.3 (-17.3%)** |
+| `builtins/json_roundtrip` | 43.7 | 37.3 (**-14.7%**) |
+| `opcost/map_get` (control) | 2.829 | 2.835 (+0.2%) |
+| corpus total | 1985 | 1989 (+0.2%, inside noise) |
+
+Gates: `built-ins --filter "JSON*"` 165/165; `language` 23726, `built-ins`
+23821, `annexB` 1086 — 0 fail both modes; corpus results identical in jit,
+jitless, `--gc-stress`, `--nursery-stress`; a gapped spot check renders the same
+text as before; `cargo test --workspace`; clippy; fmt.
+
+## MEASURED AND REJECTED (2026-11-13): the certified call lane's `ecma_functions` lookup is not the cost
+
+`certified_lane_inline` re-reads the callee's `ecma_functions` record on every
+call (the compiled body, the environment, strictness, the realm) — a HashMap
+lookup plus an `Rc<CompiledBody>` clone per certified call. A direct-mapped
+per-id cache (the `same_stack_cache`/`leaf_cache` pattern, traced the same way)
+was built and measured:
+
+| probe / row | before | after |
+|---|---:|---:|
+| `method_call` | 52.37 | 52.17 (-0.4%) |
+| `recursive_fib` | 47.53 | 47.06 (-1.0%) |
+| `closure_capture` | 24.37 | 24.47 (+0.4%) |
+| `js_call` | 0.658 | 0.663 (+0.6%) |
+| a 5M-call non-leaf probe | 5.52 ns/call | 5.55 ns/call |
+
+Reverted: the id-keyed `IdMap` is already an identity-hash lookup, so the whole
+thing is a few nanoseconds — the lane's ~18-25 ns is the frame carve, the
+`install_nested_frame`/`restore_scratch` pair and the helper round trip, not the
+record fetch. Do not re-attempt this cache without a probe that can resolve
+2 ns/call.

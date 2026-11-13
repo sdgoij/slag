@@ -690,14 +690,14 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
     let mut out = Vec::new();
-    for key in obj.own_property_keys()? {
+    for key in crate::ir::own_keys_cached(agent, &obj)?.iter() {
         let PropertyKey::String(id) = key else {
             continue;
         };
-        if let Some(prop) = obj.get_own_property_key(&PropertyKey::String(id))?
+        if let Some(prop) = obj.get_own_property_key(key)?
             && prop.enumerable
         {
-            out.push(crux::lookup(id));
+            out.push(crux::lookup(*id));
         }
     }
     Ok(out)
@@ -1014,7 +1014,11 @@ fn serialize_json_object_inner(
     }
     state.stack.push(*value);
     let stepback = state.indent.clone();
-    state.indent = format!("{}{}", state.indent, state.gap);
+    // The default has no gap, so the indent never grows: rebuilding it with a
+    // `format!` per container was one allocation per object in the common case.
+    if !state.gap.is_empty() {
+        state.indent = format!("{}{}", state.indent, state.gap);
+    }
     let keys = match &state.property_list {
         Some(list) => list.clone(),
         None => enumerable_string_keys(agent, value)?,
@@ -1112,7 +1116,9 @@ fn serialize_json_array_inner(
     }
     state.stack.push(*value);
     let stepback = state.indent.clone();
-    state.indent = format!("{}{}", state.indent, state.gap);
+    if !state.gap.is_empty() {
+        state.indent = format!("{}{}", state.indent, state.gap);
+    }
     let length = length_of_array_like(agent, value)?;
     if length == 0 {
         // spec 26.6.3.5 step 4: an empty array serializes to "[]" even with
