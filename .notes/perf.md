@@ -19362,3 +19362,20 @@ pair being reused makes two removals cover the call.
 Verified: `cargo check`, `cargo test -p runtime --lib` 1151/1151.
 **Not measured** — no release build was run, so the effect on `ac500` and the
 corpus is unproven and must be measured before it is claimed.
+
+### MEASURED (2026-11-13): the resume-handler landing
+
+`iter` profile, both sides built from it, interleaved min-of-5 (absolute ms are
+not comparable to `release`; the deltas are):
+
+| probe | parent | new | delta |
+|---|---:|---:|---:|
+| `scratch/row/ac500` (await in a loop) | 11.83 | 10.39 | **-12.2%** |
+| `builtins/async_churn` | 58.92 | 52.52 | **-10.9%** |
+| `builtins/promise_churn` | 11.51 | 11.27 | -2.0% |
+| corpus total | 2815 | 2538 | flat within +-8% noise |
+
+The corpus figure is called out as noise on purpose: three interleaved pairs
+read -9.8%, a fourth read +0.3%, and the corpus swings +-8% run to run in this
+profile. The two async rows are the honest signal, and they are what the change
+touches (promise_churn never awaits, so only the leak half applies there).
