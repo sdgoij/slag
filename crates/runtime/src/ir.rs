@@ -2192,6 +2192,11 @@ pub struct CompiledBody {
     /// three full step scans per call — hundreds of nanoseconds per recursive
     /// call on a hot body.
     pub same_stack_gate: std::cell::Cell<Option<bool>>,
+    /// Cached `certified_callee_eligible` verdict. The certified lane asks on
+    /// every call it dispatches, and the gate is four step scans over a pure
+    /// function of the step list — 20% of a non-leaf call's cost measured
+    /// (`scratch/iso/c4`, 2026-11-13).
+    pub certified_gate: std::cell::Cell<Option<bool>>,
     /// Stage O: the per-site feedback store (`.notes/optimizing-tier-plan.md`),
     /// keyed by step index. Allocated lazily and only when the probe
     /// (`SLAG_FEEDBACK`) is enabled, so a default build allocates nothing.
@@ -2246,6 +2251,15 @@ impl CompiledBody {
     /// `this` read in a certified body is a frame-slot load, not `ThisValue`,
     /// so it stays eligible).
     pub(crate) fn certified_callee_eligible(&self) -> bool {
+        if let Some(verdict) = self.certified_gate.get() {
+            return verdict;
+        }
+        let verdict = self.compute_certified_callee_eligible();
+        self.certified_gate.set(Some(verdict));
+        verdict
+    }
+
+    fn compute_certified_callee_eligible(&self) -> bool {
         let Some(scope) = self.scope.as_ref() else {
             return false;
         };
@@ -27376,6 +27390,7 @@ pub fn compile_body(
             max_stack,
             nested_gate: std::cell::Cell::new(None),
             same_stack_gate: std::cell::Cell::new(None),
+            certified_gate: std::cell::Cell::new(None),
             feedback: std::cell::RefCell::new(None),
         },
         compiler.this_writes,
@@ -27472,6 +27487,7 @@ pub fn compile_statements(
         max_stack,
         nested_gate: std::cell::Cell::new(None),
         same_stack_gate: std::cell::Cell::new(None),
+        certified_gate: std::cell::Cell::new(None),
         feedback: std::cell::RefCell::new(None),
     })
 }
@@ -27529,6 +27545,7 @@ pub(crate) fn compile_eval_in_frame(
         max_stack,
         nested_gate: std::cell::Cell::new(None),
         same_stack_gate: std::cell::Cell::new(None),
+        certified_gate: std::cell::Cell::new(None),
         feedback: std::cell::RefCell::new(None),
     })
 }

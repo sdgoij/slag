@@ -19552,3 +19552,36 @@ excess) — but the win has to be taken from all of them at once: the `.get`/`.h
 member read wants the same treatment the callback lane got, the id→collection
 lookup wants a cell (safe only because `map_data` never drops an entry and the
 roots trace every collection), and the probe wants integer-key specialization.
+
+## LANDED (2026-11-13): the certified lane's gate is memoized like its siblings
+
+`CompiledBody::certified_callee_eligible` walked the step list up to four times
+on **every** call the certified lane dispatches (`has_certified_lane_step_hazard`,
+a mapped-`arguments` scan, a super scan) — a pure function of the immutable step
+stream. `nested_gate` and `same_stack_gate` were already cached for exactly this
+reason; this one was not. It is now `certified_gate: Cell<Option<bool>>`.
+
+Measured (min-of-4 interleaved, `iter` profile, one row per process): the
+non-leaf call probe (`function f(x) { if (x === 999999) throw new Error("x"); return x + 1 }`,
+36 ns/call → 33) **-1.6%**, `calls/recursive_fib` **-2.7%**, `head-let` and
+`construct_churn` flat. Below the bar on its own; kept because the scan is
+strictly redundant work whose cost scales with the callee's step count (these
+probes' bodies are 5-10 steps) and because the file already memoizes both
+neighbouring gates.
+
+### A non-leaf call costs 8x a leaf call — measured, and where it goes
+
+Same binary, one row per process, 200k calls:
+
+| callee shape | per call |
+|---|---:|
+| leaf (`return x + 1`) | **6.4 ns** |
+| not leaf (`if (x === 999999) throw new Error("x")`) | **51.7 ns** |
+| `assert.sameValue`-shaped (a call inside, a throw branch) | **33 ns** |
+
+Every amplified test262 fixture's `assert` preamble is the third shape, and one
+`assert.sameValue` costs two such calls. The certified lane's profile is
+`certified_lane_inline` 30.7%, `certified_callee_eligible` 13.3%,
+`has_lane_step_hazard` 7.2%, `string_prototype_bits` 5.4%, `call_slow` 4.2%,
+`Vec::resize` 3.0% — so after the gate cache the remaining ~45 ns of overhead is
+the lane's own frame carve plus two per-call realm reads, not one cliff.

@@ -2801,6 +2801,7 @@ mod tests {
             max_stack,
             nested_gate: std::cell::Cell::new(None),
             same_stack_gate: std::cell::Cell::new(None),
+            certified_gate: std::cell::Cell::new(None),
             feedback: std::cell::RefCell::new(None),
         }
     }
