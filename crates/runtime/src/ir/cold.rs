@@ -1395,22 +1395,7 @@ impl Vm {
                     let obj = crate::context::as_object(&obj).ok_or_else(|| {
                         JsError::new(ErrorKind::TypeError, "for-in over a non-object".into())
                     })?;
-                    // A generation-tracked base re-enters the same
-                    // unchanged chain cheaply: the cached enumeration is
-                    // reused when the live chain still matches its
-                    // (id, generation) snapshot.
-                    let keys = if for_in_generation_tracked(&obj) {
-                        match for_in_cache_keys(agent, &obj)? {
-                            Some(keys) => keys,
-                            None => {
-                                let keys = crate::eval::for_in_key_levels(agent, &rhs)?;
-                                for_in_cache_put(agent, &obj, &keys)?;
-                                std::rc::Rc::new(keys)
-                            }
-                        }
-                    } else {
-                        std::rc::Rc::new(crate::eval::for_in_key_levels(agent, &rhs)?)
-                    };
+                    let keys = for_in_keys(agent, &obj, &rhs)?;
                     let fast = for_in_generation_tracked(&obj)
                         && keys.iter().all(|(level, _)| *level == 0);
                     self.for_in_stack.push(ForInState {

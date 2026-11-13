@@ -913,6 +913,12 @@ pub(crate) struct AgentRoots {
     /// 27 lesson.
     pub(crate) for_in_cells:
         RefCell<Box<[Option<crate::ir::ForInEnumCache>; crate::ir::FOR_IN_CELLS]>>,
+    /// The same (level, key) lists keyed by the base's SHAPE (live map id)
+    /// instead of its identity — see [`crate::ir::ForInShapeCache`]. A fresh
+    /// object in a loop shares the shape of the last one, so this is what
+    /// makes a per-iteration `for (k in {...})` re-enumerating free.
+    pub(crate) for_in_shape_cells:
+        RefCell<Box<[Option<crate::ir::ForInShapeCache>; crate::ir::FOR_IN_CELLS]>>,
     /// The eight `typeof` result strings, boxed once per agent (see
     /// `crux::value::type_of_kind`). `typeof x === "…"` is everywhere, and
     /// every evaluation of the step used to box the same five-to-nine
@@ -1421,6 +1427,7 @@ impl AgentRoots {
             species_fast_cells: std::array::from_fn(|_| Cell::new(None)),
             spread_cells: std::array::from_fn(|_| Cell::new(None)),
             for_in_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            for_in_shape_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             type_strings: RefCell::new(std::array::from_fn(|_| None)),
             empty_string: std::cell::Cell::new(None),
             atom_string_cells: Box::new(std::array::from_fn(|_| std::cell::Cell::new(None))),
@@ -1630,6 +1637,9 @@ impl Trace for AgentRoots {
             }
         }
         for cell in self.for_in_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
+        for cell in self.for_in_shape_cells.borrow().iter().flatten() {
             cell.trace(visit);
         }
         for value in self.type_strings.borrow().iter().flatten() {
@@ -4447,6 +4457,9 @@ impl Agent {
             cell.set(None);
         }
         for cell in self.roots.for_in_cells.borrow_mut().iter_mut() {
+            *cell = None;
+        }
+        for cell in self.roots.for_in_shape_cells.borrow_mut().iter_mut() {
             *cell = None;
         }
     }

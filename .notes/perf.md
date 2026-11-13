@@ -19818,3 +19818,76 @@ where the box is made. Carrying the atom in the step (or a pre-boxed `Value`,
 boxed once at compile time) would remove it; the computed-key case
 (`fns[x] = function(){}`, which is what `head-let` does) derives its name from a
 runtime key string and needs the key's own box reused instead.
+
+## LANDED (2026-11-13): a for-in enumerates a SHAPE, not an object
+
+The ForInBegin cache was keyed on the base's **identity**, so it could only
+ever hit for the same object reached again — and the common shape in real code
+is a *fresh* object per iteration (`for (k in {...})`, a per-body
+`Object.create(null)` map, `head-let`). Every one of those re-walked the whole
+prototype chain, boxed every key, allocated a `Vec` + an `Rc`, and (through
+`own_string_props`) **materialized the object's property vector**, undoing the
+vector-free create for every object that was ever enumerated.
+
+Attribution (per 100k iterations, `release`, one row per process, fresh
+`{a:1,b:2,c:3}` per iteration): a bare for-in over a fresh 3-key object cost
+**1415 ns** against **42 ns** when the same object was hoisted (cache hit). The
+split was ~680 ns for Object.prototype's twelve *non-enumerable* keys (walked,
+cloned, deduped and dropped every time), ~200 ns/key for the own keys, and the
+rest in the vector/Rc/key-box allocations. `Object.keys` on a fresh object paid
+a similar ~1 µs, and an empty `{}` paid 683 ns — the chain walk alone.
+
+The cache is now keyed on the base's **live map id** plus a snapshot of its
+*prototype* chain (`ForInShapeCache`, `agent.roots.for_in_shape_cells`, 64
+direct-mapped slots). A live map's descriptors are exactly the object's own
+string data properties — same keys, same order, same attributes, because
+`sync_map_after_define` drops the map to dictionary mode on any attribute drift
+and `drop_map_if_mapped` drops it on a delete — and a map id is never reused, so
+two objects on one map enumerate identically. Three gates keep it honest:
+
+- **`properties.len() == map.descriptor_count()`** (or the object is still
+  vector-free): a property the map does not describe (past `INLINE_FIELDS`, or a
+  non-default-attribute define) leaves the vector longer than the map and the
+  object takes the exact path.
+- **The live prototype chain is compared on every probe** (id + generation per
+  link, ending at the same link count), so a prototype change, or any structural
+  change above the base, misses.
+- **Only generation-tracked links are cached**: `for_in_cache_put`'s old rule
+  applies to the chain minus the base.
+
+Nothing is retained but the key `Value`s (traced); ids are process-global and
+never reused, so a chain snapshot cannot be matched by a different object. The
+identity-keyed table stays for the kinds a map does not describe (arrays,
+externals, dictionary-mode objects). The enumeration itself moved to one
+`ir::for_in_keys`, shared by the interpreter step and the JIT's `for_in_begin`
+helper — the two had already drifted into duplicate copies of the same logic.
+
+| probe (100k iterations) | before | after | delta |
+|---|---:|---:|---:|
+| fresh `{}`, for-in | 64.4 | 6.5 | **-89.9%** |
+| fresh 3-key literal, for-in | 134.5 | 10.0 | **-92.6%** |
+| fresh `Object.create(null)` + 3 stores | 93.1 | 26.4 | -71.7% |
+| fresh 10-key literal, for-in | 264.5 | 56.5 | -78.6% |
+
+| row | before | after | delta |
+|---|---:|---:|---:|
+| `for-in/head-let-fresh-binding` | 444.2 | 385.2 | **-13.3%** |
+| `evaluation-order` | 197.1 | 199.0 | +1.0% |
+| `opcost/map_get` (control) | 2.888 | 2.999 | +3.9% |
+
+(Per-row isolated, **same-binary** `SLAG_FORIN_SHAPE` gate A/B, interleaved
+min-of-5.) On the whole corpus the same-binary gate A/B reads **-4.0% and -4.6%**
+in two runs (2314 → 2208 ms), while the freshly rebuilt binary against the
+session's parent binary reads **2508 → 2179 ms (-13.1%)** — the difference is
+native-layout luck plus, plausibly, the GC pressure a whole-corpus process
+shares across rows: the shape cache removes a key-`Vec`, an `Rc`, one boxed
+`JsString` per key and a property-vector materialization per enumeration, and a
+fresh-object for-in is common enough in the corpus that the allocation census
+moves. Take -4.3% as the causal figure.
+
+Gates: corpus results identical 79/79 in jit, jitless, `--gc-stress` and
+`--nursery-stress`; test262 `language` 23726, `built-ins` 23821, `annexB` 1086
+— 0 fail in both modes (15 s deadline); `cargo test --workspace` (52 binaries,
+1157 runtime tests); clippy `-D warnings`; fmt. Five new unit tests cover the
+sharing: fresh-object iteration, prototype + enumerability + shadowing,
+delete, a prototype change, and a vector-only property.

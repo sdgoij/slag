@@ -3050,6 +3050,144 @@ impl Trace for ForInEnumCache {
     }
 }
 
+/// The for-in enumeration of a SHAPE rather than an object: the (level, key)
+/// list of any ordinary object whose live map is `map_id` and whose prototype
+/// chain still matches `chain`.
+///
+/// A live map's descriptors are exactly the object's own string data
+/// properties — same keys, same order, same attributes (`sync_map_after_define`
+/// drops the map on any drift) — and a map id is never reused, so two objects
+/// on one map enumerate identically. Without this table a freshly created
+/// object (the common case inside a loop) had no cache entry at all: the
+/// identity-keyed table could never hit, and every enumeration re-walked the
+/// chain and re-boxed every key.
+///
+/// `chain` is the base's PROTOTYPE chain, not the base: that is what makes a
+/// different object on the same map a hit. It holds (id, generation) per link
+/// and is verified against the live chain on every probe, so a prototype or
+/// own-property change anywhere above the base still misses.
+pub struct ForInShapeCache {
+    map_id: u64,
+    chain: std::rc::Rc<Vec<(u64, u32)>>,
+    keys: ForInKeys,
+}
+
+impl Trace for ForInShapeCache {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for (_, key) in self.keys.iter() {
+            key.trace(visit);
+        }
+    }
+}
+
+/// The map id under which `obj`'s own string keys are fully described by its
+/// live map, so an enumeration can be cached per shape.
+///
+/// `properties.len() == descriptor_count()` is the "no vector-only extras"
+/// gate: a property the map does not describe (past `INLINE_FIELDS`, or a
+/// define whose attributes could not transition) leaves the vector longer
+/// than the map, and such an object must take the exact path.
+fn for_in_shape_map(obj: &Handle<crux::object::JsObject>) -> Option<u64> {
+    if !matches!(obj.kind, crux::object::ObjectKind::Ordinary) {
+        return None;
+    }
+    let map = obj.map.get()?;
+    if !obj.props_deferred.get() && obj.properties.borrow().len() != map.descriptor_count() {
+        return None;
+    }
+    Some(map.id())
+}
+
+/// `obj`'s enumeration when the shape cache holds one for its map and the live
+/// prototype chain still matches the snapshot.
+pub(crate) fn for_in_shape_keys(
+    agent: &Agent,
+    obj: &Handle<crux::object::JsObject>,
+    map_id: u64,
+) -> Result<Option<ForInKeys>, JsError> {
+    let slot = map_id as usize & (FOR_IN_CELLS - 1);
+    let (entry_map, chain, keys) = {
+        let cells = agent.roots.for_in_shape_cells.borrow();
+        match cells[slot].as_ref() {
+            Some(entry) => (entry.map_id, entry.chain.clone(), entry.keys.clone()),
+            None => return Ok(None),
+        }
+    };
+    if entry_map != map_id {
+        return Ok(None);
+    }
+    let mut current = obj.get_prototype_of()?;
+    for &(id, generation) in chain.iter() {
+        let Some(link) = current else {
+            return Ok(None); // the chain shortened
+        };
+        if link.id() != id || link.generation.get() != generation {
+            return Ok(None); // a link changed
+        }
+        current = link.get_prototype_of()?;
+    }
+    if current.is_some() {
+        return Ok(None); // the chain grew past the snapshot
+    }
+    Ok(Some(keys))
+}
+
+/// The enumeration `ForInBegin` installs, shared by the interpreter step and
+/// the JIT's helper: the shape cache first (a fresh object on a known shape),
+/// then the identity cache, else a fresh walk.
+pub(crate) fn for_in_keys(
+    agent: &mut Agent,
+    obj: &Handle<crux::object::JsObject>,
+    rhs: &Value,
+) -> Result<ForInKeys, JsError> {
+    if let Some(map_id) = for_in_shape_map(obj) {
+        if let Some(keys) = for_in_shape_keys(agent, obj, map_id)? {
+            return Ok(keys);
+        }
+        let keys = crate::eval::for_in_key_levels(agent, rhs)?;
+        for_in_shape_cache_put(agent, obj, map_id, &keys)?;
+        return Ok(std::rc::Rc::new(keys));
+    }
+    if for_in_generation_tracked(obj) {
+        if let Some(keys) = for_in_cache_keys(agent, obj)? {
+            return Ok(keys);
+        }
+        let keys = crate::eval::for_in_key_levels(agent, rhs)?;
+        for_in_cache_put(agent, obj, &keys)?;
+        return Ok(std::rc::Rc::new(keys));
+    }
+    Ok(std::rc::Rc::new(crate::eval::for_in_key_levels(
+        agent, rhs,
+    )?))
+}
+
+/// Cache `keys` as the enumeration of every object on `map_id`'s shape.
+pub(crate) fn for_in_shape_cache_put(
+    agent: &mut Agent,
+    obj: &Handle<crux::object::JsObject>,
+    map_id: u64,
+    keys: &[(usize, Value)],
+) -> Result<(), JsError> {
+    let mut chain = Vec::new();
+    let mut current = obj.get_prototype_of()?;
+    while let Some(link) = current {
+        if !for_in_generation_tracked(&link) {
+            return Ok(());
+        }
+        chain.push((link.id(), link.generation.get()));
+        current = link.get_prototype_of()?;
+    }
+    let slot = map_id as usize & (FOR_IN_CELLS - 1);
+    let chain = std::rc::Rc::new(chain);
+    let keys = std::rc::Rc::new(keys.to_vec());
+    agent.roots.for_in_shape_cells.borrow_mut()[slot] = Some(ForInShapeCache {
+        map_id,
+        chain,
+        keys,
+    });
+    Ok(())
+}
+
 /// The (id, generation) of every object in `obj`'s prototype chain, when
 /// every link is generation-tracked (`None` otherwise — such a chain must
 /// not be cached).
@@ -33046,5 +33184,154 @@ mod tests {
             int_rmw_shape(&ops, RegInt::Unknown),
             Some((_, _, _, IntRhs::CounterChecked, _))
         ));
+    }
+
+    /// A for-in over a FRESHLY created object every iteration goes through the
+    /// shape-keyed enumeration cache (same map, different object): the list it
+    /// serves must still be that object's own keys, in order, every time.
+    #[test]
+    fn for_in_over_a_fresh_object_each_iteration_yields_its_keys() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent
+            .run_script(
+                "(function () {
+                     var out = '';
+                     for (var i = 0; i < 3; i++) {
+                         var o = { a: 1, b: 2, c: 3 };
+                         for (var k in o) { out += k; }
+                         out += '|';
+                     }
+                     return out;
+                 })()",
+            )
+            .expect("the fresh-object for-in script");
+        let text = result
+            .as_string()
+            .map(|string| string.to_string_lossy())
+            .unwrap_or_default();
+        assert_eq!(text, "abc|abc|abc|");
+    }
+
+    /// The shape cache serves a whole (level, key) list, so everything that
+    /// shapes it has to survive the sharing: an own non-enumerable key is not
+    /// yielded, a prototype's enumerable key is, and an own key shadows the
+    /// prototype's (the dedup order).
+    #[test]
+    fn a_shape_cached_enumeration_keeps_prototype_and_enumerable_rules() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent
+            .run_script(
+                "(function () {
+                     var out = '';
+                     var proto = { p: 1, shared: 2 };
+                     for (var i = 0; i < 2; i++) {
+                         var o = Object.create(proto);
+                         o.a = 1;
+                         o.shared = 3;
+                         Object.defineProperty(o, 'hidden', {
+                             value: 4, enumerable: false, writable: true, configurable: true,
+                         });
+                         for (var k in o) { out += k + '=' + o[k] + ','; }
+                         out += '|';
+                     }
+                     return out;
+                 })()",
+            )
+            .expect("the prototype for-in script");
+        let text = result
+            .as_string()
+            .map(|string| string.to_string_lossy())
+            .unwrap_or_default();
+        assert_eq!(text, "a=1,shared=3,p=1,|a=1,shared=3,p=1,|");
+    }
+
+    /// A key deleted after one enumeration is gone from the next one even
+    /// though the shape (and so the cached list) has to change.
+    #[test]
+    fn a_deleted_key_leaves_a_shape_cached_enumeration() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent
+            .run_script(
+                "(function () {
+                     var out = '';
+                     for (var i = 0; i < 3; i++) {
+                         var o = { a: 1, b: 2 };
+                         delete o.b;
+                         for (var k in o) { out += k; }
+                         out += '|';
+                     }
+                     return out;
+                 })()",
+            )
+            .expect("the delete for-in script");
+        let text = result
+            .as_string()
+            .map(|string| string.to_string_lossy())
+            .unwrap_or_default();
+        assert_eq!(text, "a|a|a|");
+    }
+
+    /// Same map, different prototype: the chain snapshot is what makes a
+    /// shape-cached list valid, so changing the prototype of a fresh object
+    /// must change the enumeration.
+    #[test]
+    fn a_changed_prototype_misses_the_shape_cache() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent
+            .run_script(
+                "(function () {
+                     var out = '';
+                     var first = { x: 1 };
+                     var second = { y: 2 };
+                     for (var i = 0; i < 2; i++) {
+                         var o = {};
+                         Object.setPrototypeOf(o, i === 0 ? first : second);
+                         for (var k in o) { out += k; }
+                         out += '|';
+                     }
+                     return out;
+                 })()",
+            )
+            .expect("the prototype-change for-in script");
+        let text = result
+            .as_string()
+            .map(|string| string.to_string_lossy())
+            .unwrap_or_default();
+        assert_eq!(text, "x|y|");
+    }
+
+    /// A property the live map does not describe (a non-default attribute
+    /// define) keeps the object off the shape cache — the exact path has to
+    /// enumerate it anyway, and in insertion order.
+    #[test]
+    fn a_vector_only_property_still_enumerates() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let result = agent
+            .run_script(
+                "(function () {
+                     var out = '';
+                     for (var i = 0; i < 2; i++) {
+                         var o = {};
+                         Object.defineProperty(o, 'a', {
+                             value: 1, enumerable: true, writable: false, configurable: false,
+                         });
+                         o.b = 2;
+                         for (var k in o) { out += k; }
+                         out += '|';
+                     }
+                     return out;
+                 })()",
+            )
+            .expect("the vector-only for-in script");
+        let text = result
+            .as_string()
+            .map(|string| string.to_string_lossy())
+            .unwrap_or_default();
+        assert_eq!(text, "ab|ab|");
     }
 }
