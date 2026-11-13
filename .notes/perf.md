@@ -19746,3 +19746,21 @@ ungapped forms.
 Gates: `built-ins/JSON` 165/165 in jit and jitless, corpus results identical
 79/79 in jit, jitless, `--gc-stress` and `--nursery-stress`, runtime 1152 (the
 new test included), clippy + fmt clean.
+
+## MEASURED (2026-11-13, `release`): the `typeof`/JSON pair on the corpus
+
+Both binaries built with `[profile.release]`, per-row isolated, min-of-2, one row
+per process, 79 rows summed (the machine was loaded — node itself read 1039 ms
+here against 796 ms earlier — so the absolute figures are inflated; the delta is
+load-symmetric):
+
+| row | before | after | delta |
+|---|---:|---:|---:|
+| **corpus total** | **2782** | **2677** | **-3.75%** |
+| `opcost/json_stringify` | 121.4 | 86.6 | **-28.7%** |
+| `builtins/json_roundtrip` | 76.1 | 59.3 | -22.0% |
+| `builtins/object_keys` | 81.3 | 64.1 | -21.2% |
+| `opcost/array_fill` | 6.3 | 5.8 | -8.7% |
+
+(The last three commits are the `typeof` cache, the root-wrapper skip and the
+one-buffer serializer, in that order.)
