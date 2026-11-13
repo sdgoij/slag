@@ -1889,6 +1889,46 @@ mod tests {
         );
     }
 
+    /// `Promise.resolve` on the stock constructor settles the promise directly
+    /// (its capability's resolving functions cannot be observed), so the paths
+    /// that stay observable have to keep working: a same-constructor promise is
+    /// returned as-is, a thenable is adopted through a job, a self-resolution
+    /// rejects with a TypeError, and a subclass still gets its own capability.
+    #[test]
+    fn stock_promise_resolve_settles_directly() {
+        assert_eq!(
+            settle(
+                "var p = new Promise(function (r) { r(1); });\
+                 Promise.resolve(p) === p"
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            settle("Promise.resolve(41).then(function (v) { return v + 1; })").unwrap(),
+            number(42.0)
+        );
+        // A thenable is adopted: the resolve function defers through a job.
+        assert_eq!(
+            settle(
+                "var t = { then: function (res) { res('adopted'); } };\
+                 Promise.resolve(t).then(function (v) { return v; })"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("adopted")))
+        );
+        // A subclass keeps its own constructor and prototype.
+        assert_eq!(
+            settle(
+                "class P extends Promise {}\n\
+                 var p = P.resolve(1);\
+                 [p instanceof P, p instanceof Promise].join()"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true,true")))
+        );
+    }
+
     #[test]
     fn executor_rejection_settles_rejected() {
         assert_eq!(

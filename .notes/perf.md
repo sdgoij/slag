@@ -20104,3 +20104,43 @@ per-iteration environment (~68 ns, dominated by the arena box) was measured too
 and is *not* worth optimizing: the compiler already omits the per-iteration steps
 when nothing captures the head binding, and every iteration that does capture
 needs a distinct environment.
+
+## LANDED (2026-11-13): `Promise.resolve` settles its stock capability directly
+
+The promise path's per-operation cost is dominated by what it allocates (see the
+section above). One piece of it is pure ceremony: `promise_resolve` built a full
+NewPromiseCapability for the realm's own `%Promise%` — two
+`Function::create_builtin` closures, each two arena boxes plus its `length`/`name`
+defines — and then *called* one of them, which dispatched into
+`resolve_promise`. The stock constructor's executor is `GetCapabilitiesExecutor`,
+never user code, so the resolving functions cannot be observed: only
+`create_promise_object`'s return value held them, and `promise_resolve` only ever
+used `[[Resolve]]`.
+
+`create_promise_object_bare` builds the promise without the pair, and
+`promise_resolve` settles it with `resolve_promise` directly. Every other path
+(user executors, `new Promise`, subclass constructors, `then`'s result
+capability) is unchanged, and a non-stock constructor still takes
+`new_promise_capability`.
+
+| probe | before | after | delta |
+|---|---:|---:|---:|
+| `Promise.resolve(i)` | 636 ns | 152 ns | **-76.1%** |
+| `new Promise(r => r(i))` | 133.8 | 131.9 | -1.4% |
+| `async function f(i) { return i }` | 223.2 | 221.6 | -0.7% |
+| `async function f(i) { await i }` ×1000 | 20.8 | 19.8 | -4.6% |
+| `builtins/async_churn` | 49.2 | 46.5 | -5.4% |
+| `builtins/promise_churn` | 10.19 | 10.08 | -1.0% |
+
+(Per-row isolated, interleaved min-of-5.) The corpus total does not move
+(+0.0%): no row is dominated by `Promise.resolve`. The await rows move only a
+few percent because their cost is the quadratic documented above, not the
+capability.
+
+Gates: `built-ins --filter "*Promise*"` 732/732 in jit, jitless, and under
+`--gc-stress --gc-verify`; `language` 23726, `built-ins` 23821, `annexB` 1086 —
+0 fail both modes; corpus results identical 79/79 (+2 new rows) in jit, jitless,
+`--gc-stress`, `--nursery-stress`; `cargo test --workspace`; clippy; fmt. A new
+unit test covers the paths that stay observable: same-constructor identity, a
+thenable adopted through a job, and a subclass still getting its own capability
+and prototype.

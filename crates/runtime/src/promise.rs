@@ -108,6 +108,25 @@ pub fn is_promise(value: &Value) -> bool {
     promise_record(value).is_some()
 }
 
+/// The promise object of spec 27.2.4.1 steps 3-9 *without* its resolving
+/// functions: for an internal caller whose executor is never user code (the
+/// stock `%Promise%` path), the two resolvers cannot be observed by anyone, so
+/// the settle is direct and the two closures are not built at all.
+pub(crate) fn create_promise_object_bare(
+    agent: &mut Agent,
+    new_target: &Value,
+) -> Result<Value, JsError> {
+    let proto = crate::builtins::promise::get_prototype_from_constructor(
+        agent,
+        new_target,
+        crate::builtins::promise::PROMISE_PROTO,
+    )?;
+    let (promise, _data) = crux::object::JsObject::promise_object_create(Some(proto));
+    let promise_value = Value::Object(promise);
+    run_promise_hook(agent, PromiseHookKind::Init, &promise_value, None)?;
+    Ok(promise_value)
+}
+
 /// The promise object of spec 27.2.4.1 steps 3-9, without the executor: the
 /// prototype, the object, its two resolving functions, its state record and the
 /// init hook.
@@ -453,6 +472,17 @@ pub fn perform_promise_then(
     Ok(result_promise.unwrap_or(Value::Undefined))
 }
 
+/// Whether `constructor` is the realm's own `%Promise%` — the capability path
+/// whose executor (`GetCapabilitiesExecutor`) is never user code.
+fn is_stock_promise(agent: &Agent, constructor: &Value) -> bool {
+    agent.current_realm().is_ok_and(|realm| {
+        realm
+            .intrinsics
+            .get(crate::builtins::promise::PROMISE)
+            .is_some_and(|stock| crux::ops::same_value(&stock, constructor))
+    })
+}
+
 /// PromiseResolve (spec 27.2.4.5.1): the static `Promise.resolve` core.
 pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Result<Value, JsError> {
     if is_promise(&x) {
@@ -460,6 +490,15 @@ pub fn promise_resolve(agent: &mut Agent, constructor: &Value, x: Value) -> Resu
         if crux::ops::same_value(&ctor, constructor) {
             return Ok(x);
         }
+    }
+    // The stock constructor's capability is internal: its resolving functions
+    // exist only to be called here, so the promise is settled directly instead
+    // of building the pair and dispatching through it (two builtin closures
+    // plus a general call per `Promise.resolve`/await).
+    if is_stock_promise(agent, constructor) {
+        let promise = create_promise_object_bare(agent, constructor)?;
+        resolve_promise(agent, &promise, x)?;
+        return Ok(promise);
     }
     let capability = new_promise_capability(agent, constructor)?;
     crate::function::call(agent, &capability.resolve, Value::Undefined, &[x])?;
