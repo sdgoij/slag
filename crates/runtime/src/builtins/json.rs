@@ -781,7 +781,8 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     // lookup and the `%Object.prototype%` intrinsic read were about half of
     // `JSON.stringify({})`'s 430 ns (`scratch/iso/j0`).
     let empty = JsString::from_utf8("");
-    let result = if state.replacer_function.is_some() {
+    let mut out: Vec<u16> = Vec::new();
+    let wrote = if state.replacer_function.is_some() {
         let wrapper = JsObject::ordinary_object_create(
             agent
                 .current_realm()?
@@ -790,13 +791,17 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
                 .and_then(|value| as_object(&value)),
         );
         wrapper.create_data_property_or_throw(&empty, value)?;
-        serialize_json_property(agent, &mut state, &empty, &Value::Object(wrapper))?
+        serialize_json_property(agent, &mut state, &empty, &Value::Object(wrapper), &mut out)?
     } else {
-        serialize_json_value(agent, &mut state, &empty, value, value)?
+        serialize_json_value(agent, &mut state, &empty, value, value, &mut out)?
     };
-    Ok(result
-        .map(|text| Value::String(Handle::new(text)))
-        .unwrap_or(Value::Undefined))
+    // The result is assembled in one buffer, so the whole document costs one
+    // allocation here instead of a box per member.
+    Ok(if wrote {
+        Value::String(Handle::new(JsString::from_utf16(&out)))
+    } else {
+        Value::Undefined
+    })
 }
 
 /// The `space` argument → the gap string (spec 26.6.3.1 steps 8-11).
@@ -862,15 +867,18 @@ fn property_list_from(agent: &mut Agent, replacer: &Value) -> Result<Vec<JsStrin
     Ok(list)
 }
 
-/// SerializeJSONProperty (spec 26.6.3.2): `None` means the value is omitted.
+/// SerializeJSONProperty (spec 26.6.3.2), appending the member's text to
+/// `out`. `Ok(false)` means the value is omitted (undefined, a callable, a
+/// symbol) and nothing was appended.
 fn serialize_json_property(
     agent: &mut Agent,
     state: &mut StringifyState,
     key: &JsString,
     holder: &Value,
-) -> Result<Option<JsString>, JsError> {
+    out: &mut Vec<u16>,
+) -> Result<bool, JsError> {
     let value = get_property(agent, holder, key, *holder)?;
-    serialize_json_value(agent, state, key, value, *holder)
+    serialize_json_value(agent, state, key, value, *holder, out)
 }
 
 /// [`serialize_json_property`] with the value already in hand: the root call
@@ -878,13 +886,18 @@ fn serialize_json_property(
 /// is a property of a container. `receiver` is the `this` a replacer function
 /// is called with — the holder for a property, the (unobservable) root value
 /// when the root has no replacer to receive it.
+///
+/// The text goes straight into the caller's UTF-16 buffer: a primitive is
+/// spelled in place (`quote_into`, `units_into`) and a container appends its
+/// own framing, so a member costs no intermediate `JsString` at all.
 fn serialize_json_value(
     agent: &mut Agent,
     state: &mut StringifyState,
     key: &JsString,
     mut value: Value,
     receiver: Value,
-) -> Result<Option<JsString>, JsError> {
+    out: &mut Vec<u16>,
+) -> Result<bool, JsError> {
     if matches!(
         value.kind(),
         ValueKind::Object(_) | ValueKind::Function(_) | ValueKind::BigInt(_)
@@ -900,15 +913,20 @@ fn serialize_json_value(
     if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {
             let source = raw_json_source(agent, &value).unwrap_or_else(|| JsString::from_utf8(""));
-            return Ok(Some(source));
+            out.extend_from_slice(source.as_slice());
+            return Ok(true);
         }
         // Unbox the Number/String/Boolean/BigInt wrappers (spec 26.6.3.2
         // steps 4.a-d). Number and String wrappers convert through the
         // agent (ToNumber/ToString honor overridden valueOf/toString);
-        // Boolean/BigInt wrappers serialize their stored primitive.
-        if agent.number_data.contains_key(&obj.id()) {
+        // Boolean/BigInt wrappers serialize their stored primitive. A program
+        // that never made a Number/Boolean wrapper has an empty table, and an
+        // empty id map is a length check — cheaper than the probe.
+        if !agent.number_data.is_empty() && agent.number_data.contains_key(&obj.id()) {
             value = Value::Number(crate::context::to_number(agent, &value)?);
-        } else if let Some(b) = agent.boolean_data.get(&obj.id()) {
+        } else if !agent.boolean_data.is_empty()
+            && let Some(b) = agent.boolean_data.get(&obj.id())
+        {
             value = Value::Boolean(*b);
         } else if matches!(obj.kind, crux::object::ObjectKind::String(_)) {
             value = Value::String(Handle::new(crate::context::to_string(agent, &value)?));
@@ -916,33 +934,51 @@ fn serialize_json_value(
             value = Value::BigInt(Handle::new(big));
         }
     }
+    let null = [b'n' as u16, b'u' as u16, b'l' as u16, b'l' as u16];
     match value.kind() {
-        ValueKind::Null => Ok(Some(JsString::from_utf8("null"))),
-        ValueKind::Boolean(true) => Ok(Some(JsString::from_utf8("true"))),
-        ValueKind::Boolean(false) => Ok(Some(JsString::from_utf8("false"))),
-        ValueKind::String(s) => Ok(Some(quote_json_string(&s))),
+        ValueKind::Null => out.extend_from_slice(&null),
+        ValueKind::Boolean(true) => {
+            out.extend_from_slice(&[b't' as u16, b'r' as u16, b'u' as u16, b'e' as u16]);
+        }
+        ValueKind::Boolean(false) => out.extend_from_slice(&[
+            b'f' as u16,
+            b'a' as u16,
+            b'l' as u16,
+            b's' as u16,
+            b'e' as u16,
+        ]),
+        ValueKind::String(s) => quote_into(out, &s),
         ValueKind::Number(n) => {
-            if n.is_finite() {
-                Ok(Some(crux::number::to_string(n)))
+            if !n.is_finite() {
+                out.extend_from_slice(&null);
             } else {
-                Ok(Some(JsString::from_utf8("null")))
+                // The digits are spelled into the result buffer: the boxed
+                // form would be copied out of its fresh box immediately.
+                let mut buf = [0u16; crux::number::SPELLING_CAP];
+                match crux::number::units_into(n, &mut buf) {
+                    Some(len) => out.extend_from_slice(&buf[..len]),
+                    None => out.extend_from_slice(crux::number::to_string(n).as_slice()),
+                }
             }
         }
-        ValueKind::BigInt(_) => Err(JsError::new(
-            ErrorKind::TypeError,
-            "Do not know how to serialize a BigInt".into(),
-        )),
+        ValueKind::BigInt(_) => {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Do not know how to serialize a BigInt".into(),
+            ));
+        }
         // Only non-callable objects are serialized; callable objects,
         // undefined, and symbols are omitted (spec steps 15-16).
         ValueKind::Object(_) | ValueKind::Function(_) if !is_callable(&value) => {
             if crate::builtins::array::is_array(&value) {
-                serialize_json_array(agent, state, &value)
+                serialize_json_array(agent, state, &value, out)?;
             } else {
-                serialize_json_object(agent, state, &value)
+                serialize_json_object(agent, state, &value, out)?;
             }
         }
-        _ => Ok(None),
+        _ => return Ok(false),
     }
+    Ok(true)
 }
 
 /// SerializeJSONObject (spec 26.6.3.4), bounding the nesting depth.
@@ -950,7 +986,8 @@ fn serialize_json_object(
     agent: &mut Agent,
     state: &mut StringifyState,
     value: &Value,
-) -> Result<Option<JsString>, JsError> {
+    out: &mut Vec<u16>,
+) -> Result<(), JsError> {
     if state.depth >= MAX_JSON_DEPTH || !crux::stack::has_headroom() {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -958,7 +995,7 @@ fn serialize_json_object(
         ));
     }
     state.depth += 1;
-    let result = serialize_json_object_inner(agent, state, value);
+    let result = serialize_json_object_inner(agent, state, value, out);
     state.depth -= 1;
     result
 }
@@ -967,7 +1004,8 @@ fn serialize_json_object_inner(
     agent: &mut Agent,
     state: &mut StringifyState,
     value: &Value,
-) -> Result<Option<JsString>, JsError> {
+    out: &mut Vec<u16>,
+) -> Result<(), JsError> {
     if state.stack.contains(value) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -981,65 +1019,64 @@ fn serialize_json_object_inner(
         Some(list) => list.clone(),
         None => enumerable_string_keys(agent, value)?,
     };
-    // Assemble the member text directly in UTF-16 units: quoting keys and
-    // appending the serialized values (already UTF-16 JsStrings) avoids the
-    // per-member UTF-16 -> UTF-8 -> UTF-16 round trips and String/format!
-    // allocations the String-part builder paid.
-    let inner = state.indent.encode_utf16().collect::<Vec<u16>>();
-    let step = stepback.encode_utf16().collect::<Vec<u16>>();
-    let mut out: Vec<u16> = Vec::new();
-    let mut first = true;
+    // Assemble the member text directly in the caller's UTF-16 buffer, so a
+    // member (its quoted key, its separator and its value) is appended in
+    // place instead of being built as its own string.
+    if keys.is_empty() {
+        // spec 26.6.3.4 step 5: an empty object is "{}" even with a gap.
+        out.extend_from_slice(&[b'{' as u16, b'}' as u16]);
+        state.indent = stepback;
+        state.stack.pop();
+        return Ok(());
+    }
+    let gapped = !state.gap.is_empty();
+    let (inner, step) = if gapped {
+        (
+            state.indent.encode_utf16().collect::<Vec<u16>>(),
+            stepback.encode_utf16().collect::<Vec<u16>>(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    out.push(b'{' as u16);
+    let open = out.len() - 1;
+    let mut wrote = false;
     for key in &keys {
-        let Some(text) = serialize_json_property(agent, state, key, value)? else {
-            continue;
-        };
-        if first {
-            first = false;
-        } else if state.gap.is_empty() {
+        let mark = out.len();
+        if wrote {
             out.push(b',' as u16);
-        } else {
-            out.extend_from_slice(
-                b",\n"
-                    .iter()
-                    .map(|&b| b as u16)
-                    .collect::<Vec<u16>>()
-                    .as_slice(),
-            );
+        }
+        if gapped {
+            out.push(b'\n' as u16);
             out.extend_from_slice(&inner);
         }
-        quote_into(&mut out, key);
+        quote_into(out, key);
         out.push(b':' as u16);
-        if !state.gap.is_empty() {
+        if gapped {
             out.push(b' ' as u16);
         }
-        out.extend_from_slice(text.as_slice());
+        if serialize_json_property(agent, state, key, value, out)? {
+            wrote = true;
+        } else {
+            // Omitted: nothing of this member may reach the result, separator
+            // included.
+            out.truncate(mark);
+        }
     }
-    state.indent = stepback.clone();
+    if gapped {
+        out.push(b'\n' as u16);
+        out.extend_from_slice(&step);
+    }
+    out.push(b'}' as u16);
+    if !wrote {
+        // Every member was omitted (a gap would otherwise leave "{\n}"):
+        // spec 26.6.3.4 step 5 answers "{}".
+        out.truncate(open);
+        out.extend_from_slice(&[b'{' as u16, b'}' as u16]);
+    }
+    state.indent = stepback;
     state.stack.pop();
-    if first {
-        Ok(Some(JsString::from_utf8("{}")))
-    } else if state.gap.is_empty() {
-        let mut body = Vec::with_capacity(out.len() + 2);
-        body.push(b'{' as u16);
-        body.extend_from_slice(&out);
-        body.push(b'}' as u16);
-        Ok(Some(JsString::from_utf16(&body)))
-    } else {
-        let mut body = Vec::with_capacity(out.len() + 4 + inner.len() + step.len());
-        body.extend_from_slice(
-            b"{\n"
-                .iter()
-                .map(|&b| b as u16)
-                .collect::<Vec<u16>>()
-                .as_slice(),
-        );
-        body.extend_from_slice(&inner);
-        body.extend_from_slice(&out);
-        body.push(b'\n' as u16);
-        body.extend_from_slice(&step);
-        body.push(b'}' as u16);
-        Ok(Some(JsString::from_utf16(&body)))
-    }
+    Ok(())
 }
 
 /// SerializeJSONArray (spec 26.6.3.5), bounding the nesting depth.
@@ -1047,7 +1084,8 @@ fn serialize_json_array(
     agent: &mut Agent,
     state: &mut StringifyState,
     value: &Value,
-) -> Result<Option<JsString>, JsError> {
+    out: &mut Vec<u16>,
+) -> Result<(), JsError> {
     if state.depth >= MAX_JSON_DEPTH || !crux::stack::has_headroom() {
         return Err(JsError::new(
             ErrorKind::RangeError,
@@ -1055,7 +1093,7 @@ fn serialize_json_array(
         ));
     }
     state.depth += 1;
-    let result = serialize_json_array_inner(agent, state, value);
+    let result = serialize_json_array_inner(agent, state, value, out);
     state.depth -= 1;
     result
 }
@@ -1064,7 +1102,8 @@ fn serialize_json_array_inner(
     agent: &mut Agent,
     state: &mut StringifyState,
     value: &Value,
-) -> Result<Option<JsString>, JsError> {
+    out: &mut Vec<u16>,
+) -> Result<(), JsError> {
     if state.stack.contains(value) {
         return Err(JsError::new(
             ErrorKind::TypeError,
@@ -1078,59 +1117,43 @@ fn serialize_json_array_inner(
     if length == 0 {
         // spec 26.6.3.5 step 4: an empty array serializes to "[]" even with
         // a gap (the object path has the same empty special-case).
+        out.extend_from_slice(&[b'[' as u16, b']' as u16]);
         state.indent = stepback;
         state.stack.pop();
-        return Ok(Some(JsString::from_utf8("[]")));
+        return Ok(());
     }
-    let inner = state.indent.encode_utf16().collect::<Vec<u16>>();
-    let step = stepback.encode_utf16().collect::<Vec<u16>>();
-    let mut out: Vec<u16> = Vec::new();
-    for index in 0..length {
-        let key = JsString::from_utf8(&index.to_string());
-        let result = serialize_json_property(agent, state, &key, value)?;
-        if !out.is_empty() {
-            if state.gap.is_empty() {
-                out.push(b',' as u16);
-            } else {
-                out.extend_from_slice(
-                    b",\n"
-                        .iter()
-                        .map(|&b| b as u16)
-                        .collect::<Vec<u16>>()
-                        .as_slice(),
-                );
-                out.extend_from_slice(&inner);
-            }
-        }
-        match result {
-            Some(text) => out.extend_from_slice(text.as_slice()),
-            None => out.extend_from_slice(&[b'n' as u16, b'u' as u16, b'l' as u16, b'l' as u16]),
-        }
-    }
-    state.indent = stepback.clone();
-    state.stack.pop();
-    if state.gap.is_empty() {
-        let mut body = Vec::with_capacity(out.len() + 2);
-        body.push(b'[' as u16);
-        body.extend_from_slice(&out);
-        body.push(b']' as u16);
-        Ok(Some(JsString::from_utf16(&body)))
+    let gapped = !state.gap.is_empty();
+    let (inner, step) = if gapped {
+        (
+            state.indent.encode_utf16().collect::<Vec<u16>>(),
+            stepback.encode_utf16().collect::<Vec<u16>>(),
+        )
     } else {
-        let mut body = Vec::with_capacity(out.len() + 4 + inner.len() + step.len());
-        body.extend_from_slice(
-            b"[\n"
-                .iter()
-                .map(|&b| b as u16)
-                .collect::<Vec<u16>>()
-                .as_slice(),
-        );
-        body.extend_from_slice(&inner);
-        body.extend_from_slice(&out);
-        body.push(b'\n' as u16);
-        body.extend_from_slice(&step);
-        body.push(b']' as u16);
-        Ok(Some(JsString::from_utf16(&body)))
+        (Vec::new(), Vec::new())
+    };
+    out.push(b'[' as u16);
+    for index in 0..length {
+        if index > 0 {
+            out.push(b',' as u16);
+        }
+        if gapped {
+            out.push(b'\n' as u16);
+            out.extend_from_slice(&inner);
+        }
+        let key = JsString::from_utf8(&index.to_string());
+        // spec 26.6.3.5 step 8: an omitted element serializes as "null".
+        if !serialize_json_property(agent, state, &key, value, out)? {
+            out.extend_from_slice(&[b'n' as u16, b'u' as u16, b'l' as u16, b'l' as u16]);
+        }
     }
+    if gapped {
+        out.push(b'\n' as u16);
+        out.extend_from_slice(&step);
+    }
+    out.push(b']' as u16);
+    state.indent = stepback;
+    state.stack.pop();
+    Ok(())
 }
 
 /// QuoteJSONString (spec 26.6.3.6): escape quotes, backslashes, control
@@ -1209,13 +1232,6 @@ fn quote_into(out: &mut Vec<u16>, s: &JsString) {
         index += 1;
     }
     out.push(b'"' as u16);
-}
-
-/// QuoteJSONString (spec 26.6.3.6) as a standalone string.
-fn quote_json_string(s: &JsString) -> JsString {
-    let mut out = Vec::with_capacity(s.len() + 2);
-    quote_into(&mut out, s);
-    JsString::from_utf16(&out)
 }
 
 fn hex_digit(value: u16) -> u16 {
@@ -1394,6 +1410,51 @@ mod tests {
         let mut agent = Agent::new();
         agent.initialize_host_defined_realm()?;
         agent.run_script(source)
+    }
+
+    /// The serializer appends into one buffer, so an omitted member (and the
+    /// separator that would have carried it) must leave nothing behind —
+    /// including the newline a gap would otherwise emit for an object whose
+    /// every member is omitted.
+    #[test]
+    fn stringify_leaves_no_trace_of_an_omitted_member() {
+        let cases = [
+            ("JSON.stringify({x: undefined}, null, 2)", "{}"),
+            (
+                "JSON.stringify({x: undefined, y: undefined}, null, 2)",
+                "{}",
+            ),
+            (
+                "JSON.stringify({x: undefined, y: 1}, null, 2)",
+                "{\n  \"y\": 1\n}",
+            ),
+            (
+                "JSON.stringify({x: 1, y: undefined}, null, 2)",
+                "{\n  \"x\": 1\n}",
+            ),
+            (
+                "JSON.stringify({a: {b: undefined}}, null, 1)",
+                "{\n \"a\": {}\n}",
+            ),
+            (
+                "JSON.stringify([undefined, 1], null, 2)",
+                "[\n  null,\n  1\n]",
+            ),
+            (
+                "JSON.stringify({a: [1, {c: undefined}]}, null, 1)",
+                "{\n \"a\": [\n  1,\n  {}\n ]\n}",
+            ),
+        ];
+        for (source, expected) in cases {
+            let value = run(source).expect("evaluates");
+            let text = value.as_string().expect("a string");
+            let want: Vec<u16> = expected.encode_utf16().collect();
+            assert_eq!(
+                text.as_slice(),
+                want.as_slice(),
+                "{source} should be {expected:?}"
+            );
+        }
     }
 
     #[test]

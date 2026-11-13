@@ -19711,3 +19711,38 @@ Two more candidates in the same row, measured but not taken: the unbox block in
 (`number_data`, `boolean_data`, `bigint`) that a plain object can never hit, and
 the `toJSON` lookup rebuilds its key with `JsString::from_utf8("toJSON")` on
 every property.
+
+## LANDED (2026-11-13): `JSON.stringify` assembles the document in one buffer
+
+The serializer already appended *container* text in UTF-16, but every member
+came back as its own freshly boxed `JsString` (a number's spelling, a quoted
+string, `"null"`) which the parent then copied — one or two arena boxes per
+member, and per member a `StringifyState.indent`/`format!` allocation per
+container even in the gapless case.
+
+`serialize_json_value` now appends into the caller's buffer and reports whether
+it wrote anything: primitives are spelled in place (`quote_into` for strings,
+`crux::number::units_into` for numbers — the same helper the template join
+uses), and a container writes its own braces. The whole document therefore
+costs one allocation, at the root.
+
+| probe (100k stringifies) | wrapper-only parent | now | delta |
+|---|---:|---:|---:|
+| one key | 66.69 | 62.04 | -7.0% |
+| three keys | 111.99 | 101.43 | -9.4% |
+| five keys | 147.83 | 129.83 | -12.2% |
+| `opcost/json_stringify` | 110.81 | 100.20 | -9.6% |
+| `builtins/json_roundtrip` | 77.02 | 64.41 | -16.4% |
+| control (`hof_methods`) | 26.11 | 25.65 | -1.8% |
+
+The omitted-member rule is the trap this introduces: an object member's text is
+now written *before* the serializer discovers the value is omitted, so the loop
+records the buffer length and truncates on `Ok(false)` — and an object whose
+*members* are all omitted must still answer `"{}"`, not `"{\n}"`. The
+`built-ins/JSON` sweep (165 fixtures) did **not** catch that; a unit test
+(`stringify_leaves_no_trace_of_an_omitted_member`) does, over the gapped and
+ungapped forms.
+
+Gates: `built-ins/JSON` 165/165 in jit and jitless, corpus results identical
+79/79 in jit, jitless, `--gc-stress` and `--nursery-stress`, runtime 1152 (the
+new test included), clippy + fmt clean.
