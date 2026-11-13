@@ -130,6 +130,12 @@ pub enum ReactionKind {
 #[derive(Debug, Clone)]
 pub struct PromiseCapability {
     pub promise: Value,
+    /// The `[[Resolve]]`/`[[Reject]]` functions. Both `undefined` for an
+    /// INTERNAL capability: the realm's own `%Promise%` cannot hand a
+    /// resolving function to user code (its executor is
+    /// `GetCapabilitiesExecutor`, engine code), so an internal caller settles
+    /// through `promise::settle_capability`/`promise::reject_capability`
+    /// instead of building two closures it would only call once.
     pub resolve: Value,
     pub reject: Value,
 }

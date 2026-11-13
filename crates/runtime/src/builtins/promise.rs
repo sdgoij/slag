@@ -17,8 +17,8 @@ use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
 use crate::promise::{
-    error_value, is_promise, new_promise_capability, perform_promise_then, promise_resolve,
-    reject_promise, resolve_promise,
+    error_value, is_promise, new_internal_capability, new_promise_capability, perform_promise_then,
+    promise_resolve, reject_promise, resolve_promise,
 };
 use crate::realm::Realm;
 
@@ -576,7 +576,13 @@ fn promise_then(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
         ));
     }
     let constructor = species_constructor(agent, this)?;
-    let capability = new_promise_capability(agent, &constructor)?;
+    // `then` only ever *calls* the result capability's resolving functions
+    // (the reaction job does), so the stock constructor's capability needs no
+    // closures.
+    let capability = match new_internal_capability(agent, &constructor)? {
+        Some(capability) => capability,
+        None => new_promise_capability(agent, &constructor)?,
+    };
     let on_fulfilled = args.first().cloned();
     let on_rejected = args.get(1).cloned();
     perform_promise_then(agent, this, on_fulfilled, on_rejected, Some(capability))
@@ -717,9 +723,12 @@ fn promise_static_reject(
             "Promise.reject requires this to be an object".into(),
         ));
     }
-    let capability = new_promise_capability(agent, this)?;
+    let capability = match new_internal_capability(agent, this)? {
+        Some(capability) => capability,
+        None => new_promise_capability(agent, this)?,
+    };
     let reason = args.first().cloned().unwrap_or(Value::Undefined);
-    crate::function::call(agent, &capability.reject, Value::Undefined, &[reason])?;
+    crate::promise::reject_capability(agent, &capability, reason)?;
     Ok(capability.promise)
 }
 
@@ -1922,6 +1931,46 @@ mod tests {
             settle(
                 "class P extends Promise {}\n\
                  var p = P.resolve(1);\
+                 [p instanceof P, p instanceof Promise].join()"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("true,true")))
+        );
+    }
+
+    /// `then` settles its result through an INTERNAL capability on the stock
+    /// constructor (no resolving closures), so both settle paths — fulfilled
+    /// and rejected — and the subclass fallback have to keep working.
+    #[test]
+    fn then_settles_an_internal_capability() {
+        assert_eq!(
+            settle("Promise.resolve(1).then(function (v) { return v + 1; })").unwrap(),
+            number(2.0)
+        );
+        // A throw in the handler rejects the result capability.
+        assert_eq!(
+            settle(
+                "Promise.resolve(1)\
+                   .then(function () { throw new Error('boom'); })\
+                   .then(null, function (e) { return e instanceof Error; })"
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        // A rejected source reaches the rejection handler.
+        assert_eq!(
+            settle(
+                "Promise.reject('no')\
+                   .then(null, function (reason) { return reason; })"
+            )
+            .unwrap(),
+            Value::String(Handle::new(JsString::from_utf8("no")))
+        );
+        // A subclass's `then` still honours its species constructor.
+        assert_eq!(
+            settle(
+                "class P extends Promise {}\n\
+                 var p = P.resolve(1).then(function (v) { return v; });\
                  [p instanceof P, p instanceof Promise].join()"
             )
             .unwrap(),

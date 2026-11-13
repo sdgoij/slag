@@ -20144,3 +20144,50 @@ Gates: `built-ins --filter "*Promise*"` 732/732 in jit, jitless, and under
 unit test covers the paths that stay observable: same-constructor identity, a
 thenable adopted through a job, and a subclass still getting its own capability
 and prototype.
+
+## LANDED (2026-11-13): `then` settles its result capability without closures — and the quadratic goes away
+
+The capability section above named `then`'s result capability as the next piece:
+`Promise.prototype.then` built a full capability for the stock `%Promise%` — two
+resolving closures, each two arena boxes plus its `length`/`name` defines — and
+the reaction job then *called* one of them. Nothing can observe them: `then`
+never hands the pair to user code (its only reader is `run_reaction_job`).
+
+`PromiseCapability` now distinguishes an INTERNAL capability (both resolving
+functions `undefined`, built by `new_internal_capability` for the stock
+constructor only) from the observable one (`new Promise`,
+`Promise.withResolvers`, the `all`/`race`/`any` combinators, which pass the
+functions as values into `invoke_then`, and any subclass). `settle_capability` /
+`reject_capability` call `resolve_promise`/`reject_promise` directly for an
+internal capability and `[[Call]]` the function otherwise. `then` and
+`Promise.reject` take the internal path; everything else keeps the pair.
+
+| probe | before | after |
+|---|---:|---:|
+| `Promise.resolve(i).then(fn)`, 1000 pending | 1580 ns | 1350 ns |
+| the same, 8000 pending | 2321 ns | 1395 ns |
+| `builtins/promise_churn` | 10.47 ms | 7.97 ms (**-23.9%**) |
+| `builtins/async_churn` | 45.8 | 46.2 (+0.9%, no change) |
+| corpus total | 2057 | 2020 (**-1.8%**) |
+
+**The quadratic is gone.** With the `Promise.resolve` landing before it, a
+`.then` went from 2.4 µs at 1000 pending to 7.9 µs at 8000; it is now flat
+(1.35 µs → 1.40 µs) because the two closures were ~6 of the ~20 allocations per
+`.then`, and the growth was the minor GC scanning a queue that no longer fills
+as fast. The remaining ~1.4 µs against node's ~100 ns is still the allocation
+count per operation (the promise object + record, the reaction records, the job
+box, and one `JobCallback` per handler), not an algorithmic cliff.
+
+`async_churn` does not move because an *async call's* capability keeps its
+`reject` as a real function: the async state stores it (and passes it to
+`perform_promise_then` as the rejection handler), so it is observable — see
+`async_await.rs`'s `AsyncFunctionState`. Making that internal is the same
+refactor one level up and is what the await rows need.
+
+Gates: `built-ins --filter "*Promise*"` 732/732 in jit, jitless and under
+`--gc-stress --gc-verify`; `language` 23726, `built-ins` 23821, `annexB` 1086 —
+0 fail both modes; corpus results identical (79/79 + the two new rows) in jit,
+jitless, `--gc-stress`, `--nursery-stress`; `cargo test --workspace`; clippy;
+fmt. New unit test: a fulfilled settle, a handler throw (the reject path), a
+rejected source reaching its handler, and a subclass still honouring its species
+constructor through the observable capability.

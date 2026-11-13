@@ -108,6 +108,35 @@ pub fn is_promise(value: &Value) -> bool {
     promise_record(value).is_some()
 }
 
+/// Settle `capability` fulfilled with `value`: the spec's
+/// `Call(capability.[[Resolve]], undefined, «value»)` for an observable
+/// capability, and the same algorithm called directly for an internal one
+/// (which has no resolving function to call).
+pub fn settle_capability(
+    agent: &mut Agent,
+    capability: &PromiseCapability,
+    value: Value,
+) -> Result<(), JsError> {
+    if capability.resolve.is_undefined() {
+        return resolve_promise(agent, &capability.promise, value);
+    }
+    crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
+    Ok(())
+}
+
+/// Reject `capability` with `reason`, the mirror of [`settle_capability`].
+pub fn reject_capability(
+    agent: &mut Agent,
+    capability: &PromiseCapability,
+    reason: Value,
+) -> Result<(), JsError> {
+    if capability.reject.is_undefined() {
+        return reject_promise(agent, &capability.promise, reason);
+    }
+    crate::function::call(agent, &capability.reject, Value::Undefined, &[reason])?;
+    Ok(())
+}
+
 /// The promise object of spec 27.2.4.1 steps 3-9 *without* its resolving
 /// functions: for an internal caller whose executor is never user code (the
 /// stock `%Promise%` path), the two resolvers cannot be observed by anyone, so
@@ -244,6 +273,27 @@ pub fn new_promise_capability(
         resolve,
         reject,
     })
+}
+
+/// NewPromiseCapability for a caller that will only *call* the resolving
+/// functions (never hand them to user code or read them as values), on the
+/// realm's own `%Promise%`: the same promise, with no closures built.
+///
+/// `None` for any other constructor — the caller then takes
+/// [`new_promise_capability`] and gets the observable pair.
+pub fn new_internal_capability(
+    agent: &mut Agent,
+    constructor: &Value,
+) -> Result<Option<PromiseCapability>, JsError> {
+    if !is_stock_promise(agent, constructor) {
+        return Ok(None);
+    }
+    let promise = create_promise_object_bare(agent, constructor)?;
+    Ok(Some(PromiseCapability {
+        promise,
+        resolve: Value::Undefined,
+        reject: Value::Undefined,
+    }))
 }
 
 /// CreateResolvingFunctions (spec 27.2.1.3.1): two built-in functions whose
@@ -612,12 +662,10 @@ fn run_reaction_job(
     run_promise_hook(agent, PromiseHookKind::After, &promise, None)?;
     if let Some(capability) = &reaction.capability {
         match handler_result {
-            Ok(value) => {
-                crate::function::call(agent, &capability.resolve, Value::Undefined, &[value])?;
-            }
+            Ok(value) => settle_capability(agent, capability, value)?,
             Err(error) => {
                 let rejection = error_value(agent, &error);
-                crate::function::call(agent, &capability.reject, Value::Undefined, &[rejection])?;
+                reject_capability(agent, capability, rejection)?;
             }
         }
     }
