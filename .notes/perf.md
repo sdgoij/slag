@@ -20280,3 +20280,44 @@ it settles, so N concurrent awaits reserve N × 512 KB. Releasing it at a
 suspension (`shrink_to_fit` after the normalize, re-reserve on resume) would fix
 the memory curve at the cost of two reallocs per await; that is a trade to
 measure, not a free win.
+
+## MEASURED AND REJECTED (2026-11-13): a bigger `Small` string is a wash
+
+`coercion_concat` (300k iterations of `"value=" + i + ":" + (i * 2)`) is 55 ms
+against node's 7.6, and the shape decomposes cleanly (per iteration):
+
+| probe | ns |
+|---|---:|
+| `s0 + i` where `s0` has 6 units (result 12 units) | 46 |
+| `s0 + i` where `s0` has 12 units (result 18 units) | **83** |
+| the same at 40 units | 91 |
+| the same at 130 units | 93 |
+| `"" + i` (a number's spelling) | 46 |
+| `i + (i * 2)` (numbers only) | 0.8 |
+
+So there is a cliff at the 16-unit `Small` boundary: below it a concat is one
+arena box, above it `concat`'s leaf branch allocates a `Vec`, converts it to an
+`Arc<[u16]>` and boxes the enum (three allocations) — **+37 ns per concat**,
+flat from 18 to 128 units. (It is not the string literal: hoisting `"value="`
+into a variable costs the same, so `Step::PushStr` is not being re-boxed per
+iteration — plain literals compile to `Push(Value::String(..))` and are boxed
+once at compile time.)
+
+Raising `SMALL_STRING_CAP` and `CONCAT_FLAT_THRESHOLD` to 32 turns that cliff
+into a 46 ns case — `coercion_concat` **-23.3%**, `st4`'s shape -19.8% — but
+every row that builds with `+=` or handles short strings pays for the larger
+box:
+
+| row | 16 → 24 | 16 → 32 |
+|---|---:|---:|
+| `strings/coercion_concat` | -23.3% | **-18.1%** |
+| `strings/split_join` | +8.2% | +4.6% |
+| `strings/concat_loop` | +6.5% | +5.6% |
+| `builtins/json_roundtrip` | +2.9% | +4.6% |
+| **corpus total** | +0.2% | **+2.9%** |
+
+Both were reverted. The cliff is real but the fix is not the threshold: the
+17-128 leaf branch needs one allocation instead of three, which means a string
+form that keeps its units in the box (a tail after the enum, like
+`EnvRecord`'s slots) rather than an `Arc<[u16]>` behind it. That is a `JsString`
+representation change, not a constant.
