@@ -161,6 +161,22 @@ const rows = [
   ['math_call', '', 's = (s + Math.floor(Math.sqrt(k))) | 0;'],
   ['json_stringify', 'var o2 = { a: 1, b: 2, c: 3 };', 's = (s + JSON.stringify(o2).length) | 0;'],
   ['object_keys', 'var o3 = { a: 1, b: 2, c: 3, d: 4 };', 's = (s + Object.keys(o3).length) | 0;'],
+  // The shape-cache twin of `object_keys`: the same enumeration of the same
+  // SHAPE, but the object is fresh every iteration — the identity-keyed
+  // caches can never hit, which is what `Object.keys({...})` inside a loop
+  // (and a spread's `CopyDataProperties`) actually sees.
+  [
+    'object_keys_fresh',
+    '',
+    'var f4 = { a: 1, b: 2, c: 3, d: 4 }; s = (s + Object.keys(f4).length) | 0;',
+  ],
+  // The spread twin of the same pair: `{...fresh}` enumerates its source
+  // through `CopyDataProperties` rather than the `Object.keys` builtin.
+  [
+    'object_spread_fresh',
+    '',
+    'var f5 = { a: 1, b: 2, c: 3, d: 4 }; var g5 = { ...f5 }; s = (s + g5.a) | 0;',
+  ],
 ];
 
 const template = (setup, body) => `// opcost row: one operation inside a bare loop. See gen_opcost.js.

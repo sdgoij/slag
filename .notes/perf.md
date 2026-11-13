@@ -20011,3 +20011,43 @@ two rest-copies is seen by the second.
 `Object.keys`'s identity cache (`enum_key_cells`) is still keyed on the object;
 a *shape*-keyed value list would make a fresh-object `Object.keys` (702 ns, not
 in the corpus today) cost what a hoisted one does. The same gate applies.
+
+## LANDED (2026-11-13): the last identity-keyed enumeration cache, and two corpus rows that measure it
+
+`Agent::enumerable_key_values` (the `Object.keys` cache) was identity-keyed like
+`ForInBegin` and the own-key list were, so a fresh object never hit it:
+`Object.keys` on a fresh 3-key object cost 443 ns against 222 hoisted.
+`EnumKeyShapeCell` (`enum_key_shape_cells`) keys the same boxed key values on the
+live map id with the established gate; a shape hit also fronts the identity cell
+so the next call on that object is a single id + generation compare.
+
+| probe (100k iterations) | before | after | delta |
+|---|---:|---:|---:|
+| `Object.keys(fresh)` | 44.3 | 20.3 | **-54.1%** |
+| `{ ...fresh }` (control) | 16.3 | 16.4 | +0.8% |
+| `opcost/for-in fresh` (control) | 8.13 | 8.14 | +0.0% |
+
+The corpus did not move (`+0.7%`, i.e. noise): **no row enumerated a fresh
+object**, so the two landings before this one had no way to show their own
+effect on the fresh-object path either. Two `opcost` rows now do
+(`gen_opcost.js`, the family's localizer-pair convention):
+
+| row | slag | node | gap |
+|---|---:|---:|---:|
+| `opcost/object_keys_fresh` (the shape cache's twin of `object_keys`) | 22.9 | 9.1 | 2.5x |
+| `opcost/object_spread_fresh` (`CopyDataProperties` on a fresh source) | 17.6 | 0.8 | **20.9x** |
+
+The corpus is therefore **81 rows**, and the 2.0x line moves with it: slag 2112
+ms (81 rows, whole-directory run) against node 718 ms. The 79-row total on the
+same binary is 2032 ms. The second row is the interesting one — `{...o}` inside
+a loop is 21x node even after the own-key list is shared — so the next
+enumeration slice is the copy itself (the result object's build), not the key
+list.
+
+Gates: 79/79 original rows identical in jit, jitless, `--gc-stress` and
+`--nursery-stress` (the two new rows agree with each other in all four modes and
+with node under `bench.js`, 0 mismatches over 81 rows); test262 `language`
+23726, `built-ins` 23821, `annexB` 1086 — 0 fail both modes; workspace tests;
+clippy; fmt. One new unit test pins the shape-shared `Object.keys` list
+(inherited/non-enumerable/symbol exclusion, a delete and an add between
+objects, and a function's non-enumerable own keys).

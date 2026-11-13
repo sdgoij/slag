@@ -1766,6 +1766,47 @@ mod tests {
         );
     }
 
+    /// `Object.keys` serves a plain object's key list from a cache keyed on the
+    /// object's SHAPE too, so a fresh object on a known shape must get its own
+    /// keys — not the previous object's — including the enumerability and
+    /// index-order rules, and a function's non-enumerable own keys must not
+    /// leak in.
+    #[test]
+    fn a_shape_cached_object_keys_list_serves_a_fresh_object() {
+        let observed = run("var proto = { inherited: 1 };\
+             var sym = Symbol('s');\
+             var out = [];\
+             for (var i = 0; i < 2; i++) {\
+               var o = Object.create(proto);\
+               o.a = i;\
+               o.b = i + 1;\
+               o[sym] = 1;\
+               Object.defineProperty(o, 'hidden', { value: 1, enumerable: false });\
+               out.push(Object.keys(o).join(','));\
+             }\
+             var p1 = { x: 1, y: 2 };\
+             var p2 = { x: 3, y: 4 };\
+             out.push(Object.keys(p1).join(','));\
+             out.push(Object.keys(p2).join(','));\
+             delete p2.y;\
+             out.push(Object.keys(p2).join(','));\
+             p1.z = 5;\
+             out.push(Object.keys(p1).join(','));\
+             function f1() {}\
+             function f2() {}\
+             f1.a = 1;\
+             f2.a = 2;\
+             out.push(Object.keys(f1).join(','));\
+             out.push(Object.keys(f2).join(','));\
+             out.push(Object.keys({ 2: 'a', b: 1, 1: 'c' }).join());\
+             JSON.stringify(out)")
+        .unwrap();
+        assert_eq!(
+            observed,
+            str("[\"a,b\",\"a,b\",\"x,y\",\"x,y\",\"x\",\"x,y,z\",\"a\",\"a\",\"1,2,b\"]")
+        );
+    }
+
     #[test]
     fn constructor_makes_fresh_objects_and_boxes() {
         // `Object()` and `Object(null/undefined)` make fresh objects; an

@@ -951,6 +951,11 @@ pub(crate) struct AgentRoots {
     /// ready-made values, so `Object.keys` on a stable object allocates only
     /// the result array. Boxed per the Cut 27 lesson.
     pub(crate) enum_key_cells: RefCell<Box<[EnumKeyCacheCell; crate::ir::ENUM_KEY_CELLS]>>,
+    /// The same enumerable-key values keyed by base SHAPE (live map id):
+    /// `Object.keys` on a fresh object inside a loop — see
+    /// [`crate::ir::EnumKeyShapeCell`].
+    pub(crate) enum_key_shape_cells:
+        RefCell<Box<[Option<crate::ir::EnumKeyShapeCell>; crate::ir::ENUM_KEY_CELLS]>>,
     /// The IC value cells, in the roots like the rest of the traced state.
     /// They are `Cell`s (not `RefCell`s): the payloads are `Copy`, so a read
     /// is a load and a write a store, with no borrow flag on the hot path.
@@ -1445,6 +1450,7 @@ impl AgentRoots {
             leaf_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             same_stack_cache: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             enum_key_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            enum_key_shape_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             member_value_cells: std::array::from_fn(|_| {
                 Cell::new(crate::ir::MemberValueCell::empty())
             }),
@@ -1652,6 +1658,9 @@ impl Trace for AgentRoots {
         for cell in self.own_keys_shape_cells.borrow().iter().flatten() {
             cell.trace(visit);
         }
+        for cell in self.enum_key_shape_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
         for value in self.type_strings.borrow().iter().flatten() {
             value.trace(visit);
         }
@@ -1683,6 +1692,9 @@ impl Trace for AgentRoots {
             entry.trace(visit);
         }
         for cell in self.enum_key_cells.borrow().iter().flatten() {
+            cell.trace(visit);
+        }
+        for cell in self.enum_key_shape_cells.borrow().iter().flatten() {
             cell.trace(visit);
         }
         // The IC value caches hold Values; the index-only caches re-resolve
@@ -3541,6 +3553,11 @@ impl Agent {
     /// but reading *keys* runs no user code at all, so nothing can mutate the
     /// object between the validation and the array build. `values`/`entries`
     /// run getters and must keep re-reading enumerability per key.
+    ///
+    /// A fresh object can never hit the identity cell, so the shape cell
+    /// (`described_shape_map`) is probed next: the key list is a function of the
+    /// live map, and the boxed strings are immutable, so one build serves every
+    /// object on that shape.
     pub(crate) fn enumerable_key_values(
         &mut self,
         object: &Handle<crux::object::JsObject>,
@@ -3558,6 +3575,27 @@ impl Agent {
                 return Some(cell.keys.clone());
             }
         }
+        let shape_map = crate::ir::described_shape_map(object);
+        if let Some(map_id) = shape_map {
+            let slot = map_id as usize & (crate::ir::ENUM_KEY_CELLS - 1);
+            let cached = {
+                let cells = self.roots.enum_key_shape_cells.borrow();
+                match cells[slot].as_ref() {
+                    Some(cell) if cell.map_id == map_id => Some(cell.keys.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(keys) = cached {
+                // Front the identity cell too: the next call on THIS object is
+                // then one id + generation compare.
+                self.roots.enum_key_cells.borrow_mut()[index] = Some(crate::ir::EnumKeyCell {
+                    id,
+                    generation,
+                    keys: keys.clone(),
+                });
+                return Some(keys);
+            }
+        }
         let props = object.own_string_props()?;
         // GC-2: the values accumulate in a local `Vec` the stack scan cannot
         // see while the next `Handle::new` allocates.
@@ -3572,6 +3610,14 @@ impl Agent {
             })
             .collect();
         let keys: std::rc::Rc<[Value]> = keys.into();
+        if let Some(map_id) = shape_map {
+            let slot = map_id as usize & (crate::ir::ENUM_KEY_CELLS - 1);
+            self.roots.enum_key_shape_cells.borrow_mut()[slot] =
+                Some(crate::ir::EnumKeyShapeCell {
+                    map_id,
+                    keys: keys.clone(),
+                });
+        }
         self.roots.enum_key_cells.borrow_mut()[index] = Some(crate::ir::EnumKeyCell {
             id,
             generation,
@@ -4473,6 +4519,12 @@ impl Agent {
             *cell = None;
         }
         for cell in self.roots.own_keys_shape_cells.borrow_mut().iter_mut() {
+            *cell = None;
+        }
+        for cell in self.roots.enum_key_shape_cells.borrow_mut().iter_mut() {
+            *cell = None;
+        }
+        for cell in self.roots.enum_key_cells.borrow_mut().iter_mut() {
             *cell = None;
         }
     }

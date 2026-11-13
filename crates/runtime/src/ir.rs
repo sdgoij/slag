@@ -3087,7 +3087,7 @@ impl Trace for ForInShapeCache {
 /// gate: a property the map does not describe (past `INLINE_FIELDS`, or a
 /// define whose attributes could not transition) leaves the vector longer
 /// than the map, and such an object must take the exact path.
-fn for_in_shape_map(obj: &Handle<crux::object::JsObject>) -> Option<u64> {
+pub(crate) fn described_shape_map(obj: &Handle<crux::object::JsObject>) -> Option<u64> {
     if !matches!(obj.kind, crux::object::ObjectKind::Ordinary) {
         return None;
     }
@@ -3140,7 +3140,7 @@ pub(crate) fn for_in_keys(
     obj: &Handle<crux::object::JsObject>,
     rhs: &Value,
 ) -> Result<ForInKeys, JsError> {
-    if let Some(map_id) = for_in_shape_map(obj) {
+    if let Some(map_id) = described_shape_map(obj) {
         if let Some(keys) = for_in_shape_keys(agent, obj, map_id)? {
             return Ok(keys);
         }
@@ -3219,12 +3219,12 @@ fn own_keys_shape_slot(map_id: u64) -> usize {
 }
 
 /// `obj`'s own key list, through the shape cache when the object's live map
-/// describes its own keys exactly (see [`for_in_shape_map`]).
+/// describes its own keys exactly (see [`described_shape_map`]).
 pub(crate) fn own_keys_cached(
     agent: &Agent,
     obj: &Handle<crux::object::JsObject>,
 ) -> Result<std::rc::Rc<Vec<crux::property::PropertyKey>>, JsError> {
-    let Some(map_id) = for_in_shape_map(obj) else {
+    let Some(map_id) = described_shape_map(obj) else {
         return Ok(std::rc::Rc::new(obj.own_property_keys()?));
     };
     let slot = own_keys_shape_slot(map_id);
@@ -3829,6 +3829,23 @@ impl Trace for EnumKeyCell {
 
 /// The enumerable-key cache size (a direct-mapped table over object ids).
 pub(crate) const ENUM_KEY_CELLS: usize = 64;
+
+/// The same enumerable-key values keyed by the base's SHAPE (live map id)
+/// instead of its identity: the identity cell above can never hit for a fresh
+/// object, which is what `Object.keys` sees inside a loop. The gate and the
+/// soundness argument are [`described_shape_map`]'s.
+pub(crate) struct EnumKeyShapeCell {
+    pub map_id: u64,
+    pub keys: std::rc::Rc<[Value]>,
+}
+
+impl Trace for EnumKeyShapeCell {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for key in self.keys.iter() {
+            key.trace(visit);
+        }
+    }
+}
 
 /// A cached same-stack record: everything `try_push_inline_call` reads out of
 /// the `ecma_functions` map, resolved once per body. A body enters this table
