@@ -19452,3 +19452,44 @@ The per-element callback in the array iterators is not taking a fast lane: it
 falls through to `do_call_fast`, the interpreter funnel, for *every* element.
 That is the builtin-entry item (W5) with a named mechanism, and it is where
 `let`-style callback rows spend two thirds of their time.
+
+## LANDED (2026-11-13): a callback loop keeps its run registration and its leaf
+
+`CallbackVm` re-derived the callee and re-registered the pooled Vm for *every*
+element: a `leaf_lookup` probe, an `Rc` bump, a rebind, and a push/pop pair on
+`ACTIVE_RUNS` (two thread-local borrows). A loop calls one function value with
+one running environment, so none of that can change between elements.
+
+- The run registration moves to `LeafRunGuard` (ir.rs) and stays open for the
+  loop: the Vm is the same and its stack is empty between elements, so one
+  entry covers them all. A changed callee only repoints `ActiveRun::body`, the
+  same way a tail call already updates it. The guard drops in
+  `CallbackVm::finish` (and on the error path) before the Vm returns to the
+  pool — a pooled Vm must never look like an active run.
+- `CallbackLeaf` caches `(callee id, LeafEntry)` for the loop.
+
+Min-of-4 interleaved, same `iter` profile, one row per process:
+
+| row | parent | new | delta |
+|---|---:|---:|---:|
+| `arrays/hof_methods` | 28.12 | 21.31 | **-24.2%** |
+| `opcost/array_for_each` | 34.51 | 25.14 | **-27.2%** |
+| `opcost/map_for_each` | 32.41 | 26.00 | **-19.8%** |
+| `opcost/typed_array_for_each` | 34.30 | 29.47 | **-14.1%** |
+
+Results identical (79/79) in jit and jitless, and on the four rows under
+`--gc-stress`, `--nursery-stress` and `--gc-stress --gc-verify`: the change is
+GC-visible (it moves a root registration), so those are the gates that matter.
+
+## LANDED (2026-11-13): a dense Array reads its length from the cell
+
+`length_of_array_like` — the prologue of every array builtin (48 call sites) —
+did the generic `[[Get]]` of `"length"`: a `JsString` build, a prototype-chain
+walk, and a `ToNumber`. A genuine dense Array's length cell is authoritative
+(dense keeps the mirror in step — see `write_length_mirror`), so it now reads
+the cell when the receiver is one.
+
+Empty-array `forEach` loop (entry cost only, 100k calls): **8.43 -> 5.75 ms
+(-31.7%)**, min-of-4 interleaved. On top of the callback landing the same
+binary reads `hof_methods` 21.31, `array_for_each` 25.14, `map_for_each` 26.00,
+`typed_array_for_each` 29.47.

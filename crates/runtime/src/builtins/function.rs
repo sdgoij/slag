@@ -450,6 +450,18 @@ fn call_method(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value,
 #[derive(Default)]
 pub(crate) struct CallbackVm {
     vm: Option<Box<crate::ir::Vm>>,
+    leaf: CallbackLeaf,
+}
+
+/// A callback loop's reusable leaf state. Every element dispatches the same
+/// callee value with the same running environment, so the entry the leaf probe
+/// would re-derive is kept here, and the loop's GC registration (which roots
+/// the pooled Vm and its body for a collection) stays open across elements
+/// instead of being pushed and popped per call.
+#[derive(Default)]
+struct CallbackLeaf {
+    entry: Option<(u64, crate::ir::LeafEntry)>,
+    run: Option<crate::ir::LeafRunGuard>,
 }
 
 impl CallbackVm {
@@ -466,7 +478,7 @@ impl CallbackVm {
         // The leaf probe comes first: it is the lane every JS callback takes,
         // so the native probe stays off that path. A builtin callee pays it
         // once and fails on the `EcmaScript` gate.
-        match try_leaf_call_reusing(agent, &mut self.vm, callee, this, args) {
+        match try_leaf_call_cached(agent, &mut self.vm, &mut self.leaf, callee, this, args) {
             Some(result) => result,
             None => match try_builtin_call(agent, callee, this, args) {
                 Some(result) => result,
@@ -493,6 +505,9 @@ impl CallbackVm {
     /// the common completion. The slot only ever holds a Vm whose last leaf
     /// run completed, so the cheap cleanup applies.
     pub(crate) fn finish(&mut self, agent: &mut Agent) {
+        // Drop the loop's registration before the Vm returns to the pool: a
+        // pooled Vm is not an active run, and the tracer follows both pointers.
+        self.leaf = CallbackLeaf::default();
         if let Some(vm) = self.vm.take() {
             agent.return_leaf_vm(vm);
         }
@@ -579,20 +594,26 @@ pub(crate) fn try_leaf_call(
     arg_list: &[Value],
 ) -> Option<Result<Value, JsError>> {
     let mut slot = None;
-    let result = try_leaf_call_reusing(agent, &mut slot, func, this_arg, arg_list);
+    let mut leaf = CallbackLeaf::default();
+    let result = try_leaf_call_cached(agent, &mut slot, &mut leaf, func, this_arg, arg_list);
+    // Release the run registration before the Vm goes back to the pool.
+    leaf.run = None;
     if let Some(vm) = slot.take() {
         agent.return_leaf_vm(vm);
     }
     result
 }
 
-/// `try_leaf_call` with the Vm held by the caller: `slot` carries a Vm across
-/// calls, and a successful run leaves it in `slot` again for the next one. On
-/// an error the Vm goes back to the pool through the full reset, because an
-/// unwind may leave the value stack past the call site.
-fn try_leaf_call_reusing(
+/// `try_leaf_call` with the Vm and the resolved entry held by the caller: `slot`
+/// carries a Vm across calls and a successful run leaves it in `slot` again, and
+/// `leaf` carries the entry for the callee the previous call used. On an error
+/// the Vm goes back to the pool through the full reset, because an unwind may
+/// leave the value stack past the call site.
+#[allow(clippy::too_many_arguments)]
+fn try_leaf_call_cached(
     agent: &mut Agent,
     slot: &mut Option<Box<crate::ir::Vm>>,
+    leaf: &mut CallbackLeaf,
     func: &Value,
     this_arg: Value,
     arg_list: &[Value],
@@ -610,12 +631,23 @@ fn try_leaf_call_reusing(
     if !matches!(function.kind, crux::function::FunctionKind::EcmaScript) {
         return None;
     }
-    let entry = agent.leaf_lookup(function.id())?;
-    let entry = crate::ir::LeafEntry {
-        ir: entry.ir.clone(),
-        strict: entry.strict,
-        environment: entry.environment,
-        construct_inline: false,
+    // A loop's callee is one function value, so the previous element's entry
+    // is the answer here: the probe, the `Rc` bump and the entry clone are
+    // paid once per loop instead of once per element.
+    let id = function.id();
+    let entry = match &leaf.entry {
+        Some((cached_id, entry)) if *cached_id == id => entry.clone(),
+        _ => {
+            let entry = agent.leaf_lookup(id)?;
+            let entry = crate::ir::LeafEntry {
+                ir: entry.ir,
+                strict: entry.strict,
+                environment: entry.environment,
+                construct_inline: false,
+            };
+            leaf.entry = Some((id, entry.clone()));
+            entry
+        }
     };
     let env = {
         let Ok(context) = agent.running_context() else {
@@ -634,16 +666,24 @@ fn try_leaf_call_reusing(
     // stack, which the precise tracer cannot see — register the Vm as an
     // active run for the whole leaf window (the pushes and the body), so
     // a budget collection inside the body traces it exactly like
-    // `run_inner`.
-    let result = crate::ir::with_leaf_run(&mut *vm, std::rc::Rc::as_ptr(&entry.ir), || {
+    // `run_inner`. A loop keeps the registration open across elements (the
+    // stack is empty between them), and only re-points it when the callee
+    // changes.
+    let body = std::rc::Rc::as_ptr(&entry.ir);
+    match &mut leaf.run {
+        Some(run) => run.retarget(body),
+        none => *none = Some(crate::ir::LeafRunGuard::open(&mut *vm, body)),
+    }
+    let argc = arg_list.len();
+    let result = {
         vm.stack.push(this_arg);
         vm.stack.push(*func);
         vm.stack.extend_from_slice(arg_list);
         // The entry is already resolved: run its leaf arm directly instead of
         // `do_call_fast`, which would re-derive the same entry (a second
         // `leaf_lookup`) and re-run the call-site gate on every element.
-        vm.run_leaf_entry(agent, arg_list.len(), this_arg, entry, 2)
-    })
+        vm.run_leaf_entry(agent, argc, this_arg, entry, 2)
+    }
     .and_then(|()| {
         vm.stack.pop().ok_or_else(|| {
             JsError::new(
@@ -654,7 +694,13 @@ fn try_leaf_call_reusing(
     });
     match &result {
         Ok(_) => *slot = Some(vm),
-        Err(_) => agent.return_vm(vm),
+        Err(_) => {
+            // The Vm goes back to the pool through the full reset, and a
+            // pooled Vm must not stay registered as an active run.
+            leaf.entry = None;
+            leaf.run = None;
+            agent.return_vm(vm);
+        }
     }
     Some(result)
 }

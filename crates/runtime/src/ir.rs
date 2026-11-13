@@ -4146,18 +4146,50 @@ pub(crate) fn with_jit_run<T>(vm: &Vm, body: &CompiledBody, f: impl FnOnce() -> 
     f()
 }
 
-/// Root a pooled Vm running a leaf body for the duration of `f` (GC-2):
-/// the builtins' leaf fast path (`apply`/`call`) runs a certified leaf on
-/// a Vm taken from the pool — a buffer its `stack` holds that the precise
-/// tracer cannot see — so a budget collection inside the body must trace
-/// it exactly like `run_inner` would. `vm`/`body` are raw pointers (the
-/// caller owns both for the call; `body` is the leaf's `Rc<CompiledBody>`).
-pub(crate) fn with_leaf_run<T>(vm: *mut Vm, body: *const CompiledBody, f: impl FnOnce() -> T) -> T {
-    ACTIVE_RUNS.with(|stack| {
-        stack.borrow_mut().push(ActiveRun { vm, body });
-    });
-    let _guard = ActiveRunGuard;
-    f()
+/// An `ACTIVE_RUNS` registration held open for a leaf's window: the builtins'
+/// leaf fast path (`apply`/`call`) runs a certified leaf on a Vm taken from
+/// the pool — a buffer its `stack` holds that the precise tracer cannot see —
+/// so a budget collection inside the body must trace it exactly like
+/// `run_inner` would. A callback loop keeps one registration open across its
+/// elements (`crate::builtins::function::CallbackVm`): the Vm is the same and
+/// its stack is empty between calls, so the per-element push/pop pair (which
+/// measured ~14 ns of a ~75 ns callback) is not worth paying.
+///
+/// The guard must be dropped before its Vm is returned to the pool —
+/// `trace_active_vms` follows both pointers.
+pub(crate) struct LeafRunGuard {
+    vm: *const Vm,
+}
+
+impl LeafRunGuard {
+    /// Register `vm` as running `body` until the guard drops.
+    pub(crate) fn open(vm: *mut Vm, body: *const CompiledBody) -> Self {
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().push(ActiveRun { vm, body });
+        });
+        Self { vm }
+    }
+
+    /// Repoint the registration at another leaf body (the loop's callee
+    /// changed). The entry is the top of the stack here: a run this guard
+    /// covers has returned, and a nested run has popped its own entry.
+    pub(crate) fn retarget(&mut self, body: *const CompiledBody) {
+        ACTIVE_RUNS.with(|stack| {
+            let mut runs = stack.borrow_mut();
+            match runs.last_mut() {
+                Some(last) if std::ptr::eq(last.vm, self.vm) => last.body = body,
+                _ => debug_assert!(false, "a leaf run guard must be the top ACTIVE_RUNS entry"),
+            }
+        });
+    }
+}
+
+impl Drop for LeafRunGuard {
+    fn drop(&mut self) {
+        ACTIVE_RUNS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
 }
 
 /// Pops the `ACTIVE_RUNS` entry on every exit path, including unwinding.
