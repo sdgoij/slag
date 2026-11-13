@@ -3592,6 +3592,16 @@ pub const GLOBAL_CELLS: usize = 256;
 /// path).
 pub(crate) const LEAF_CACHE: usize = 256;
 
+/// One atom→boxed-string cache cell: the atom it holds and the box its string
+/// was materialized into (see `Agent::atom_string_value`).
+pub(crate) type AtomStringCell = std::cell::Cell<Option<(crux::AtomId, crux::Value)>>;
+
+/// The direct-mapped atom→boxed-string cells (see
+/// [`crate::agent::Agent::atom_string_value`]): `SetFunctionName` and
+/// object-literal naming spell the same name on every evaluation of a site,
+/// and each one boxed a fresh `JsString` for it.
+pub(crate) const ATOM_STRING_CELLS: usize = 64;
+
 /// One enumerable-key cache cell: the object it was filled for, the generation
 /// it was filled at, and that object's enumerable own string keys as
 /// ready-made JS values.
@@ -10398,10 +10408,15 @@ impl Vm {
             AssignOp::Assign => {
                 let value = self.pop();
                 if set_name {
+                    let name_value = agent.atom_string_value(name);
                     let display =
                         crate::function::default_binding_display_name(Some(crux::lookup(name)))
                             .unwrap_or_else(|| crux::lookup(name));
-                    crate::function::set_function_name(&value, &display, None)?;
+                    if display == crux::lookup(name) {
+                        crate::function::set_function_name_value(&value, name_value)?;
+                    } else {
+                        crate::function::set_function_name(&value, &display, None)?;
+                    }
                 }
                 crate::context::put_value(agent, &reference, value)?;
                 self.stack.push(value);

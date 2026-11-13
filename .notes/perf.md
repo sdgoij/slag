@@ -19764,3 +19764,57 @@ load-symmetric):
 
 (The last three commits are the `typeof` cache, the root-wrapper skip and the
 one-buffer serializer, in that order.)
+
+## LANDED (2026-11-13): a closure's boxes, counted — and the name string shared
+
+The allocation census (a throwaway `SLAG_ALLOC_CENSUS` hook, since removed) named
+the boxes a closure actually creates. 200,000 closures in a loop:
+
+| shape | boxes per closure |
+|---|---|
+| anonymous (`take(function(){})`) | `Function` + `JsObject` |
+| named by its target (`f = function(){}`) | `Function` + `JsObject` + **1 `JsString`** |
+| named function expression (`f = function g(){}`) | +1 `EnvRecord` (the self-binding scope) |
+| arrow (`f = () => 1`) | `Function` + `JsObject` + 1 `JsString` |
+
+So the third box is the **display name**, boxed fresh at every creation: the
+closure's own `name` placeholder (`""`, from `set_function_properties_batched`)
+or the `SetFunctionName` that names it after its binding/key.
+
+Two caches remove it:
+
+- `Agent::empty_string_value`: one boxed `""` for the whole agent (an anonymous
+  function's `name`), traced like the `typeof` strings.
+- `Agent::atom_string_value`: a direct-mapped `atom → boxed Value` cell (64
+  slots, evicting), because `SetFunctionName`'s name is a compile-time atom —
+  the same string at every evaluation of the site. `set_function_name` split into
+  `set_function_name` (boxes) and `set_function_name_value` (takes the box), and
+  the two hot naming sites (`Step::SetFunctionName`, `AssignIdent` with
+  `set_name`) use the cache.
+
+| probe | before | after | delta |
+|---|---:|---:|---:|
+| closure as an argument (unnamed, 200k) | 88.89 | 78.23 | **-12.0%** |
+| `{ p: function () {} }` | 198.48 | 190.94 | -3.8% |
+| `f = function () {}` (named) | 89.57 | 88.43 | -1.3% |
+| `f = () => 1` | 79.69 | 82.67 | +3.7% |
+| `for-in/head-let-fresh-binding` | 795.59 | 755.96 | -5.0% |
+
+(min-of-5 interleaved, `iter`, one row per process. The named-closure and arrow
+rows are inside the load band — the *measurable* case is the unnamed one, which
+is the box the empty-string cache removes.)
+
+Gates: corpus results identical 79/79 in jit, jitless, `--gc-stress` and
+`--nursery-stress`; `language/expressions/function` 264/264,
+`expressions/assignmenttargettype` 324/324, `*function-name*` 34/34,
+`built-ins/Function` 509/509; runtime 1152, crux 283, jit 380; clippy + fmt clean.
+
+### Still open on the closure path
+
+The named-closure string (the `f = function(){}` shape, and an object literal's
+key-named method) still boxes: the name reaches `register_function` as a
+`JsString` inside `Step::CreateFunction { named }`, so the atom is not available
+where the box is made. Carrying the atom in the step (or a pre-boxed `Value`,
+boxed once at compile time) would remove it; the computed-key case
+(`fns[x] = function(){}`, which is what `head-let` does) derives its name from a
+runtime key string and needs the key's own box reused instead.

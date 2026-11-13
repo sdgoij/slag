@@ -918,6 +918,14 @@ pub(crate) struct AgentRoots {
     /// every evaluation of the step used to box the same five-to-nine
     /// character constant into the arena: one allocation per `typeof`.
     pub(crate) type_strings: RefCell<[Option<Value>; 8]>,
+    /// The boxed empty string. Every anonymous function's `name` property is
+    /// `""`, and a closure used to box a fresh one per creation.
+    pub(crate) empty_string: std::cell::Cell<Option<Value>>,
+    /// The boxed value of an atom's string, direct-mapped (see
+    /// `Agent::atom_string_value`): naming a closure after its binding or its
+    /// object-literal key occurs once per evaluation, and the name is the same
+    /// atom every time.
+    pub(crate) atom_string_cells: Box<[crate::ir::AtomStringCell; crate::ir::ATOM_STRING_CELLS]>,
     /// The leaf-inline cache (Cut 34): function id → the record data
     /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
@@ -1414,6 +1422,8 @@ impl AgentRoots {
             spread_cells: std::array::from_fn(|_| Cell::new(None)),
             for_in_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             type_strings: RefCell::new(std::array::from_fn(|_| None)),
+            empty_string: std::cell::Cell::new(None),
+            atom_string_cells: Box::new(std::array::from_fn(|_| std::cell::Cell::new(None))),
             array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
@@ -1624,6 +1634,14 @@ impl Trace for AgentRoots {
         }
         for value in self.type_strings.borrow().iter().flatten() {
             value.trace(visit);
+        }
+        if let Some(value) = self.empty_string.get() {
+            value.trace(visit);
+        }
+        for cell in self.atom_string_cells.iter() {
+            if let Some((_, value)) = cell.get() {
+                value.trace(visit);
+            }
         }
         for cell in self.global_leaf_cells.borrow().iter().flatten() {
             cell.trace(visit);
@@ -3670,6 +3688,40 @@ impl Agent {
     /// answer does not depend on which execution context happens to be running.
     pub fn first_realm(&self) -> Option<Handle<Realm>> {
         self.roots.realms.borrow().first().copied()
+    }
+
+    /// The boxed value for an atom's string. `SetFunctionName` (an assignment's
+    /// NamedEvaluation) and object-literal naming spell the same name at every
+    /// evaluation of a site, and each one boxed a fresh `JsString` for it — one
+    /// allocation per named closure.
+    ///
+    /// The cell holds the box, so it is traced like any other cached value; a
+    /// collision simply drops the old entry (the box stays alive while anything
+    /// else references it).
+    pub(crate) fn atom_string_value(&self, atom: crux::AtomId) -> Value {
+        let index = (atom as usize).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            & (crate::ir::ATOM_STRING_CELLS - 1);
+        let cell = &self.roots.atom_string_cells[index];
+        if let Some((cached, value)) = cell.get()
+            && cached == atom
+        {
+            return value;
+        }
+        let value = Value::String(Handle::new(crux::lookup(atom)));
+        cell.set(Some((atom, value)));
+        value
+    }
+
+    /// The boxed empty string, shared by every `Value` that spells `""`: an
+    /// anonymous function's `name` is the common one, and a closure creation
+    /// boxed a fresh copy of it.
+    pub(crate) fn empty_string_value(&self) -> Value {
+        if let Some(cached) = self.roots.empty_string.get() {
+            return cached;
+        }
+        let boxed = Value::String(Handle::new(crux::JsString::from_utf8("")));
+        self.roots.empty_string.set(Some(boxed));
+        boxed
     }
 
     /// The boxed `typeof` result for `value` (spec 13.5.3.2), from this

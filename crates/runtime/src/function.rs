@@ -673,9 +673,12 @@ fn set_function_properties_batched(
     let Some(map) = function_boilerplate_map(agent, restricted) else {
         return false;
     };
-    let name_value = Value::String(Handle::new(
-        name.cloned().unwrap_or_else(|| JsString::from_utf8("")),
-    ));
+    // An anonymous function's `name` is `""`, which is the same string for
+    // every closure in the program: one boxed value serves them all.
+    let name_value = match name {
+        Some(name) => Value::String(Handle::new(name.clone())),
+        None => agent.empty_string_value(),
+    };
     let mut values = [Value::Undefined; 4];
     values[0] = Value::Number(function_length(params) as f64);
     values[1] = name_value;
@@ -733,38 +736,58 @@ pub fn set_function_name(
     name: &JsString,
     prefix: Option<&str>,
 ) -> Result<(), JsError> {
-    let ValueKind::Function(function) = function.kind() else {
-        return Ok(());
-    };
-    let own = function
-        .object
-        .get_own_property_key(&crux::property::PropertyKey::from_utf8("name"))?;
-    // SetFunctionName only runs on functions without a real own `name`: a
-    // freshly created function carries the "" placeholder, a bound function
-    // carries no own `name` at all. A non-empty own `name` (a static `name`
-    // element on a class constructor, which wins over the surrounding binding
-    // per ClassDefinitionEvaluation) is left alone. The own descriptor is
-    // inspected rather than the value so a static accessor named `name` is
-    // never executed.
-    let placeholder = match own {
-        None => true,
-        Some(crux::object::Property {
-            kind: crux::object::PropertyKind::Data { value, .. },
-            ..
-        }) => value.as_string().is_some_and(|s| s.is_empty()),
-        _ => false,
-    };
-    if !placeholder {
+    if !function_name_is_placeholder(function)? {
         return Ok(());
     }
     let name = match prefix {
         Some(prefix) => JsString::from_utf8(&format!("{prefix} {}", name.to_string_lossy())),
         None => name.clone(),
     };
+    define_function_name(function, Value::String(Handle::new(name)))
+}
+
+/// [`set_function_name`] with the name's boxed value in hand. The hot naming
+/// sites (an assignment's and an object-literal key's NamedEvaluation) spell a
+/// compile-time atom, whose box the agent caches — boxing it once per closure
+/// was an allocation on the closure-creation path.
+pub fn set_function_name_value(function: &Value, name_value: Value) -> Result<(), JsError> {
+    if !function_name_is_placeholder(function)? {
+        return Ok(());
+    }
+    define_function_name(function, name_value)
+}
+
+/// Whether SetFunctionName may rename `function` (spec 15.2.3.10 step 1: only a
+/// function whose own `name` is still the `""` placeholder, or which has none at
+/// all). The own descriptor is inspected rather than the value so a static
+/// accessor named `name` is never executed, and a non-empty own `name` (a static
+/// `name` element on a class constructor, which wins over the surrounding
+/// binding per ClassDefinitionEvaluation) is left alone.
+fn function_name_is_placeholder(function: &Value) -> Result<bool, JsError> {
+    let ValueKind::Function(function) = function.kind() else {
+        return Ok(false);
+    };
+    let own = function
+        .object
+        .get_own_property_key(&crux::property::PropertyKey::from_utf8("name"))?;
+    Ok(match own {
+        None => true,
+        Some(crux::object::Property {
+            kind: crux::object::PropertyKind::Data { value, .. },
+            ..
+        }) => value.as_string().is_some_and(|s| s.is_empty()),
+        _ => false,
+    })
+}
+
+fn define_function_name(function: &Value, name_value: Value) -> Result<(), JsError> {
+    let ValueKind::Function(function) = function.kind() else {
+        return Ok(());
+    };
     function.define_property(
         &JsString::from_utf8("name"),
         &PropertyDescriptor {
-            value: Some(Value::String(Handle::new(name))),
+            value: Some(name_value),
             writable: Some(false),
             get: None,
             set: None,

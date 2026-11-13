@@ -2633,10 +2633,20 @@ impl Vm {
             }
             Step::SetFunctionName { name } => {
                 let value = self.pop();
-                let display =
-                    crate::function::default_binding_display_name(Some(crux::lookup(*name)))
-                        .unwrap_or_else(|| crux::lookup(*name));
-                crate::function::set_function_name(&value, &display, None)?;
+                let raw = crux::lookup(*name);
+                let display = crate::function::default_binding_display_name(Some(raw.clone()))
+                    .unwrap_or_else(|| raw.clone());
+                if display == raw {
+                    // The name is this site's atom: its box is shared, where
+                    // boxing it per evaluation was one allocation per named
+                    // closure.
+                    crate::function::set_function_name_value(
+                        &value,
+                        agent.atom_string_value(*name),
+                    )?;
+                } else {
+                    crate::function::set_function_name(&value, &display, None)?;
+                }
                 self.stack.push(value);
             }
             Step::UpdateMemberName { name, op, prefix } => {
