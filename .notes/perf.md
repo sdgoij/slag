@@ -19345,3 +19345,20 @@ any program that hits that shape rather than adding corpus speed.
 Gates run: `cargo test -p jit -p runtime` (380 / 1151 green), `clippy
 --workspace --all-targets -D warnings` clean, corpus results identical in jit
 and jitless. **Pending:** test262 `language`/`built-ins`/`annexB` sweeps.
+
+## LANDED (2026-11-12): one resume-handler pair per async call, released on settle
+
+`make_resume_handler` built two callables plus two `async_resume` inserts for
+**every await** — 637 ns of `attach_await`'s 1826 on `scratch/row/ac500`, paid
+per iteration of an awaiting loop. They are keyed by `(state, is_reject)` and
+never exposed, and `dispatch_resume` keeps its entry for the handler's
+lifetime, so one pair per `AsyncFunctionState` serves every await of a call.
+
+`settle_async_completion` now removes the pair. `dispatch_resume` never removed
+its entry, so every *completed* async call held its whole state (Vm, promise,
+body, environment) alive through `async_resume` for the process's life; the
+pair being reused makes two removals cover the call.
+
+Verified: `cargo check`, `cargo test -p runtime --lib` 1151/1151.
+**Not measured** — no release build was run, so the effect on `ac500` and the
+corpus is unproven and must be measured before it is claimed.

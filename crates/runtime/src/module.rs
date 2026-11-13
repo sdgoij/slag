@@ -1850,6 +1850,8 @@ fn execute_module_body(
         resolve,
         reject,
         module: Some(*module),
+        resume_ok: None,
+        resume_err: None,
     }));
     let mut state_ref = state.borrow_mut();
     let body = state_ref.body.clone();

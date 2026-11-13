@@ -35,6 +35,15 @@ pub struct AsyncFunctionState {
     pub resolve: Value,
     pub reject: Value,
     pub module: Option<crux::handle::Handle<crate::module::SourceTextModule>>,
+    /// The (onFulfilled, onRejected) resume handlers, built once per async call
+    /// rather than once per await. They are keyed by (this state, is_reject)
+    /// and are never exposed to user code, so a body that awaits in a loop
+    /// reuses one pair; `dispatch_resume` keeps the `async_resume` entry for the
+    /// function's lifetime, so a reused handler still resolves. Building the
+    /// pair costs two callable objects plus two table inserts (~640 ns measured
+    /// on `scratch/row/ac500`), and every await paid it.
+    pub resume_ok: Option<Value>,
+    pub resume_err: Option<Value>,
 }
 
 impl Trace for AsyncFunctionState {
@@ -45,6 +54,8 @@ impl Trace for AsyncFunctionState {
         self.resolve.trace(visit);
         self.reject.trace(visit);
         self.module.trace(visit);
+        self.resume_ok.trace(visit);
+        self.resume_err.trace(visit);
         // The compiled body's steps embed literal `Value`s; while suspended
         // at an await the body is no longer in the active-run stack, so the
         // state must root it (GC-2).
@@ -232,6 +243,8 @@ pub fn call_async_function(
                 resolve: capability.resolve,
                 reject: capability.reject,
                 module: None,
+                resume_ok: None,
+                resume_err: None,
             }));
             if state.borrow().body.scope.is_some() {
                 // The saved context is re-pushed on resume — its lexical
@@ -341,8 +354,24 @@ pub(crate) fn attach_await(
         .get("%Promise%")
         .unwrap_or(Value::Undefined);
     let promise = crate::promise::promise_resolve(agent, &promise_ctor, value)?;
-    let on_fulfilled = make_resume_handler(agent, state.clone(), false)?;
-    let on_rejected = make_resume_handler(agent, state.clone(), true)?;
+    let cached = {
+        let state = state.borrow();
+        match (state.resume_ok, state.resume_err) {
+            (Some(ok), Some(err)) => Some((ok, err)),
+            _ => None,
+        }
+    };
+    let (on_fulfilled, on_rejected) = match cached {
+        Some(pair) => pair,
+        None => {
+            let ok = make_resume_handler(agent, state.clone(), false)?;
+            let err = make_resume_handler(agent, state.clone(), true)?;
+            let mut state = state.borrow_mut();
+            state.resume_ok = Some(ok);
+            state.resume_err = Some(err);
+            (ok, err)
+        }
+    };
     crate::promise::perform_promise_then(
         agent,
         &promise,
@@ -351,6 +380,26 @@ pub(crate) fn attach_await(
         None,
     )?;
     Ok(())
+}
+
+/// Remove this call's resume handlers from the agent's table (see
+/// [`settle_async_completion`]). The entries are keyed by the handler
+/// functions' ids, and the handler pair is reused for every await of the same
+/// call, so two removals cover the whole call.
+fn release_resume_handlers(agent: &Agent, state: &Rc<RefCell<AsyncFunctionState>>) {
+    let (ok, err) = {
+        let state = state.borrow();
+        (state.resume_ok, state.resume_err)
+    };
+    if ok.is_none() && err.is_none() {
+        return;
+    }
+    let mut table = agent.roots.async_resume.borrow_mut();
+    for handler in [ok, err].into_iter().flatten() {
+        if let ValueKind::Function(function) = handler.kind() {
+            table.remove(&function.id());
+        }
+    }
 }
 
 fn make_resume_handler(
@@ -486,6 +535,11 @@ fn settle_async_completion(
     state: &Rc<RefCell<AsyncFunctionState>>,
     completion: Completion,
 ) -> Result<(), JsError> {
+    // The body has completed, so no await can resume it again: drop the two
+    // `async_resume` entries this call built. `dispatch_resume` never removes
+    // them, and each entry holds the whole state (Vm, promise, body,
+    // environment) alive, so without this every completed async call leaks one.
+    release_resume_handlers(agent, state);
     let resources = {
         let state = state.borrow();
         state.vm.lexical_env.drain_disposable_resources()
