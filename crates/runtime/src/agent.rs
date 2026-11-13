@@ -913,6 +913,11 @@ pub(crate) struct AgentRoots {
     /// 27 lesson.
     pub(crate) for_in_cells:
         RefCell<Box<[Option<crate::ir::ForInEnumCache>; crate::ir::FOR_IN_CELLS]>>,
+    /// The eight `typeof` result strings, boxed once per agent (see
+    /// `crux::value::type_of_kind`). `typeof x === "…"` is everywhere, and
+    /// every evaluation of the step used to box the same five-to-nine
+    /// character constant into the arena: one allocation per `typeof`.
+    pub(crate) type_strings: RefCell<[Option<Value>; 8]>,
     /// The leaf-inline cache (Cut 34): function id → the record data
     /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
     /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
@@ -1408,6 +1413,7 @@ impl AgentRoots {
             species_fast_cells: std::array::from_fn(|_| Cell::new(None)),
             spread_cells: std::array::from_fn(|_| Cell::new(None)),
             for_in_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
+            type_strings: RefCell::new(std::array::from_fn(|_| None)),
             array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
@@ -1615,6 +1621,9 @@ impl Trace for AgentRoots {
         }
         for cell in self.for_in_cells.borrow().iter().flatten() {
             cell.trace(visit);
+        }
+        for value in self.type_strings.borrow().iter().flatten() {
+            value.trace(visit);
         }
         for cell in self.global_leaf_cells.borrow().iter().flatten() {
             cell.trace(visit);
@@ -3661,6 +3670,23 @@ impl Agent {
     /// answer does not depend on which execution context happens to be running.
     pub fn first_realm(&self) -> Option<Handle<Realm>> {
         self.roots.realms.borrow().first().copied()
+    }
+
+    /// The boxed `typeof` result for `value` (spec 13.5.3.2), from this
+    /// agent's cache. `typeof` answers one of eight constant strings, so the
+    /// box is created once per agent rather than once per evaluation; the
+    /// cached values are traced through [`AgentRoots`] like any other root.
+    pub(crate) fn type_of_value(&self, value: &Value) -> Value {
+        let kind = crux::value::type_of_kind(value);
+        if let Some(cached) = self.roots.type_strings.borrow()[kind.index()] {
+            return cached;
+        }
+        // Boxed outside the borrow: `Handle::new` may collect under
+        // `--gc-stress`, and the trace would re-enter the same `RefCell`. The
+        // fresh box is the collection's own extra root, so it survives.
+        let boxed = Value::String(Handle::new(crux::JsString::from_utf8(kind.name())));
+        self.roots.type_strings.borrow_mut()[kind.index()] = Some(boxed);
+        boxed
     }
 
     /// The current Realm Record (the Realm component of the running context).

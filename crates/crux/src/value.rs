@@ -513,28 +513,72 @@ impl fmt::Display for Value {
     }
 }
 
+/// The `Type` abstract operation (spec 7.2.1), as an indexable kind: `typeof`
+/// answers one of eight constant strings, so a caller that must hand back a
+/// `Value` can cache one arena box per kind instead of materializing the
+/// constant on every evaluation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeOfKind {
+    Undefined,
+    Object,
+    Boolean,
+    Number,
+    String,
+    Function,
+    Symbol,
+    BigInt,
+}
+
+impl TypeOfKind {
+    /// The string `typeof` answers for this kind (spec 13.5.3.2).
+    pub fn name(self) -> &'static str {
+        match self {
+            TypeOfKind::Undefined => "undefined",
+            TypeOfKind::Object => "object",
+            TypeOfKind::Boolean => "boolean",
+            TypeOfKind::Number => "number",
+            TypeOfKind::String => "string",
+            TypeOfKind::Function => "function",
+            TypeOfKind::Symbol => "symbol",
+            TypeOfKind::BigInt => "bigint",
+        }
+    }
+
+    /// The cache slot for this kind.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// The `Type` abstract operation (spec 7.2.1). Proxies over callable
 /// functions report `function` like the spec's typeof.
 pub fn type_of(value: &Value) -> &'static str {
+    type_of_kind(value).name()
+}
+
+/// [`type_of`] as a [`TypeOfKind`], for a caller that caches the boxed string.
+pub fn type_of_kind(value: &Value) -> TypeOfKind {
     if value.is_number() {
-        return "number";
+        return TypeOfKind::Number;
     }
     match value.tag() {
-        TAG_UNDEFINED => "undefined",
-        TAG_NULL => "object",
-        TAG_FALSE | TAG_TRUE => "boolean",
-        TAG_BIGINT => "bigint",
-        TAG_STRING => "string",
-        TAG_SYMBOL => "symbol",
-        TAG_FUNCTION => "function",
+        TAG_UNDEFINED => TypeOfKind::Undefined,
+        TAG_NULL => TypeOfKind::Object,
+        TAG_FALSE | TAG_TRUE => TypeOfKind::Boolean,
+        TAG_BIGINT => TypeOfKind::BigInt,
+        TAG_STRING => TypeOfKind::String,
+        TAG_SYMBOL => TypeOfKind::Symbol,
+        TAG_FUNCTION => TypeOfKind::Function,
         TAG_OBJECT => match value.as_object() {
             Some(obj) => match &obj.kind {
-                crate::object::ObjectKind::IsHTMLDDA => "undefined",
-                crate::object::ObjectKind::Proxy(slots) if slots.callable.get() => "function",
-                crate::object::ObjectKind::Host(ops) if ops.is_callable() => "function",
-                _ => "object",
+                crate::object::ObjectKind::IsHTMLDDA => TypeOfKind::Undefined,
+                crate::object::ObjectKind::Proxy(slots) if slots.callable.get() => {
+                    TypeOfKind::Function
+                }
+                crate::object::ObjectKind::Host(ops) if ops.is_callable() => TypeOfKind::Function,
+                _ => TypeOfKind::Object,
             },
-            None => "object",
+            None => TypeOfKind::Object,
         },
         _ => unreachable!("reserved tag"),
     }

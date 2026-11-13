@@ -3591,7 +3591,7 @@ extern "C" fn typeof_ident(ctx: *mut c_void, name: u64) -> u64 {
             Err(error) => return slow_error(ctx, error),
         },
     };
-    typeof_bits(&value)
+    typeof_bits(agent, &value)
 }
 
 extern "C" fn resolve_var_ident(ctx: *mut c_void, name: u64) -> u64 {
@@ -6087,8 +6087,9 @@ extern "C" fn create_arguments(ctx: *mut c_void, step: u64) -> u64 {
 /// value (spec 13.5.3.2 — a value operand; the unresolvable-reference form
 /// is `TypeofIdent`, which `typeof_ident` serves). Never errors.
 extern "C" fn typeof_top(ctx: *mut c_void, value: u64) -> u64 {
-    let _ = ctx;
-    typeof_bits(&Value::from_bits(value))
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &*ctx.agent };
+    typeof_bits(agent, &Value::from_bits(value))
 }
 
 /// `Step::CallIntrinsic` for `%String.prototype.charCodeAt%`: `this` is a String
@@ -6253,12 +6254,11 @@ extern "C" fn array_reverse(ctx: *mut c_void, this: u64) -> u64 {
 
 /// The `typeof` string for `value`, as the value's bits — the shape
 /// `typeof_top` (a value operand, Cut 60) and `typeof_ident` (a name resolved
-/// through the environment) both push.
-fn typeof_bits(value: &Value) -> u64 {
-    Value::String(crux::Handle::new(crux::JsString::from_utf8(
-        crux::value::type_of(value),
-    )))
-    .bits()
+/// through the environment) both push. The string itself comes from the
+/// agent's per-kind cache: `typeof` answers one of eight constants, and boxing
+/// it per evaluation was an allocation per `typeof`.
+fn typeof_bits(agent: &crate::agent::Agent, value: &Value) -> u64 {
+    agent.type_of_value(value).bits()
 }
 
 /// The typed-array length probe: the slots length of an IntegerIndexed

@@ -19647,3 +19647,34 @@ The remaining excess is two rows and a long tail: `head-let` 390.6 ms over node
 42.8, `object_keys` 41.8. No row is above 200 ms except the two amplified
 test262 fixtures, and both of those are dominated by the same `assert` preamble
 (a non-leaf call at ~33 ns, 18 of them per body) rather than by one hot loop.
+
+## LANDED (2026-11-13): `typeof` answers from a per-agent string cache
+
+`typeof` produces one of eight constant strings, and every evaluation boxed a
+fresh arena `JsString` for it — in both the interpreter handler
+(`ir/cold.rs`) and the compiled helper (`jit.rs::typeof_bits`). A loop of
+`typeof obj.prop` allocated **94,195 boxes per 100k evaluations** (measured with
+`--gc-trace`'s `swept` total); it now allocates **2**.
+
+`crux::value::type_of_kind` exposes the eight kinds as an index (with
+`type_of` kept as `kind().name()`), and `Agent::type_of_value` caches one boxed
+string per kind in `AgentRoots::type_strings` (traced like every other cache;
+boxed outside the borrow so a `--gc-stress` collection inside `Handle::new`
+cannot re-enter the `RefCell`).
+
+| probe (100k iterations) | before | after | delta |
+|---|---:|---:|---:|
+| `typeof obj.missing` | 17.25 | 14.05 | -18.5% |
+| `typeof obj.present` | 4.17 | 1.69 | **-59.4%** |
+| control, no `typeof` | 12.44 | 12.48 | +0.3% |
+| `for-in/head-let-fresh-binding` | 578.0 | 555.9 | -3.8% |
+
+(min-of-4 interleaved for the probes, min of 10 pairs for `head-let`; `iter`
+profile, one row per process.) Results identical 79/79 in jit, jitless,
+`--gc-stress` and `--nursery-stress`; `language/expressions/typeof` 16/16 with
+and without `--gc-stress`; crux 283, runtime 1151, jit 380.
+
+The same shape — a *constant* materialized into the arena per evaluation —
+is still in `Step::PushStr`, which boxes its literal `JsString` on every
+execution of the step; a string literal inside a loop pays an allocation per
+iteration.

@@ -2182,10 +2182,7 @@ impl Vm {
             }
             Step::TypeofTop => {
                 let value = self.pop();
-                self.stack
-                    .push(Value::String(Handle::new(JsString::from_utf8(
-                        crux::value::type_of(&value),
-                    ))));
+                self.stack.push(agent.type_of_value(&value));
             }
             Step::TypeofIdent { name } => {
                 // spec 13.5.3.2 step 1: an unresolvable reference is
@@ -2196,10 +2193,7 @@ impl Vm {
                     crate::context::ReferenceBase::Unresolvable => Value::Undefined,
                     _ => crate::context::get_value(agent, &reference)?,
                 };
-                self.stack
-                    .push(Value::String(Handle::new(JsString::from_utf8(
-                        crux::value::type_of(&value),
-                    ))));
+                self.stack.push(agent.type_of_value(&value));
             }
             Step::PushStr(text) => {
                 self.stack.push(Value::String(Handle::new(text.clone())));
