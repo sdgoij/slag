@@ -236,7 +236,12 @@ pub fn call_async_function(
             // `--gc-stress` for the first-run window so they cannot be swept.
             let _stress = crate::ir::StressSuppress::new();
             let state = Rc::new(RefCell::new(AsyncFunctionState {
-                vm: Vm::new(run_env, data.strict),
+                // The value stack comes from the agent's pool: the first JIT
+                // entry reserves it to the VM's cap (512 KB), and an async
+                // call used to build a fresh `Vm` and drop it, so every call
+                // paid an allocation and a free of that reservation (490 ns
+                // measured). A pooled Vm keeps the capacity between calls.
+                vm: *agent.take_vm(run_env, data.strict),
                 body,
                 context,
                 promise: capability.promise,
@@ -544,20 +549,36 @@ fn settle_async_completion(
         let state = state.borrow();
         state.vm.lexical_env.drain_disposable_resources()
     };
-    if resources.is_empty() {
-        settle_async(agent, state, completion)?;
-        return Ok(());
-    }
-    let (resolve, reject) = {
-        let state = state.borrow();
-        (state.resolve, state.reject)
+    let result = if resources.is_empty() {
+        settle_async(agent, state, completion).map(|_| ())
+    } else {
+        let (resolve, reject) = {
+            let state = state.borrow();
+            (state.resolve, state.reject)
+        };
+        crate::builtins::disposable::dispose_async_body_resources(
+            agent,
+            resources,
+            completion,
+            crate::builtins::disposable::AsyncBodySettlement::Function { resolve, reject },
+        )
     };
-    crate::builtins::disposable::dispose_async_body_resources(
-        agent,
-        resources,
-        completion,
-        crate::builtins::disposable::AsyncBodySettlement::Function { resolve, reject },
-    )
+    // The body can never run again, so hand its value stack back to the pool
+    // instead of holding the 512 KB reservation until the state drops.
+    release_state_vm(agent, state);
+    result
+}
+
+/// Return the state's `Vm` to the agent's pool. Its persistent frame is dead
+/// once the body completed; a fresh empty Vm takes its place so the state (which
+/// a disposal job may still hold) stays well formed.
+fn release_state_vm(agent: &mut Agent, state: &Rc<RefCell<AsyncFunctionState>>) {
+    let vm = {
+        let mut state = state.borrow_mut();
+        let env = state.vm.lexical_env;
+        std::mem::replace(&mut state.vm, crate::ir::Vm::new(env, false))
+    };
+    agent.return_vm(Box::new(vm));
 }
 
 /// Resolve or reject the async function's promise with the body completion.

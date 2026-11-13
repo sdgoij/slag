@@ -20239,3 +20239,44 @@ Two candidate fixes, neither a slice:
 
 `async_churn`'s remaining 46 ms is about half this reservation and half the
 per-operation allocation count the two promise landings already thinned.
+
+## LANDED (2026-11-13): an async call's `Vm` comes from the pool
+
+The 512 KB reservation described above is inherent to the JIT's baked-pointer
+contract (a nested certified call carves its region from the same `vm.stack`, so
+the vector must never reallocate mid-run). What was *not* inherent is paying for
+it per async call: `call_async_function` built `Vm::new(...)` and dropped it, so
+every async call allocated and freed a 512 KB value stack, while a synchronous
+call reuses one warm Vm from `Agent::take_vm`/`return_vm`.
+
+The state now takes its Vm from the pool, and `settle_async_completion` hands it
+back (a fresh empty `Vm` replaces it, because a disposal job may still hold the
+state). Every termination that settles the promise goes through that function
+after `release_resume_handlers`, so the Vm can never be run again once it is
+pooled. Error paths that never build a state still allocate one — rare, and the
+pool refills on the next completion.
+
+| probe / row | before | after |
+|---|---:|---:|
+| `async function f(i){ return i }` ×100k | 222.2 ms | 185.3 (**-16.6%**) |
+| `async function f(i){ await i }`, 1000 pending | 19.9 | 13.4 (**-32.7%**) |
+| `builtins/async_churn` | 45.4 | 31.2 (**-31.4%**) |
+| `builtins/promise_churn` | 8.22 | 8.24 (+0.3%) |
+| `opcost/map_get` (control) | 2.830 | 2.837 (+0.3%) |
+| corpus total | 2014 | 1999 (-0.7%) |
+
+The concurrent case (`async_churn` queues 2000 awaits that the harness only
+drains between timed calls) improves as much as the sequential one because the
+drain settles those bodies through `settle_async_completion`, warming the pool
+for the next timed call — the steady state stops allocating entirely.
+
+Gates: `language` 23726, `built-ins` 23821, `annexB` 1086 — 0 fail both modes;
+`built-ins --filter "*Promise*"` 732/732 under `--gc-stress --gc-verify`; corpus
+results identical in jit, jitless, `--gc-stress` and `--nursery-stress`;
+`cargo test --workspace` (all 52 binaries); clippy; fmt.
+
+Still open on this path: a *suspended* body keeps its 512 KB reservation until
+it settles, so N concurrent awaits reserve N × 512 KB. Releasing it at a
+suspension (`shrink_to_fit` after the normalize, re-reserve on resume) would fix
+the memory curve at the cost of two reallocs per await; that is a trade to
+measure, not a free win.
