@@ -454,7 +454,7 @@ impl<T: Trace> Gc<T> {
     /// one heap borrow.
     pub fn new(value: T) -> Gc<T> {
         let size = round_up(size_of::<GcBox<T>>(), ARENA_GRANULARITY);
-        let gc = with_heap_mut(|heap| {
+        let (gc, stress) = with_alloc_state(|heap, state| {
             let raw = heap.alloc(size, align_of::<GcBox<T>>()) as *mut GcBox<T>;
             // SAFETY: `raw` is a fresh arena slot (bumped or reused) of at
             // least `size` bytes; writing the header + payload initializes
@@ -470,15 +470,20 @@ impl<T: Trace> Gc<T> {
                 });
             }
             heap.note_alloc(raw as usize, size);
-            Gc {
-                ptr: unsafe { NonNull::new_unchecked(raw) },
-                _not_send_sync: std::marker::PhantomData,
-            }
+            let stress = note_alloc_in_state(state);
+            (
+                Gc {
+                    ptr: unsafe { NonNull::new_unchecked(raw) },
+                    _not_send_sync: std::marker::PhantomData,
+                },
+                stress,
+            )
         });
-        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
         // GC-2 `--gc-stress`: the fresh box is not yet reachable from any
         // handle the caller holds, so it is passed through as an extra root.
-        maybe_stress_collect(gc.as_any());
+        if stress {
+            maybe_stress_collect(gc.as_any());
+        }
         gc
     }
 
@@ -491,7 +496,7 @@ impl<T: Trace> Gc<T> {
     /// allocate through the heap (the heap is mutably borrowed here).
     pub fn new_in_place(init: impl FnOnce(*mut T)) -> Gc<T> {
         let size = round_up(size_of::<GcBox<T>>(), ARENA_GRANULARITY);
-        let gc = with_heap_mut(|heap| {
+        let (gc, stress) = with_alloc_state(|heap, state| {
             let raw = heap.alloc(size, align_of::<GcBox<T>>()) as *mut GcBox<T>;
             // SAFETY: `raw` is a fresh arena slot (bumped or reused) of at
             // least `size` bytes; the header fields are written through raw
@@ -505,13 +510,18 @@ impl<T: Trace> Gc<T> {
                 init(std::ptr::addr_of_mut!((*raw).data));
             }
             heap.note_alloc(raw as usize, size);
-            Gc {
-                ptr: unsafe { NonNull::new_unchecked(raw) },
-                _not_send_sync: std::marker::PhantomData,
-            }
+            let stress = note_alloc_in_state(state);
+            (
+                Gc {
+                    ptr: unsafe { NonNull::new_unchecked(raw) },
+                    _not_send_sync: std::marker::PhantomData,
+                },
+                stress,
+            )
         });
-        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
-        maybe_stress_collect(gc.as_any());
+        if stress {
+            maybe_stress_collect(gc.as_any());
+        }
         gc
     }
 
@@ -546,7 +556,7 @@ impl<T: Trace> Gc<T> {
             size <= u32::MAX as usize,
             "a tailed box must fit its header's size field"
         );
-        let gc = with_heap_mut(|heap| {
+        let (gc, stress) = with_alloc_state(|heap, state| {
             let raw = heap.alloc(size, std::mem::align_of::<GcBox<T>>()) as *mut GcBox<T>;
             // SAFETY: `raw` is a fresh arena slot of at least `size` bytes; the
             // header and the caller's `init` write the payload and the tail
@@ -562,13 +572,18 @@ impl<T: Trace> Gc<T> {
                 );
             }
             heap.note_alloc(raw as usize, size);
-            Gc {
-                ptr: unsafe { NonNull::new_unchecked(raw) },
-                _not_send_sync: std::marker::PhantomData,
-            }
+            let stress = note_alloc_in_state(state);
+            (
+                Gc {
+                    ptr: unsafe { NonNull::new_unchecked(raw) },
+                    _not_send_sync: std::marker::PhantomData,
+                },
+                stress,
+            )
         });
-        ALLOC_SINCE_COLLECT.with(|count| count.set(count.get() + 1));
-        maybe_stress_collect(gc.as_any());
+        if stress {
+            maybe_stress_collect(gc.as_any());
+        }
         gc
     }
 
@@ -1819,6 +1834,29 @@ pub fn with_heap<R>(f: impl FnOnce(&Heap) -> R) -> R {
 /// Run `f` with mutable access to the entered heap.
 pub fn with_heap_mut<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     with_state(|state| f(&mut state.heap.borrow_mut()))
+}
+
+/// The per-allocation bookkeeping, done on the state the allocation already
+/// borrowed: bump the safe-point pacing counter and report whether this box has
+/// to go through the `--gc-stress` collector (GC-2). Both used to be separate
+/// thread-local round trips — `Gc::new` is the hottest function in the engine,
+/// and the stress check was a whole round trip per box to learn "off".
+fn note_alloc_in_state(state: &HeapState) -> bool {
+    state
+        .alloc_since_collect
+        .set(state.alloc_since_collect.get() + 1);
+    state.stress.get() && !state.collecting.get()
+}
+
+/// [`with_heap_mut`] plus the heap's collector state, for the allocation path.
+///
+/// A box's creation has to bump the pacing counter and consult the
+/// `--gc-stress` flag, which live on the state next to the arena. Reaching them
+/// through their own accessors cost two more thread-local round trips per box —
+/// `Gc::new` is the hottest function in the engine, so the allocation paths take
+/// the arena and the state from one lookup instead.
+fn with_alloc_state<R>(f: impl FnOnce(&mut Heap, &HeapState) -> R) -> R {
+    with_state(|state| f(&mut state.heap.borrow_mut(), state))
 }
 
 per_heap!(

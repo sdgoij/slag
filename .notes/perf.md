@@ -19585,3 +19585,47 @@ Every amplified test262 fixture's `assert` preamble is the third shape, and one
 `has_lane_step_hazard` 7.2%, `string_prototype_bits` 5.4%, `call_slow` 4.2%,
 `Vec::resize` 3.0% — so after the gate cache the remaining ~45 ns of overhead is
 the lane's own frame carve plus two per-call realm reads, not one cliff.
+
+## LANDED (2026-11-13): a box's creation takes one heap lookup, not three
+
+`Gc::new` / `new_in_place` / `with_tail` each did three state lookups per box:
+`with_heap_mut` (thread-local read + heap `RefCell` borrow), then
+`ALLOC_SINCE_COLLECT.with(...)` (another thread-local read) to bump the
+safe-point pacing counter, then `maybe_stress_collect` → `STRESS.with(...)`
+(another) to learn that `--gc-stress` is off.
+
+All three facts live on the `HeapState` the allocation already reached:
+`with_alloc_state` hands the body `(&mut Heap, &HeapState)`, so the counter bump
+is a `Cell` store inside the existing borrow and the stress verdict is
+`state.stress && !state.collecting` — the round trip to learn "off" is gone, and
+the collector is only called when it is on. Identical pacing and identical
+semantics: the collector still runs *after* the heap borrow is released, and
+`maybe_stress_collect` still re-checks both flags.
+
+Measured (min-of-3 per row, one row per process, 79 rows summed against the
+parent binary):
+
+| row | before | after | delta |
+|---|---:|---:|---:|
+| **corpus total** | **2375** | **2295** | **-3.4%** |
+| `for-in/head-let-fresh-binding` | 566.6 | 504.0 | -11.1% |
+| `strings/concat_loop` | 9.9 | 8.8 | -11.3% |
+| `opcost/json_stringify` | 111.7 | 105.1 | -5.9% |
+| `objects/spread_assign` | 103.9 | 98.2 | -5.4% |
+| `opcost/regexp_test` | 33.9 | 32.3 | -4.8% |
+
+`head-let` over a further 6 interleaved pairs reads 529.2 -> 511.5 (-3.3%);
+`promise_churn` reads +4.7% in both measurements, which is inside the +-33%
+spread that row is documented to carry. Results identical (79/79) under
+`--gc-stress` and `--nursery-stress`; crux 283, runtime 1151, jit 380.
+
+### The shape of the remaining gap, in one paragraph
+
+Nine mechanisms have now been measured one at a time (object literal + property
+define, closure creation, per-iteration env, `Map`/`Set` op, array builtin entry,
+`JSON.stringify`, `split`/`join`, a non-leaf call, a leaf call) and every one of
+them sits at 5-15x node with the cost spread over 8-15 components of 2-6 ns each:
+no per-op profile has an entry above 15% once the cross-crate `iter` artifacts
+(`Value::kind`, `LocalKey::with`) are discounted. What is left is not a cliff to
+find but the per-operation constants themselves — and allocation, which every one
+of those operations pays once or twice, was the biggest of them (this landing).
