@@ -19891,3 +19891,59 @@ Gates: corpus results identical 79/79 in jit, jitless, `--gc-stress` and
 1157 runtime tests); clippy `-D warnings`; fmt. Five new unit tests cover the
 sharing: fresh-object iteration, prototype + enumerability + shadowing,
 delete, a prototype change, and a vector-only property.
+
+## MEASURED (2026-11-13): the per-operation constants behind `head-let`, and where the next 100 ns live
+
+After the shape-keyed enumeration landing, `head-let` is 385 ms (5.8x node) and
+still the corpus's largest row, so its body was decomposed again (per 100k
+iterations, `release`, one row per process; probes in `scratch/hlp`):
+
+| shape (per iteration) | ns |
+|---|---:|
+| bare loop (`acc += 1`) | 6 |
+| object literal `{a,b,c}` + read | 2 (folded) |
+| `Object.create(null)` | 86 |
+| + 3 new-key stores | +165 |
+| for-in over that object, per-iteration `let` (before / after the shape cache) | 1415 / ~130 |
+| closure `function () {}` created, never called | **316** |
+| …created with a captured per-iteration `let` | **483** |
+| …and called once, fresh | +113 |
+| …called again (warm identity) | +10 |
+| its body also reads a global (the property-probe's `certified_verdict` walk) | +87 |
+| `{ m: function () {} }` (closure + method define) | 769 |
+| `{ m() {} }` (method syntax) | 578 |
+| `{}` then `o.m = function () {}` | 384 |
+
+The decomposition of the fixture body (`scratch/hlc/v0`–`v5`): 3593 ns total =
+closure create + capture (≈1500) + three fresh-closure calls (≈450) + three
+computed-key stores (≈330) + object create/stores (≈250) + for-in (≈390, now
+≈130) + the rest in the loop.
+
+Three findings worth carrying forward:
+
+- **Closure creation is still 316 ns (node ≈ 25) and still has no single
+  component** — the two arena boxes, the `ecma_functions` insert, the shared
+  compiled-body lookup, the batched boilerplate and the capture env are each
+  20–100 ns. Only the "one allocation with the slots inline" merge (W3a) moves
+  it, and that is a `Function`/`JsObject` layout refactor, not a slice.
+- **A call site's leaf record is keyed on the callee's exact 64-bit identity**
+  (`LeafCallRecord`), so a freshly created closure misses it and pays the whole
+  `leaf_call_probe` — 113 ns of Rust (two `ecma_functions` lookups, two
+  `Rc<CompiledBody>` clones, `certified_verdict`, `leaf_fill_info`) — on *every*
+  call, including the second call in the same iteration being free (10 ns) once
+  the record is warm. `certified_verdict` is computed eagerly even when the
+  leaf verdict succeeds and never needs it, and its
+  `global_reads_are_unshadowed` walk is the 87 ns a global-reading callee body
+  adds.
+- **The enumeration cliff is a pattern, not an incident**: `own_string_props`
+  (via `Object.keys`'s `enumerable_key_values` and `CopyDataProperties`) is
+  identity-keyed in exactly the way `ForInBegin` was. `Object.keys({a,b,c})`
+  with a fresh object: 702 ns; the same object hoisted: 222. `{...freshObj}`
+  329 vs 200 hoisted; `Object.assign({}, freshObj)` 371. The shape gate this
+  landing added (`for_in_shape_map`) is the same one those would need.
+
+Two builtin-entry items remain unaddressed and are the largest single absolute
+gaps in the `opcost` family (`release`, 100k iterations, node v24): `slice` 174
+vs 12 ns, `forEach` 214 vs 18, `Map.forEach` 227 vs 21, `TypedArray.forEach`
+258 vs 25, `RegExp.test` 306 vs 15, `toSorted` 322 vs 96, `stringify` 656 vs
+190.
