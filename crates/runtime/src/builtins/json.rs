@@ -773,20 +773,27 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
         indent: String::new(),
         depth: 0,
     };
-    let wrapper = JsObject::ordinary_object_create(
-        agent
-            .current_realm()?
-            .intrinsics
-            .get("%Object.prototype%")
-            .and_then(|value| as_object(&value)),
-    );
-    wrapper.create_data_property_or_throw(&JsString::from_utf8(""), value)?;
-    let result = serialize_json_property(
-        agent,
-        &mut state,
-        &JsString::from_utf8(""),
-        &Value::Object(wrapper),
-    )?;
+    // spec 26.6.2 steps 4-5 put the value on a fresh ordinary wrapper and start
+    // SerializeJSONProperty at `Get(wrapper, "")`. The wrapper is observable
+    // only as the replacer function's `this` (step 3 of 26.6.3.2 calls it with
+    // the holder), so the common case — no replacer — passes the root value
+    // straight in. The per-call object, its property vector, the empty-key
+    // lookup and the `%Object.prototype%` intrinsic read were about half of
+    // `JSON.stringify({})`'s 430 ns (`scratch/iso/j0`).
+    let empty = JsString::from_utf8("");
+    let result = if state.replacer_function.is_some() {
+        let wrapper = JsObject::ordinary_object_create(
+            agent
+                .current_realm()?
+                .intrinsics
+                .get("%Object.prototype%")
+                .and_then(|value| as_object(&value)),
+        );
+        wrapper.create_data_property_or_throw(&empty, value)?;
+        serialize_json_property(agent, &mut state, &empty, &Value::Object(wrapper))?
+    } else {
+        serialize_json_value(agent, &mut state, &empty, value, value)?
+    };
     Ok(result
         .map(|text| Value::String(Handle::new(text)))
         .unwrap_or(Value::Undefined))
@@ -862,7 +869,22 @@ fn serialize_json_property(
     key: &JsString,
     holder: &Value,
 ) -> Result<Option<JsString>, JsError> {
-    let mut value = get_property(agent, holder, key, *holder)?;
+    let value = get_property(agent, holder, key, *holder)?;
+    serialize_json_value(agent, state, key, value, *holder)
+}
+
+/// [`serialize_json_property`] with the value already in hand: the root call
+/// has no holder to read it from (see `json_stringify`), and every other caller
+/// is a property of a container. `receiver` is the `this` a replacer function
+/// is called with — the holder for a property, the (unobservable) root value
+/// when the root has no replacer to receive it.
+fn serialize_json_value(
+    agent: &mut Agent,
+    state: &mut StringifyState,
+    key: &JsString,
+    mut value: Value,
+    receiver: Value,
+) -> Result<Option<JsString>, JsError> {
     if matches!(
         value.kind(),
         ValueKind::Object(_) | ValueKind::Function(_) | ValueKind::BigInt(_)
@@ -873,7 +895,7 @@ fn serialize_json_property(
         }
     }
     if let Some(replacer_function) = &state.replacer_function {
-        value = crate::function::call(agent, replacer_function, *holder, &[strv(key), value])?;
+        value = crate::function::call(agent, replacer_function, receiver, &[strv(key), value])?;
     }
     if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {

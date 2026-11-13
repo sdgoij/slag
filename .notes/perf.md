@@ -19678,3 +19678,36 @@ The same shape — a *constant* materialized into the arena per evaluation —
 is still in `Step::PushStr`, which boxes its literal `JsString` on every
 execution of the step; a string literal inside a loop pays an allocation per
 iteration.
+
+## LANDED (2026-11-13): `JSON.stringify` skips the root wrapper when nothing can see it
+
+spec 26.6.2 steps 4-5 put the value on a fresh ordinary wrapper and start
+SerializeJSONProperty at `Get(wrapper, "")`. That cost, per call: an arena
+`JsObject`, its property vector and define, the empty-key `[[Get]]`, and a
+SipHash `intrinsics.get("%Object.prototype%")` — about half of
+`JSON.stringify({})`'s 435 ns.
+
+The wrapper is observable in exactly one place: the replacer function's `this`
+(26.6.3.2 step 3 calls the replacer with the holder). So it is built only when
+a replacer function is present; otherwise the root value goes straight into the
+serializer (`serialize_json_value`, split out of `serialize_json_property`).
+
+| probe (100k stringifies) | before | after | delta |
+|---|---:|---:|---:|
+| `JSON.stringify({})` | 43.51 | 27.97 | **-35.7%** |
+| one key | 77.52 | 59.15 | -23.7% |
+| three keys | 109.12 | 96.51 | -11.6% |
+| five keys | 145.83 | 122.83 | -15.8% |
+| `opcost/json_stringify` | 109.10 | 94.81 | -13.1% |
+| `builtins/json_roundtrip` | 63.52 | 59.86 | -5.8% |
+| control (`hof_methods`) | 21.92 | 22.17 | +1.1% |
+
+(min-of-4 interleaved, `iter`, one row per process.) Results identical 79/79 in
+jit, jitless, `--gc-stress` and `--nursery-stress`; `built-ins/JSON` 165/165 and
+`JSON/stringify` 66/66 jitless; runtime 1151, jit 380.
+
+Two more candidates in the same row, measured but not taken: the unbox block in
+`serialize_json_value` does up to four id-keyed table probes per property
+(`number_data`, `boolean_data`, `bigint`) that a plain object can never hit, and
+the `toJSON` lookup rebuilds its key with `JsString::from_utf8("toJSON")` on
+every property.
