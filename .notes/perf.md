@@ -19629,3 +19629,21 @@ no per-op profile has an entry above 15% once the cross-crate `iter` artifacts
 (`Value::kind`, `LocalKey::with`) are discounted. What is left is not a cliff to
 find but the per-operation constants themselves — and allocation, which every one
 of those operations pays once or twice, was the biggest of them (this landing).
+
+## MEASURED (2026-11-13, `release`): the corpus standing after this session
+
+Per-row isolated, one row per process, min-of-2, `release` (`lto = "thin"`,
+`codegen-units = 1`), 79 rows against node v24:
+
+**slag 2077 ms, node 796 ms — 2.61x.** The plan's baseline for this target was
+2468-2526 ms (3.4-3.5x), so ~400 ms has come out of the release corpus this
+session (five landings, each A/B'd in `iter` against a same-profile parent), and
+the 2.0x line (<= ~1450 ms) is 627 ms away.
+
+The remaining excess is two rows and a long tail: `head-let` 390.6 ms over node
+(456.4 vs 65.9, 6.9x), `evaluation-order` 169.5 (198.3 vs 28.8, 6.9x), then
+`json_stringify` 69.9, `spread_assign` 55.4, `async_churn` 51.0 (194x),
+`method_call` 47.9, `construct_churn` 43.9, `split_join` 43.8, `recursive_fib`
+42.8, `object_keys` 41.8. No row is above 200 ms except the two amplified
+test262 fixtures, and both of those are dominated by the same `assert` preamble
+(a non-leaf call at ~33 ns, 18 of them per body) rather than by one hot loop.
