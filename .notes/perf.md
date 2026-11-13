@@ -19406,3 +19406,21 @@ with sparse publics lands in another crate: it reported `ryu::pretty::format64`
 for `crux::object::ArraySlots::refresh`. It now asks `llvm-symbolizer`
 (`--output-style=JSON`, one object per line) and takes the outermost frame, so a
 sample is named after the engine function that contains the instruction.
+
+### FOLLOW-UP: `toSorted` copies its run too
+
+`Array.prototype.toSorted` filled its result with the same per-index define, over
+a source whose run is dense-present in the common case. It now uses
+`array_copy_dense_from` when the whole range is dense-present and keeps the
+per-index loop otherwise (a hole's `[[Get]]` must consult the prototype chain,
+which a bulk copy cannot do).
+
+`opcost/array_to_sorted` **44.26 -> 41.00 ms (-7.4%)**, min-of-5 interleaved,
+same profile; `opcost/array_slice` and `arrays/hof_methods` flat (+1.2%, +4.2%,
+both unchanged code paths). Below the 10% bar on its own, kept because it is the
+same mechanism as the slice landing and strictly less work.
+
+Still defining per index: `map`, `filter`, `concat`, `splice`, `to_spliced`.
+`map`/`filter` need a hole-aware gate (a skipped hole must leave a hole in the
+result), so they want the dense case as a separate loop rather than a blanket
+copy.
