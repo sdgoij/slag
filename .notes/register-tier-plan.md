@@ -352,19 +352,29 @@ prologue/epilogue on a twelve-argument function, the record move, and the
 instrument's own ±50-cycle noise, which is where this method stops resolving.
 So the cuts are the four named items, not the plumbing:
 
-- **A0a — `source_info` laziness (blocked: not a cost, a correctness guard).**
-  The 230 cycles are dominated by the FNV hash of the function's source slice,
-  and that hash is what keys `SOURCE_INFO_CACHE` and `FUNCTION_BODY_CACHE`.
-  Node addresses are reused after a parse is dropped, and two parses of
-  same-length sources collide on `(address, realm, span)` alone — the comment on
-  `shared_function_body` records this as observed. So the hash cannot be dropped
-  or shortened without returning another parse's source text to
-  `Function.prototype.toString`. Making it lazy needs the whole site-key design
-  changed: materialize the enclosing text to a canonical leaf *first*, then key
-  by `(node, realm, span, leaf identity)` — sound because the cache entry pins
-  the leaf, so its address cannot be recycled — and do the same for
-  `shared_arrow_body`, `shared_accessor_body` and `source_info_with_slice`,
-  which each hash per closure today. That is a coherent cut, not a one-liner.
+- **A0a — the site key is the text's identity (landed 2026-11-14).** The 230
+  cycles were dominated by the FNV hash of the function's source slice, and the
+  hash could not be dropped on its own: node addresses are reused after a parse
+  is dropped, and two parses of same-length sources collide on
+  `(address, realm, span)` alone, so something content-derived had to
+  disambiguate them. The cut replaces the hash with the *address* of the
+  enclosing text — `JsString::Flat` is an `Arc`, shared by every clone — and
+  makes the address sound by having every cache that keys on it also store the
+  text, pinning the `Arc` so its address cannot be recycled (`source_site_identity`
+  and `SiteSource` in `function.rs`). The forms with no stable base (`Small`,
+  and a rope until it is materialized) keep the hash. All four site caches take
+  the identity — `SOURCE_INFO_CACHE`, `FUNCTION_BODY_CACHE`,
+  `ARROW_BODY_CACHE`, `ACCESSOR_BODY_CACHE` — and `SourceInfo::key` carries it.
+
+  Measured on the head-let fixture with `SLAG_CLOSURE_PHASES`: `source_info`
+  **273.0 → 183.9** cycles per closure and `total` **1890.8 → 1783.9**
+  (-5.7%); `body`, `props` and `patterns` moved inside the instrument's
+  ±50-cycle band. The wall clock does not resolve it in this window (that row
+  spans 337-602 ms within one binary), so this is an isolated win, not a row
+  claim. What is left in the phase is `enclosing_source` — a walk of the
+  execution-context stack plus a `JsString` clone per closure — and the frame
+  already carries its source, so it can carry the site key with it: that is
+  the next item.
 - **A0c — `props` and the record insert** (120–200 + 195): property adoption
   behind a pending flag like `prototype`'s is the remaining safe item. The
   record insert was attempted the obvious way and **measured worse**:

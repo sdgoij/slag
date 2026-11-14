@@ -148,9 +148,22 @@ pub(crate) struct CompiledBodyCacheEntry {
 pub struct SourceInfo {
     pub slice: Option<JsString>,
     pub full: Option<JsString>,
-    /// The site's source hash, shared so the body cache does not recompute it
-    /// per closure (`shared_function_body_with_key`).
+    /// The `full` text's site identity (`source_site_identity`), shared so the
+    /// body cache does not resolve its own text per closure
+    /// (`shared_function_body_at`).
     pub(crate) key: usize,
+}
+
+impl SourceInfo {
+    /// The site this info was resolved for: its key, and the text that key is
+    /// taken from. The body caches store the text, which is what keeps a `Flat`
+    /// source's address unique for as long as an entry keys on it.
+    fn site(&self) -> Option<SiteSource> {
+        self.full.as_ref().map(|text| SiteSource {
+            text: text.clone(),
+            key: self.key,
+        })
+    }
 }
 
 impl Trace for SourceInfo {
@@ -302,7 +315,7 @@ pub struct EcmaFunction {
     /// The two differ: `slice` is this function's own slice of `full`, and a
     /// call frame runs the whole thing, so a closure created inside the body
     /// resolves its span against the text the span belongs to
-    /// (`enclosing_source`), and `source_hash_at` keys the body cache from it.
+    /// (`enclosing_source`), and `site_source` keys the body cache from it.
     /// Shared per declaration site (`shared_source_info`): 96 bytes of text
     /// become one `Rc`. `None` when no text covered the creation site.
     pub source_info: Option<std::rc::Rc<SourceInfo>>,
@@ -1034,13 +1047,13 @@ pub fn instantiate_function_with_source(
             None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
         }
     };
-    let source_key = source_info
+    let site = source_info
         .as_ref()
-        .map(|info| info.key)
-        .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
+        .and_then(|info| info.site())
+        .or_else(|| site_source(agent, f.span));
     let body = {
         let _phase = phases::enter(phases::BODY);
-        shared_function_body_with_key(agent, f, source_key)
+        shared_function_body_at(agent, f, site)
     };
     let params = {
         let _phase = phases::enter(phases::PARAMS);
@@ -1079,28 +1092,32 @@ pub fn instantiate_function_with_source(
 /// factory share the site nodes, so the template-object cache keys by node
 /// identity hold (cache-different-functions-same-site.js). The shared body is
 /// immutable, so reentrancy is safe. The key carries the node's span and the
-/// hash of the node's source slice: raw node addresses are reused after a
-/// parse is dropped, and distinct parses of same-length sources (e.g. two
-/// modules whose functions sit at identical offsets) can otherwise collide on
-/// (address, realm, span) alone.
+/// identity of the text the span is written in (`site_source`): raw node
+/// addresses are reused after a parse is dropped, and distinct parses of
+/// same-length sources (e.g. two modules whose functions sit at identical
+/// offsets) can otherwise collide on (address, realm, span) alone.
 pub fn shared_function_body(
     agent: &Agent,
     f: &syntax::ast::Function,
     source: Option<&JsString>,
 ) -> std::rc::Rc<Block> {
-    let source_key = source
-        .map(source_hash)
-        .or_else(|| source_hash_at(agent, f.span))
-        .unwrap_or(0);
-    shared_function_body_with_key(agent, f, source_key)
+    let site = source
+        .map(|source| SiteSource {
+            key: source_site_identity(source),
+            text: source.clone(),
+        })
+        .or_else(|| site_source(agent, f.span));
+    shared_function_body_at(agent, f, site)
 }
 
-/// `shared_function_body` with the site hash already known (`SourceInfo::key`),
-/// so a cached site does not hash its own slice on every closure.
-fn shared_function_body_with_key(
+/// `shared_function_body` with the site already resolved (`SourceInfo` carries
+/// it), so a cached site does not resolve its own text on every closure. The
+/// stored entry keeps the text it keyed on, which is the other half of what
+/// makes a `Flat` source's address a sound key: the entry pins the `Arc`.
+fn shared_function_body_at(
     agent: &Agent,
     f: &syntax::ast::Function,
-    source_key: usize,
+    site: Option<SiteSource>,
 ) -> std::rc::Rc<Block> {
     let realm = agent
         .current_realm()
@@ -1111,14 +1128,15 @@ fn shared_function_body_with_key(
         realm,
         f.span.start as usize,
         f.span.end as usize,
-        source_key,
+        site.as_ref().map(|site| site.key).unwrap_or(0),
     );
     FUNCTION_BODY_CACHE.with(|cache| {
-        if let Some(body) = cache.borrow().get(&key) {
+        if let Some((body, _)) = cache.borrow().get(&key) {
             return body.clone();
         }
         let body = std::rc::Rc::new(f.body.clone());
-        cache.borrow_mut().insert(key, body.clone());
+        let pin = site.map(|site| site.text);
+        cache.borrow_mut().insert(key, (body.clone(), pin));
         body
     })
 }
@@ -1128,7 +1146,8 @@ fn shared_function_body_with_key(
 /// index into. Caching them per site turns the per-closure `span_slice`
 /// allocation into one allocation for the site's first closure. The key
 /// mirrors `shared_function_body`'s: raw node addresses are reused after a
-/// parse is dropped, so the span and a hash of the slice disambiguate them.
+/// parse is dropped, so the span and the text's identity disambiguate them
+/// (`source_site_identity`).
 fn shared_source_info(
     agent: &Agent,
     node: usize,
@@ -1140,14 +1159,8 @@ fn shared_source_info(
         .current_realm()
         .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
-    let key = (
-        node,
-        realm,
-        start,
-        end,
-        fnv1a_units(&text.as_slice()[start..end]),
-    );
-    let source_key = key.4;
+    let source_key = source_site_identity(&text);
+    let key = (node, realm, start, end, source_key);
     SOURCE_INFO_CACHE.with(|cache| {
         if let Some(info) = cache.borrow().get(&key) {
             return Some(info.clone());
@@ -1232,18 +1245,12 @@ fn source_info_with_slice(
     slice: JsString,
 ) -> std::rc::Rc<SourceInfo> {
     let full = enclosing_source(agent, span).or_else(|| Some(slice.clone()));
-    let key = source_hash(&slice);
+    let key = source_site_identity(full.as_ref().unwrap_or(&slice));
     std::rc::Rc::new(SourceInfo {
         slice: Some(slice),
         full,
         key,
     })
-}
-
-/// A stable content hash of a function's source slice, used to disambiguate
-/// cache keys across parses (see `shared_function_body`).
-fn source_hash(source: &JsString) -> usize {
-    fnv1a_units(source.as_slice())
 }
 
 /// The engine's identity for a piece of source text: the hash a breakpoint
@@ -1283,17 +1290,45 @@ fn enclosing_source(agent: &Agent, span: crux::Span) -> Option<JsString> {
     })
 }
 
-/// `source_hash` over the source slice at `span`, WITHOUT allocating the
-/// `JsString` `capture_source` builds (Cut 66): the body-site caches recompute
-/// the key on every closure, and the slice allocation dominated the
-/// per-closure cost. The resolution is `enclosing_source` — falling back to
-/// `None` would leave the cache key with only raw addresses (the AST node and
-/// the realm box), which recur across parses in one process: two same-span
-/// sites would then share one body and run the wrong code.
-fn source_hash_at(agent: &Agent, span: crux::Span) -> Option<usize> {
-    let (start, end) = (span.start as usize, span.end as usize);
-    let source = enclosing_source(agent, span)?;
-    Some(fnv1a_units(&source.as_slice()[start..end]))
+/// The text a site's spans are offsets into, with the identity its caches key
+/// it by. Every cache entry taken from a `SiteSource` stores `text`, so a
+/// `Flat` source's address cannot be recycled while an entry keys on it.
+struct SiteSource {
+    text: JsString,
+    key: usize,
+}
+
+/// The identity of a piece of source text, used as the fifth field of every
+/// site-cache key.
+///
+/// For a `Flat` source it is the allocation base of the `Arc` buffer — shared by
+/// every clone, so the same text always yields the same address and a different
+/// parse always yields a different one. That is the property the content hash
+/// was standing in for: raw node addresses are reused after a parse is dropped,
+/// so a key of (node, realm, span) alone can serve one parse's body to another.
+/// An address is only sound because the entry holding a key also holds the text
+/// (`SiteSource::text`), pinning the `Arc`; without that pin the buffer would be
+/// freed with the parse and the next parse's text could land on the same
+/// address. The forms with no stable base keep the hash: `Small` is inline in
+/// its box, and a rope's buffer is materialized only on a miss.
+fn source_site_identity(text: &JsString) -> usize {
+    match text {
+        JsString::Flat(units) if !units.is_empty() => units.as_ptr() as usize,
+        _ => fnv1a_units(text.as_slice()),
+    }
+}
+
+/// The `SiteSource` a span is written in. The identity is what removes the
+/// per-closure `source_info` phase (230 of ~840 cycles per closure,
+/// `.notes/register-tier-plan.md` §4 A0a): the old key hashed the whole source
+/// slice on every instantiation. A `None` would leave the key with only raw
+/// addresses (the AST node and the realm box), which recur across parses in one
+/// process: two same-span sites would then share one body and run the wrong
+/// code.
+fn site_source(agent: &Agent, span: crux::Span) -> Option<SiteSource> {
+    let text = enclosing_source(agent, span)?;
+    let key = source_site_identity(&text);
+    Some(SiteSource { text, key })
 }
 
 /// FNV-1a over UTF-16 code units, narrowed to `usize`. The 64-bit basis and
@@ -1310,7 +1345,8 @@ fn fnv1a_units(units: &[u16]) -> usize {
 
 type FunctionBodyKey = (usize, usize, usize, usize, usize);
 
-type FunctionBodyCache = SiteHashMap<FunctionBodyKey, std::rc::Rc<Block>>;
+type FunctionBodyCache =
+    SiteHashMap<FunctionBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
 
 thread_local! {
     static FUNCTION_BODY_CACHE: std::cell::RefCell<FunctionBodyCache> =
@@ -1367,16 +1403,16 @@ pub fn shared_arrow_body(agent: &Agent, body: &syntax::ast::ArrowBody) -> std::r
         ArrowBody::Expr(expr) => (expr.as_ref() as *const Expr as usize, expr.span),
         ArrowBody::Block(block) => (block as *const Block as usize, block.span),
     };
-    let source_key = source_hash_at(agent, span).unwrap_or(0);
+    let site = site_source(agent, span);
     let key = (
         node,
         realm,
         span.start as usize,
         span.end as usize,
-        source_key,
+        site.as_ref().map(|site| site.key).unwrap_or(0),
     );
     ARROW_BODY_CACHE.with(|cache| {
-        if let Some(block) = cache.borrow().get(&key) {
+        if let Some((block, _)) = cache.borrow().get(&key) {
             return block.clone();
         }
         let block: std::rc::Rc<Block> = match body {
@@ -1392,14 +1428,16 @@ pub fn shared_arrow_body(agent: &Agent, body: &syntax::ast::ArrowBody) -> std::r
             }
             ArrowBody::Block(block) => std::rc::Rc::new(block.clone()),
         };
-        cache.borrow_mut().insert(key, block.clone());
+        let pin = site.map(|site| site.text);
+        cache.borrow_mut().insert(key, (block.clone(), pin));
         block
     })
 }
 
 type ArrowBodyKey = (usize, usize, usize, usize, usize);
 
-type ArrowBodyCache = SiteHashMap<ArrowBodyKey, std::rc::Rc<Block>>;
+type ArrowBodyCache =
+    SiteHashMap<ArrowBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
 
 thread_local! {
     static ARROW_BODY_CACHE: std::cell::RefCell<ArrowBodyCache> =
@@ -1419,27 +1457,29 @@ pub fn shared_accessor_body(agent: &Agent, body: &Block) -> std::rc::Rc<Block> {
         .current_realm()
         .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
-    let source_key = source_hash_at(agent, body.span).unwrap_or(0);
+    let site = site_source(agent, body.span);
     let key = (
         body as *const Block as usize,
         realm,
         body.span.start as usize,
         body.span.end as usize,
-        source_key,
+        site.as_ref().map(|site| site.key).unwrap_or(0),
     );
     ACCESSOR_BODY_CACHE.with(|cache| {
-        if let Some(block) = cache.borrow().get(&key) {
+        if let Some((block, _)) = cache.borrow().get(&key) {
             return block.clone();
         }
         let block = std::rc::Rc::new(body.clone());
-        cache.borrow_mut().insert(key, block.clone());
+        let pin = site.map(|site| site.text);
+        cache.borrow_mut().insert(key, (block.clone(), pin));
         block
     })
 }
 
 type AccessorBodyKey = (usize, usize, usize, usize, usize);
 
-type AccessorBodyCache = SiteHashMap<AccessorBodyKey, std::rc::Rc<Block>>;
+type AccessorBodyCache =
+    SiteHashMap<AccessorBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
 
 thread_local! {
     static ACCESSOR_BODY_CACHE: std::cell::RefCell<AccessorBodyCache> =
@@ -1456,11 +1496,11 @@ pub fn instantiate_method(
     enclosing_strict: bool,
 ) -> Result<Value, JsError> {
     let source_info = shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span);
-    let source_key = source_info
+    let site = source_info
         .as_ref()
-        .map(|info| info.key)
-        .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
-    let body = shared_function_body_with_key(agent, f, source_key);
+        .and_then(|info| info.site())
+        .or_else(|| site_source(agent, f.span));
+    let body = shared_function_body_at(agent, f, site);
     let params = shared_params(&body, &f.params);
     register_function(
         agent,
@@ -2094,18 +2134,18 @@ pub fn instantiate_function_from_source(
     // `Function` constructor's assembled string for the sibling path — so its
     // spans index into it, not into whatever the running frame has.
     let source_info = source.map(|full| {
-        let key = source_hash(&full);
+        let key = source_site_identity(&full);
         std::rc::Rc::new(SourceInfo {
             slice: Some(full.clone()),
             full: Some(full),
             key,
         })
     });
-    let source_key = source_info
+    let site = source_info
         .as_ref()
-        .map(|info| info.key)
-        .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
-    let body = shared_function_body_with_key(agent, f, source_key);
+        .and_then(|info| info.site())
+        .or_else(|| site_source(agent, f.span));
+    let body = shared_function_body_at(agent, f, site);
     let params = shared_params(&body, &f.params);
     let value = register_function(
         agent,
