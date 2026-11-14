@@ -277,6 +277,23 @@ pub enum Op {
     /// A context slot init (`Step::InitContextSlot`), lowered through
     /// `init_context`; `args = [value]`.
     ContextInit,
+    /// The `for (let ... in/of ...)` per-iteration environment: the first
+    /// iteration's fresh bindings (`Step::EnterPerIteration`), the later
+    /// iterations' copies (`Step::PerIteration`), and their reads and writes
+    /// (`Step::LoadPerIteration`/`StorePerIteration`). Lowered through the same
+    /// helpers the per-step path calls; `imm` is the step index for the two
+    /// enter forms and the `Imm::Context` depth/index for the slot ops.
+    PerIterEnter,
+    PerIterNext,
+    PerIterLoad,
+    PerIterStore,
+    /// A block-scope exit (`Step::LeaveBlock`): pops the environment stack
+    /// through `leave_block`; no value, no args.
+    LeaveBlock,
+    /// `typeof` of the operand (`Step::TypeofTop`), through `typeof_top`.
+    /// Pure — the operator never runs user code (it does not consult
+    /// `Symbol.toStringTag`).
+    TypeofTop,
     MemberLoad,
     MemberStore,
     /// A speculative member-value cell load: `object`'s `atom` data-property
@@ -502,7 +519,13 @@ impl Op {
             | Op::ForInBegin
             | Op::ForInNext
             | Op::ForOfBindLocal
-            | Op::UpdateValue => E::call(),
+            | Op::UpdateValue
+            | Op::PerIterEnter
+            | Op::PerIterNext
+            | Op::PerIterLoad
+            | Op::PerIterStore
+            | Op::LeaveBlock => E::call(),
+            Op::TypeofTop => E::pure(),
         }
     }
 }

@@ -88,6 +88,8 @@ The morning revision listed these as future work. They are in the tree:
 | materialization census (B0) | `opt/census.rs`, `JIT_DUMP_IR` | per-iteration conversions by cause, printed with the IR dump; §1.3 |
 | named lift refusals (A3) | `opt/lift/mod.rs` | `opt bail` names the refused family (`HoistGuard`, `Switch`, `Try`, `Generator`, …), `opt-refuse` the exact step |
 | negated comparisons lift | `opt/lift/mod.rs` | `!=`/`!==` as the base comparison plus a pure `Not`, so a body whose hot callee is `x !== 0 || 1/x === 1/y` enters the tier |
+| per-iteration environment lifts | `opt/lift/mod.rs`, `ir.rs`, `opt_lower.rs` | `EnterPerIteration`/`PerIteration`/`LoadPerIteration`/`StorePerIteration`, `LeaveBlock`, `TypeofTop` as helper calls; the 101-step `__t262Body` (the corpus's largest row) now compiles |
+| `TemplateSub` delta fix | `opt/lift/mod.rs` | the substitution fence is a pop *and* a push; charging it −1 drifted the block depth and refused any body with a template before a conditional |
 | closure phase instrument | `function::phases`, `SLAG_CLOSURE_PHASES` | per-phase TSC cycles per closure, overhead-calibrated; §4 A0 |
 | `Int`-op operand check | `opt_lower.rs` (`opt:int-operand`) | a wrapping `i32` op over `Value`-word operands refuses instead of `iadd`ing tag bits |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
@@ -391,17 +393,23 @@ So the cuts are the four named items, not the plumbing:
 corpus differential and `--gc-stress` stay exact (a closure is a heap object with
 an environment edge — the rooting traps in §7 apply).
 
-**A1 — the corpus's biggest body cannot enter the tier.** `__t262Body` in the
-`head-let` fixture is 101 steps and bails on the `for (let x in obj)`
-per-iteration environment family (`EnterPerIteration`, `PerIteration`,
-`LoadPerIteration`, `StorePerIteration`, `LeaveBlock`) plus `TypeofTop`. Each is
-a helper call in the per-step tier (`enter_per_iteration`, `per_iteration`,
-`load_per_iter`, `store_per_iter`, `leave_block`, `typeof_top` are all in the
-helper table), so this is a mechanical lift of six op families, and it is a
-prerequisite for A0 paying anything on that row: the tier cannot make the body
-faster while the body is not in the tier. Expect coverage, not speed — the
-`is()` body (§1.4) lifted at ~2%. **Accept:** the body lifts; the row ≤ its
-per-step time; helper census not worse.
+**A1 — the corpus's biggest body cannot enter the tier (landed 2026-11-14).**
+`__t262Body` in the `head-let` fixture was 101 steps and bailed on the
+`for (let x in obj)` per-iteration environment family (`EnterPerIteration`,
+`PerIteration`, `LoadPerIteration`, `StorePerIteration`, `LeaveBlock`) plus
+`TypeofTop`. All six now lift as helper calls (`PerIterEnter`/`PerIterNext`/
+`PerIterLoad`/`PerIterStore`/`LeaveBlock`/`TypeofTop`), and the same cut found a
+real modelling bug: `TemplateSub` is a pop *and* a push, but `stack_delta`
+charged it −1, so every substitution drifted the block depth down and any body
+with a template before a conditional was refused as `Malformed("stack
+underflow")` — that is what kept the template fixture's 40-step body out.
+
+Measured outcome: **parity, not speed** (1.002–1.020× against `SLAG_OPT=0` over
+three five-round runs on both fixtures; corpus 2.62–2.70× node, differential
+exact). Two more bodies are compiled and the last anonymous/malformed refusals
+are gone; the two fixtures are still allocation- and call-bound, which is A0
+and D5/E, not coverage. The one refusal left in either fixture is
+`UpdateContextSlot`, the deliberate one the notes' test pins.
 
 **A1b — the register body's member leaf ops (S3) and stores (S4).** Lift
 `GetMemberNameLocal`/`GetMemberComputedLocal` to `MemberLoad`/`MemberCellLoad` +
@@ -683,6 +691,15 @@ Added 2026-11-14 by the B0 census:
   measured 31 cycles, i.e. ~20% of a 160-cycle phase, and 12 phases put ~370
   cycles inside the `total` they inflate. Time an empty block beside the real
   phases and subtract it, or the split will read as nine equal slices.
+- **A step's stack delta is the block-depth model, not a stack trace.**
+  `stack_delta` feeds `stack_depths`, which sizes merge-block parameters and
+  checks each conditional's edge for underflow. A pop-plus-push step charged as
+  a pure pop (`TemplateSub`, −1 instead of 0) does not fail where it is
+  written: it drifts every later join by one per occurrence and refuses the
+  body as `Malformed("stack underflow")` at the first conditional after it. The
+  drift is uniform along a path, so joins stay consistent and nothing
+  miscompiles — the symptom is always a refusal, and the reason names a step
+  that is not the culprit.
 - **A hypothesis that names a chunk is not a measurement that locates it.** The
   missing quarter of the closure path looked like caller-side `Rc` clones;
   instrumenting both sides showed ~70 cycles of call overhead and put the rest

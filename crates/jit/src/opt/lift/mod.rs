@@ -620,7 +620,6 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::StoreLocal { .. }
         | Step::InitLocal { .. }
         | Step::FusedStoreLocal { .. }
-        | Step::TemplateSub
         | Step::TaggedTemplate(_)
         | Step::Binary(_)
         | Step::GetMemberComputed
@@ -628,10 +627,15 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::StoreContextSlot { .. }
         | Step::InitContextSlot { .. } => -1,
         // `BinaryImm` pops its left operand and pushes the result, a member
-        // read pops the receiver and pushes the value; the rest are net-neutral.
+        // read pops the receiver and pushes the value, and a substitution's
+        // `ToString` fence replaces the top (it is a pop *and* a push — the
+        // deltas here are the block-depth model, so charging it −1 drifts every
+        // later join and underflows the first conditional after a template);
+        // the rest are net-neutral.
         Step::BinaryImm { .. }
         | Step::GetMemberName { .. }
         | Step::Unary(_)
+        | Step::TemplateSub
         | Step::ResetCompletion
         | Step::NormalizeCompletion
         | Step::ListBegin
@@ -639,6 +643,15 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::SaveCompletion
         | Step::RestoreCompletion
         | Step::FunctionDeclInit { .. } => 0,
+        // The `for (let ... in/of ...)` per-iteration environment family: the
+        // enter/copy steps and the block exit are net-neutral, a slot read
+        // pushes and a write pops, and `typeof` replaces the top.
+        Step::EnterPerIteration { .. }
+        | Step::PerIteration { .. }
+        | Step::LeaveBlock
+        | Step::TypeofTop => 0,
+        Step::LoadPerIteration { .. } => 1,
+        Step::StorePerIteration { .. } => -1,
         // The pause/step protocol's debug point (§14.4): a no-op on every
         // compiled tier for the same reason as `emit_step`'s arm. Refusing it
         // here does not just add a branch, it demotes the whole body from the
@@ -1144,6 +1157,76 @@ fn emit_step(
                     depth: *depth as u32,
                     index: *index as u32,
                 },
+            );
+            stack.push(v);
+        }
+        // The `for (let ... in/of ...)` per-iteration environment: the first
+        // iteration pushes fresh bindings, later ones copy the previous env,
+        // and the loop's exit pops it (`LeaveBlock`). The helpers carry the
+        // whole semantics, so the lift only has to keep the stack honest.
+        Step::EnterPerIteration { .. } => {
+            builder.emit_void(
+                block,
+                Op::PerIterEnter,
+                &[],
+                Op::PerIterEnter.default_effects(),
+                Imm::Int(index as i32),
+            );
+        }
+        Step::PerIteration { .. } => {
+            builder.emit_void(
+                block,
+                Op::PerIterNext,
+                &[],
+                Op::PerIterNext.default_effects(),
+                Imm::Int(index as i32),
+            );
+        }
+        Step::LoadPerIteration { depth, index: slot } => {
+            let v = builder.emit(
+                block,
+                Op::PerIterLoad,
+                &[],
+                Type::Unknown,
+                Op::PerIterLoad.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *slot as u32,
+                },
+            );
+            stack.push(v);
+        }
+        Step::StorePerIteration { depth, index: slot } => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            builder.emit_void(
+                block,
+                Op::PerIterStore,
+                &[value],
+                Op::PerIterStore.default_effects(),
+                Imm::Context {
+                    depth: *depth as u32,
+                    index: *slot as u32,
+                },
+            );
+        }
+        Step::LeaveBlock => {
+            builder.emit_void(
+                block,
+                Op::LeaveBlock,
+                &[],
+                Op::LeaveBlock.default_effects(),
+                Imm::None,
+            );
+        }
+        Step::TypeofTop => {
+            let value = stack.pop().ok_or(Unsupported::Stack)?;
+            let v = builder.emit(
+                block,
+                Op::TypeofTop,
+                &[value],
+                Type::String,
+                Op::TypeofTop.default_effects(),
+                Imm::None,
             );
             stack.push(v);
         }
@@ -2973,6 +3056,60 @@ mod tests {
         let func = lift(&b).expect("lifts");
         let entry = func.entry();
         assert_eq!(func.block(entry).insts[4].imm, Imm::Float(4.0));
+    }
+
+    #[test]
+    fn a_template_substitution_is_net_neutral() {
+        // `TemplateSub` pops the substitution and pushes its `ToString` fence's
+        // result: net 0. Charging it −1 (as this model did) drifts the block
+        // depth by one per substitution, so the first conditional after a
+        // template underflows and the body is refused as malformed — which is
+        // what kept the template fixture's 40-step body out of the tier.
+        assert_eq!(stack_delta(&Step::TemplateSub).expect("modelled"), 0);
+    }
+
+    #[test]
+    fn lifts_the_per_iteration_environment() {
+        // `for (let x in obj) { ... }`: the first iteration's fresh bindings,
+        // a later iteration's copies, a read and a write of the binding, the
+        // block exit, and a `typeof`. Before these arms the whole body bailed,
+        // which is what kept the corpus's largest fixture out of the tier.
+        let b = body(
+            vec![
+                Step::EnterPerIteration {
+                    names: vec![crux::JsString::from_utf8("x")],
+                },
+                Step::PerIteration {
+                    names: vec![crux::JsString::from_utf8("x")],
+                },
+                Step::LoadPerIteration { depth: 0, index: 0 },
+                Step::StorePerIteration { depth: 0, index: 0 },
+                Step::LoadPerIteration { depth: 0, index: 0 },
+                Step::TypeofTop,
+                Step::LeaveBlock,
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("the per-iteration environment lifts");
+        let entry = func.entry();
+        let ops: Vec<Op> = func.block(entry).insts.iter().map(|i| i.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                Op::PerIterEnter,
+                Op::PerIterNext,
+                Op::PerIterLoad,
+                Op::PerIterStore,
+                Op::PerIterLoad,
+                Op::TypeofTop,
+                Op::LeaveBlock,
+            ]
+        );
+        // The store consumes the read's value; `typeof` replaces the second
+        // read's, so the body's operand stack ends balanced and the `return`
+        // sees exactly one value.
+        assert_eq!(func.block(entry).insts.last().map(|i| i.result), Some(None));
     }
 
     #[test]

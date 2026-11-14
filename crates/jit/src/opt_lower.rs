@@ -103,6 +103,9 @@ struct Abi {
     /// The `(vm, callee, this, argc, args, direct_eval)` signature of the
     /// general `call_slow` helper.
     sig_call_slow: SigRef,
+    /// The `(ctx, depth, index, value)` signature of the per-iteration slot
+    /// store helper.
+    sig_per_iter_store: SigRef,
     /// The `(frame, stack, ctx) -> value` signature of a compiled body's entry —
     /// the in-frame leaf lane calls the callee's entry with it directly.
     sig_entry: SigRef,
@@ -157,6 +160,7 @@ fn lower(
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
         sig_tdz: builder.import_signature(helper_sig(&[types::I64; 1], conv)),
         sig_call_slow: builder.import_signature(helper_sig(&[types::I64; 6], conv)),
+        sig_per_iter_store: builder.import_signature(helper_sig(&[types::I64; 5], conv)),
         sig_entry: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
@@ -676,6 +680,76 @@ fn lower_inst(
             let ok = builder.ins().icmp(IntCC::Equal, callee, expected);
             emit_guard(builder, abi, ok, step, &inst.args[2..], values)?;
             callee
+        }
+        // The `for (let ... in/of ...)` per-iteration environment, and the
+        // block-scope exit / `typeof` that sit beside it: the same helpers the
+        // per-step path calls. The enter forms read their payload (the binding
+        // names) from the running body by step index.
+        Op::PerIterEnter | Op::PerIterNext => {
+            let Imm::Int(step) = inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter"));
+            };
+            let step = builder.ins().iconst(types::I64, step as i64);
+            let helper = if inst.op == Op::PerIterEnter {
+                Helper::EnterPerIteration
+            } else {
+                Helper::PerIteration
+            };
+            call_helper(builder, helpers, abi, abi.sig_unary, helper, &[step])?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::PerIterLoad => {
+            let Imm::Context { depth, index } = inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter-load"));
+            };
+            let depth = builder.ins().iconst(types::I64, depth as i64);
+            let index = builder.ins().iconst(types::I64, index as i64);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_binary,
+                Helper::LoadPerIter,
+                &[depth, index],
+            )?
+        }
+        Op::PerIterStore => {
+            let Imm::Context { depth, index } = inst.imm else {
+                return Err(Unsupported::Step("opt:per-iter-store"));
+            };
+            let depth = builder.ins().iconst(types::I64, depth as i64);
+            let index = builder.ins().iconst(types::I64, index as i64);
+            let value = arg!(0);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_per_iter_store,
+                Helper::StorePerIter,
+                &[depth, index, value],
+            )?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::LeaveBlock => {
+            call_helper(builder, helpers, abi, abi.sig_tdz, Helper::LeaveBlock, &[])?;
+            builder
+                .ins()
+                .iconst(types::I64, JsValue::Undefined.bits() as i64)
+        }
+        Op::TypeofTop => {
+            let value = arg!(0);
+            call_helper(
+                builder,
+                helpers,
+                abi,
+                abi.sig_bool,
+                Helper::TypeofTop,
+                &[value],
+            )?
         }
         // A callee identity comparison for a splice's mismatch branch: the same
         // bits comparison the callee guard makes, materialized as a value so the
