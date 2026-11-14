@@ -87,6 +87,7 @@ The morning revision listed these as future work. They are in the tree:
 | literal scalar replacement (E, narrow) | `70fa450b`, `9189ec80`, `pass/scalar.rs` | whole `ObjectFast`/`ArrayFast` bodies whose reads are all constant-keyed |
 | materialization census (B0) | `opt/census.rs`, `JIT_DUMP_IR` | per-iteration conversions by cause, printed with the IR dump; §1.3 |
 | named lift refusals (A3) | `opt/lift/mod.rs` | `opt bail` names the refused family (`HoistGuard`, `Switch`, `Try`, `Generator`, …), `opt-refuse` the exact step |
+| negated comparisons lift | `opt/lift/mod.rs` | `!=`/`!==` as the base comparison plus a pure `Not`, so a body whose hot callee is `x !== 0 || 1/x === 1/y` enters the tier |
 | `Int`-op operand check | `opt_lower.rs` (`opt:int-operand`) | a wrapping `i32` op over `Value`-word operands refuses instead of `iadd`ing tag bits |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
@@ -150,6 +151,51 @@ does say is that the two mechanisms that *produced* the level-3 lanes
 (`canon` median 0, `int` median 1) are working as designed: the values that are
 in registers stay in registers, and what remains is the residue the four
 materialization points legitimately require.
+
+---
+
+### 1.4 Where the two rows that dominate the gap actually spend it
+
+The two language fixtures are ~45% of the corpus gap (head-let 335 ms, template
+227 ms on a 2026-11-14 pass). Ablating head-let (100k bodies per call, ms):
+
+| variant | ms | delta |
+|---|---:|---|
+| full fixture | 327 | |
+| `for-in` + member stores, no closures, no asserts | 69 | enumeration + stores = 69 |
+| closures per iteration + `for-in`, no asserts | 293 | **+224 for the closure path** |
+| 3 closures + 3 calls, no `for-in` | 153 | closure path alone |
+| template fixture, no asserts | 116 | asserts = 140 of its 256 |
+
+Microbenchmarks (200k iterations, opt tier) price the pieces: a closure created
+and called **581 ns/iteration** (no capture 487, created-but-never-called **339**,
+arrow instead of function 571, escaping into a property 547), while a hoisted
+closure called per iteration costs **7 ns**, a plain object literal is
+**2.3 ns** (scalar-replaced), and node eliminates the non-escaping closure
+entirely (0.6 ns/iteration). So **function-object creation is ~340 ns**, two
+orders above an object literal, and the call itself is ~7 ns.
+
+The helper census agrees on the shape (per body, from `JIT_HELPER_STATS`):
+head-let makes 21 helper calls (`CertifiedCall` 3, `UnarySlow` 2, `BinarySlow` 2,
+`ForInNext` 1.3, `PerIteration`/`LoadPerIter`/`StorePerIter` 3, `CreateFunction`
+1, `AssignMemberName`/`AssignMemberComputed`/`FastArrayElementWrite`/`LoadIdent`/
+`TypeofTop` 1 each); the template fixture makes 26 (`UnarySlow` 5,
+`CertifiedCall` 5, `LoadContext` 3, `ArgsPush` 3, `TemplateSub` 2, then the
+template/tag/context steps).
+
+Two consequences for the ordering, and they are the reason §4 now starts with
+A0 rather than a lift:
+
+- **The gap in these rows is creation and call machinery, not register traffic.**
+  B0 (§1.3) measured 1–2 avoidable conversions per iteration; the closure path
+  is 340 ns *per closure*. Lifting `is()` (a 30-step body every assert calls)
+  was worth ~2% on both fixtures by same-binary A/B — real, but not the lever.
+- **The biggest row's hot body is still outside the tier**: `__t262Body` is 101
+  steps and bails on `EnterPerIteration`/`PerIteration`/`LoadPerIteration`/
+  `StorePerIteration`/`LeaveBlock`/`TypeofTop` — the `for (let x in obj)`
+  per-iteration environment family. Lifting it is *necessary* for the row, but
+  by the ablation it cannot be *sufficient*: the closures it creates cost 340 ns
+  each and the tier does not change that.
 
 ---
 
@@ -270,12 +316,41 @@ probe prints beside it.
 
 ## 4. The remaining work
 
-Ordered by dependency. **A** is coverage (no perf claim of its own); **C** is
-what makes a register-held heap value sound; **D5** is the one call lane left;
-**F1** is the oracle the rest of the read/arith work needs. The B0 probe (§1.3)
-retires most of Phases B and E *as scoped*; what survives of each is listed.
+Ordered by measured impact, then by dependency (§1.3 and §1.4 are the evidence).
+**A0** is the corpus's largest single term; **A** is coverage (no perf claim of
+its own); **C** makes a register-held heap value sound; **D5** is the one call
+lane left; **F1** is the oracle the read/arith work needs. The B0 probe (§1.3)
+retires most of Phases B and E *as scoped*.
 
-**A1 — the register body's member leaf ops (S3) and stores (S4).** Lift
+**A0 — function-object creation (~340 ns each).** The measured dominant term in
+the corpus's two largest rows (§1.4): three closures per body cost ~1 µs of
+head-let's 3.3 µs, against node's 570 ns for the *whole* body. `register_function`
+(`crates/runtime/src/function.rs`) already carries three landed cuts (shared
+body per site, batched `length`/`name` properties, pre-forked `[[Prototype]]`),
+so the next step is a phase instrument on the path — `Function::new_with_prototype`,
+`shared_compiled_body`, `register_ecma_function`, the batched property adoption,
+`store_construct_patterns` — measured the way the call lane's phase split was
+(§1). At ~44 ns per empty object (the plan's own allocation measurement) the
+340 ns is roughly eight allocations, so the candidate cuts are structural: merge
+the `EcmaFunction` record into the function box, skip the constructor-pattern
+record for non-constructors, and drop a per-closure `Rc` clone. **Accept:** the
+closure micro (§1.4) falls; both fixtures fall with it; the corpus differential
+and `--gc-stress` stay exact (a closure is a heap object with an environment
+edge — the rooting traps in §7 apply).
+
+**A1 — the corpus's biggest body cannot enter the tier.** `__t262Body` in the
+`head-let` fixture is 101 steps and bails on the `for (let x in obj)`
+per-iteration environment family (`EnterPerIteration`, `PerIteration`,
+`LoadPerIteration`, `StorePerIteration`, `LeaveBlock`) plus `TypeofTop`. Each is
+a helper call in the per-step tier (`enter_per_iteration`, `per_iteration`,
+`load_per_iter`, `store_per_iter`, `leave_block`, `typeof_top` are all in the
+helper table), so this is a mechanical lift of six op families, and it is a
+prerequisite for A0 paying anything on that row: the tier cannot make the body
+faster while the body is not in the tier. Expect coverage, not speed — the
+`is()` body (§1.4) lifted at ~2%. **Accept:** the body lifts; the row ≤ its
+per-step time; helper census not worse.
+
+**A1b — the register body's member leaf ops (S3) and stores (S4).** Lift
 `GetMemberNameLocal`/`GetMemberComputedLocal` to `MemberLoad`/`MemberCellLoad` +
 `MemberGuard` (read-only first, as S3 was scoped), then `BinAccPop`, `UpdateAcc`
 and the member stores. Probe: `JIT_DUMP_STEPS` bodies per row, before/after, and
@@ -399,7 +474,7 @@ coverage-blocked (§3), not pass-blocked, which is why they come after A1.
 ## 5. Ordering
 
 ```
-A1 (S3/S4 member leaves) -> A2 (model the hoist probe: 6 rows) -> A4 (SwitchDisc, rest)
+A0 (function-object creation)  <- A1 (the 101-step body's env family)  <- A1b (S3/S4)
         |
         v
    D5 (callback lane: inlined loop bodies)   F1 (clobberize) -> F2 (GVN/loads)
@@ -412,9 +487,9 @@ A3 (naming the refusal) is landed; it is what makes this ordering readable, and
 it is the first cut of any future coverage arc, because a bucket you cannot
 name is a bucket you cannot size.
 
-- **A gates the rest**: 18 rows are still outside the tier, and the ones with
-  the largest gaps (`proto_read`, `own_read`, `many_objects_read`) are in that
-  set. Coverage is not an optimization, but it is the precondition for one.
+- **A0 gates the corpus total**: the two fixtures are ~45% of the gap and the
+  closure path is ~2/3 of the larger one. Coverage (A1/A1b) is a precondition
+  for A0 on those rows, but the allocation cost is what has to move.
 - **D5 before E**: escape analysis has nothing to work on until a call boundary
   disappears, and the callback row is where the call traffic is.
 - **C2 before any level-2 heap value.** Nothing above requires it, because the
@@ -534,6 +609,19 @@ Added 2026-11-14 by the B0 census:
   `Op::Canon` sites and `Int` operand widens are structural; the
   frame/guard/alloc/call/compute charge is an op classification. Quote the
   structural numbers as facts and the split as evidence.
+- **A parity-neutral lift is not a win, and a win needs a denominator.** Lifting
+  the 30-step `is()` body (every assert calls it) measured 0.98–1.00× against
+  `SLAG_OPT=0` on both fixtures: the tier was neither better nor worse, because
+  the row's time is in the closures the body creates (340 ns each), not in the
+  body's execution. Before crediting a lift, price the row's *creation* work
+  with an ablation (§1.4); a body can be perfectly compiled and still be 2% of
+  the row.
+- **A refusal that moves later can expose a genuine underflow.** Widening the
+  lift moved the template fixture's 40-step body from `Step("Binary")` to
+  `Malformed("stack underflow")` — a latent lift bug previously masked by the
+  earlier bail. Both are refusals (the body still runs per-step), but the second
+  means the lift's stack model is wrong somewhere in that body's shapes; treat a
+  reason change after a widening as a new work item, not as "still refused".
 - **A corpus total is only comparable within a session and a corpus size.** The
   morning revision's 2.70× and this session's 2.68–3.06× are not a regression:
   81 rows vs 77, and a different load window. Four passes on one binary in one

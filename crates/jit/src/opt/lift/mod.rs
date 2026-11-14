@@ -2550,7 +2550,15 @@ fn emit_binary(
     left: ValueId,
     right: ValueId,
 ) -> Result<(), Unsupported> {
-    let op = binary_op(op)?;
+    // The negated comparisons have no IR op of their own: `x != y` is
+    // `!(x == y)` (and the strict forms likewise), and `Op::Not` on the
+    // comparison's canonical `Bool` is a pure bit flip, so the pair is two
+    // instructions and no helper.
+    let (op, negate) = match op {
+        BinaryOp::NotEqual => (Op::Eq, true),
+        BinaryOp::StrictNotEqual => (Op::StrictEq, true),
+        other => (binary_op(other)?, false),
+    };
     let v = builder.emit(
         block,
         op,
@@ -2559,6 +2567,18 @@ fn emit_binary(
         op.default_effects(),
         Imm::None,
     );
+    let v = if negate {
+        builder.emit(
+            block,
+            Op::Not,
+            &[v],
+            Type::Bool,
+            Op::Not.default_effects(),
+            Imm::None,
+        )
+    } else {
+        v
+    };
     stack.push(v);
     Ok(())
 }
@@ -2606,6 +2626,8 @@ fn binary_op(op: BinaryOp) -> Result<Op, Unsupported> {
         BinaryOp::BitAnd => Op::BitAnd,
         BinaryOp::BitXor => Op::BitXor,
         BinaryOp::BitOr => Op::BitOr,
+        // The negated forms are lowered by `emit_binary`, which has room for
+        // the trailing `Not`; a *leaf* op that reaches here still refuses.
         BinaryOp::In | BinaryOp::Instanceof | BinaryOp::NotEqual | BinaryOp::StrictNotEqual => {
             return Err(Unsupported::Step("Binary"));
         }
@@ -2951,6 +2973,30 @@ mod tests {
         let func = lift(&b).expect("lifts");
         let entry = func.entry();
         assert_eq!(func.block(entry).insts[4].imm, Imm::Float(4.0));
+    }
+
+    #[test]
+    fn lifts_a_negated_comparison() {
+        // `f[0] !== 0`: the base comparison plus a pure `Not`. The negated forms
+        // have no IR op of their own, and this is what unblocked the 30-step
+        // `is()` body every assert in the corpus calls.
+        let b = body(
+            vec![
+                Step::LoadLocal { slot: 0 },
+                Step::BinaryImm {
+                    op: BinaryOp::StrictNotEqual,
+                    imm: 0.0,
+                },
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("a negated comparison lifts");
+        let entry = func.entry();
+        let insts = &func.block(entry).insts;
+        assert!(insts.iter().any(|i| i.op == Op::StrictEq));
+        assert!(insts.iter().any(|i| i.op == Op::Not));
+        assert_eq!(insts.last().map(|i| i.ty), Some(Type::Bool));
     }
 
     #[test]
