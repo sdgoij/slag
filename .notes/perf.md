@@ -20369,3 +20369,52 @@ thing is a few nanoseconds — the lane's ~18-25 ns is the frame carve, the
 `install_nested_frame`/`restore_scratch` pair and the helper round trip, not the
 record fetch. Do not re-attempt this cache without a probe that can resolve
 2 ns/call.
+
+## MEASURED (2026-11-13): `head-let` makes ~57 JIT helper round trips per body
+
+`JIT_HELPER_STATS=1` on the row alone gives a census (one `bench()` of 100k
+bodies; counts normalized against `ForInBegin`'s one-per-body):
+
+| helper | per body | what it is |
+|---|---:|---|
+| `CertifiedCall` | 9 | the six `assert.sameValue` calls plus `is` inside them, and `fns.a()` |
+| `BinarySlow` | 6 | `x === y` on two strings (the assert comparisons) |
+| `UnarySlow` | 6 | `typeof x` |
+| `ForInNext` | 4 | 3 keys + the done check |
+| `CreateFunction` | 3 | the three closures |
+| `AssignMemberName` / `AssignMemberComputed` | 3 / 3 | `obj.a = 1` and `fns[x] = …` |
+| `LoadPerIter` / `StorePerIter` / `PerIteration` | 3 each | the for-in head binding |
+| `TypeofTop`, `LoadIdent`, `GetMemberName`, `InitContext`, `LeaveBlock`, `ObjectBegin`, `ForInBegin`, `EnterPerIteration` | 1 each | |
+
+That is **~57 helper calls per body**, and `CreateFunction`'s three calls carry
+948 ns of the body's 3593 (26%).
+
+The census also says what the JIT *does* inline: `GetMemberName` costs 1 call per
+body even though the body reads members a dozen times, so the value-cell probe is
+compiled and only misses call the helper. `LoadContextSlot` is 7 calls for the
+whole run. What is NOT inlined and cannot be without new emitter work: `typeof`
+(18 ns/call measured against a local), string `===` (17 ns, against 6.3 for a
+number compare), member *writes*, closure creation, and the per-iteration env
+copy.
+
+Measured costs of those, per operation, `release`, one row per process:
+
+| probe (10M iterations) | slag | node |
+|---|---:|---:|
+| `typeof v === 'number'`, `v` a local number | 18.1 ns | 4.1 |
+| `typeof o.prop === 'number'` | 2.5 | 3.1 |
+| `a === b`, two strings | 16.9 | 4.2 |
+| `a === b`, two numbers | 6.3 | 4.1 |
+| `is(a, b)` (the assert helper, strings) | 29.0 | 42.3 |
+
+So the two amplified rows' remaining ~570 ms is: closure creation (~950 ns/body),
+~57 helper round trips (~10 ns each of pure call overhead), and the preamble's
+`typeof`/string-compare constants. The first needs the `Function`/`JsObject`
+one-allocation merge (W3a); the second and third need emitter inlining of
+`typeof`, string equality, member writes and the per-iteration env copy.
+
+A diagnostic build that skipped the record insert + boilerplate in
+`register_function` to bound them broke ("Function body is not registered" — the
+function's own properties need the record), so the plan's component split
+(record insert 44, boilerplate 29, compiled-body cache 26, preamble 35, boxes
+104) remains the only measurement of that path.
