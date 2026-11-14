@@ -88,6 +88,7 @@ The morning revision listed these as future work. They are in the tree:
 | materialization census (B0) | `opt/census.rs`, `JIT_DUMP_IR` | per-iteration conversions by cause, printed with the IR dump; §1.3 |
 | named lift refusals (A3) | `opt/lift/mod.rs` | `opt bail` names the refused family (`HoistGuard`, `Switch`, `Try`, `Generator`, …), `opt-refuse` the exact step |
 | negated comparisons lift | `opt/lift/mod.rs` | `!=`/`!==` as the base comparison plus a pure `Not`, so a body whose hot callee is `x !== 0 || 1/x === 1/y` enters the tier |
+| closure phase instrument | `function::phases`, `SLAG_CLOSURE_PHASES` | per-phase TSC cycles per closure, overhead-calibrated; §4 A0 |
 | `Int`-op operand check | `opt_lower.rs` (`opt:int-operand`) | a wrapping `i32` op over `Value`-word operands refuses instead of `iadd`ing tag bits |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
@@ -324,19 +325,37 @@ retires most of Phases B and E *as scoped*.
 
 **A0 — function-object creation (~340 ns each).** The measured dominant term in
 the corpus's two largest rows (§1.4): three closures per body cost ~1 µs of
-head-let's 3.3 µs, against node's 570 ns for the *whole* body. `register_function`
-(`crates/runtime/src/function.rs`) already carries three landed cuts (shared
-body per site, batched `length`/`name` properties, pre-forked `[[Prototype]]`),
-so the next step is a phase instrument on the path — `Function::new_with_prototype`,
-`shared_compiled_body`, `register_ecma_function`, the batched property adoption,
-`store_construct_patterns` — measured the way the call lane's phase split was
-(§1). At ~44 ns per empty object (the plan's own allocation measurement) the
-340 ns is roughly eight allocations, so the candidate cuts are structural: merge
-the `EcmaFunction` record into the function box, skip the constructor-pattern
-record for non-constructors, and drop a per-closure `Rc` clone. **Accept:** the
-closure micro (§1.4) falls; both fixtures fall with it; the corpus differential
-and `--gc-stress` stay exact (a closure is a heap object with an environment
-edge — the rooting traps in §7 apply).
+head-let's 3.3 µs, against node's 570 ns for the *whole* body.
+
+The phase instrument (`SLAG_CLOSURE_PHASES=1`, `function::phases`) splits the
+path into TSC cycles per closure, with an empty timed block measuring the
+instrument's own per-phase cost (~31 cycles, subtracted below):
+
+| phase | cycles/closure | what it is |
+|---|---:|---|
+| `source_info` | 230 | the `SourceInfo` cache lookup + slice/hash for `Function.prototype.toString` |
+| `props` | 199 | `length`/`name` (+ sloppy `caller`/`arguments`) adoption |
+| `register` | 195 | the `EcmaFunction` record insert into the agent's table |
+| `function_new` | 169 | the `Function` object allocation with its prototype |
+| `record`, `strict`, `body`, `params`, `compile`, `patterns`, `realm`, `context` | ~60 total | every cached lookup is cheap; the record build is ~25 |
+| **unaccounted** | **~446** | outside the instrumented phases: the `outer_chain`/`per_iteration_chain`/`named` clones passed by value at each creation site, and the call plumbing |
+
+The picture is diffuse — four ~200-cycle items and a third of the cost in
+plumbing — so there is no single 2× cut:
+
+- **A0a — `source_info` laziness** (230 cycles): resolve the source slice only
+  when a consumer asks (`toString`, a span-carrying frame). Nothing else needs
+  it at creation time.
+- **A0b — the caller-side plumbing** (~446 cycles, the largest chunk): drop the
+  by-value environment/chain/name clones at the creation sites and instrument
+  the caller side to confirm the split before moving code.
+- **A0c — `props` and `register`** (199 + 195): defer `name`/`length` behind the
+  same pending flag the `prototype` already uses, and fold the record into the
+  function box (or at least avoid a second allocation for it).
+
+**Accept:** the closure micro (§1.4) falls; both fixtures fall with it; the
+corpus differential and `--gc-stress` stay exact (a closure is a heap object with
+an environment edge — the rooting traps in §7 apply).
 
 **A1 — the corpus's biggest body cannot enter the tier.** `__t262Body` in the
 `head-let` fixture is 101 steps and bails on the `for (let x in obj)`
@@ -622,6 +641,15 @@ Added 2026-11-14 by the B0 census:
   earlier bail. Both are refusals (the body still runs per-step), but the second
   means the lift's stack model is wrong somewhere in that body's shapes; treat a
   reason change after a widening as a new work item, not as "still refused".
+- **An instrument's own cost is a phase.** Two `_rdtsc` reads plus an atomic add
+  measured 31 cycles, i.e. ~20% of a 160-cycle phase, and 12 phases put ~370
+  cycles inside the `total` they inflate. Time an empty block beside the real
+  phases and subtract it, or the split will read as nine equal slices.
+- **Phases that sum to three quarters mean the missing quarter is plumbing.**
+  The closure instrument accounted for ~74% of the path; the rest was the
+  by-value `Rc` chains cloned at each creation site, which no phase boundary
+  covered. When the parts do not add up, instrument the *caller* next — the
+  cost is often not in the function being profiled.
 - **A corpus total is only comparable within a session and a corpus size.** The
   morning revision's 2.70× and this session's 2.68–3.06× are not a regression:
   81 rows vs 77, and a different load window. Four passes on one binary in one

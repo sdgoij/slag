@@ -1016,22 +1016,36 @@ pub fn instantiate_function_with_source(
     named_expression: bool,
     named: Option<JsString>,
 ) -> Result<Value, JsError> {
-    let source_info = match source {
-        Some(slice) => {
-            // A caller-supplied slice (a module declaration's own text, a
-            // snapshot restore): its body spans run past the slice when it has
-            // nested closures, so the enclosing text is still the full one
-            // when a frame carries it.
-            Some(source_info_with_slice(agent, f.span, slice))
+    let _total = phases::enter(phases::TOTAL);
+    phases::count_call();
+    {
+        let _phase = phases::enter(phases::OVERHEAD);
+    }
+    let source_info = {
+        let _phase = phases::enter(phases::SOURCE_INFO);
+        match source {
+            Some(slice) => {
+                // A caller-supplied slice (a module declaration's own text, a
+                // snapshot restore): its body spans run past the slice when it has
+                // nested closures, so the enclosing text is still the full one
+                // when a frame carries it.
+                Some(source_info_with_slice(agent, f.span, slice))
+            }
+            None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
         }
-        None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
     };
     let source_key = source_info
         .as_ref()
         .map(|info| info.key)
         .unwrap_or_else(|| source_hash_at(agent, f.span).unwrap_or(0));
-    let body = shared_function_body_with_key(agent, f, source_key);
-    let params = shared_params(&body, &f.params);
+    let body = {
+        let _phase = phases::enter(phases::BODY);
+        shared_function_body_with_key(agent, f, source_key)
+    };
+    let params = {
+        let _phase = phases::enter(phases::PARAMS);
+        shared_params(&body, &f.params)
+    };
     let value = register_function(
         agent,
         default_binding_display_name(named.or_else(|| f.name.map(crux::lookup))),
@@ -1695,24 +1709,37 @@ fn register_function(
     // `strict` overrides the body-directive check (CreateDynamicFunction
     // computes it against its assembled source, which the running context
     // cannot provide); `enclosing_strict` still forces strictness.
-    let strict = strict.unwrap_or_else(|| body_is_strict(agent, &body, None)) || enclosing_strict;
-    let this_mode = if strict {
-        ThisMode::Strict
-    } else {
-        ThisMode::Sloppy
+    let (strict, this_mode) = {
+        let _phase = phases::enter(phases::STRICT);
+        let strict =
+            strict.unwrap_or_else(|| body_is_strict(agent, &body, None)) || enclosing_strict;
+        let this_mode = if strict {
+            ThisMode::Strict
+        } else {
+            ThisMode::Sloppy
+        };
+        (strict, this_mode)
     };
-    let realm = agent.current_realm()?;
-    let private_environment = agent.running_context()?.private_environment;
-    let declaring_script_or_module = agent
-        .running_context()
-        .ok()
-        .and_then(|context| context.script_or_module.clone());
+    let realm = {
+        let _phase = phases::enter(phases::REALM);
+        agent.current_realm()?
+    };
+    let (private_environment, declaring_script_or_module) = {
+        let _phase = phases::enter(phases::CONTEXT);
+        let private_environment = agent.running_context()?.private_environment;
+        let declaring_script_or_module = agent
+            .running_context()
+            .ok()
+            .and_then(|context| context.script_or_module.clone());
+        (private_environment, declaring_script_or_module)
+    };
     // Cut 43: closures from the same declaration site share one compiled
     // body (the `body` Rc is the canonical site identity — see
     // `shared_function_body`), so the IR compile — and the per-body JIT
     // fast pointer it feeds — runs once per site instead of once per
     // closure. The pointer is captured before `body` moves into the record.
     let body_key = std::rc::Rc::as_ptr(&body) as usize;
+    let _record_phase = phases::enter(phases::RECORD);
     let mut data = EcmaFunction {
         name: name.clone(),
         params: params.clone(),
@@ -1746,6 +1773,7 @@ fn register_function(
         // first observation (see `ensure_function_prototype`).
         prototype_pending: !kind.is_generator && !kind.is_method && !kind.is_async,
     };
+    drop(_record_phase);
     // Every body compiles to the step IR; the VM executes ordinary bodies
     // the same way it runs the resumable kinds. The Function is created
     // before the compile: `Function::new` fires a `--gc-stress` collection,
@@ -1756,31 +1784,44 @@ fn register_function(
     // (resolved from the realm cache), so the trailing `set_prototype_of` —
     // a generic cycle scan + generation bump on an object nothing can have
     // observed yet — disappears.
-    let function = Function::new_with_prototype(
-        name.clone(),
-        function_kind_prototype(&realm, kind.is_generator, kind.is_async),
-    );
-    // The closure's [[Environment]] rides on the box as a GC edge (the record
-    // below keeps the typed handle for the call machinery). It is set before
-    // the compile, so a collection in that window - `Function::new` fires one
-    // under `--gc-stress` - already sees the environment through the box. A
-    // record whose [[Environment]] IS the realm's global environment needs no
-    // edge: `Agent::realms` roots the realm and `Realm::trace` walks its
-    // `global_env`, and the closure would otherwise re-emit one duplicate root
-    // per closure for that one shared box.
-    if !environment.ptr_eq(realm.global_env) {
-        function.set_environment_edge(Some(environment.as_any()));
-    }
+    let function = {
+        let _phase = phases::enter(phases::FUNCTION_NEW);
+        let function = Function::new_with_prototype(
+            name.clone(),
+            function_kind_prototype(&realm, kind.is_generator, kind.is_async),
+        );
+        // The closure's [[Environment]] rides on the box as a GC edge (the record
+        // below keeps the typed handle for the call machinery). It is set before
+        // the compile, so a collection in that window - `Function::new` fires one
+        // under `--gc-stress` - already sees the environment through the box. A
+        // record whose [[Environment]] IS the realm's global environment needs no
+        // edge: `Agent::realms` roots the realm and `Realm::trace` walks its
+        // `global_env`, and the closure would otherwise re-emit one duplicate root
+        // per closure for that one shared box.
+        if !environment.ptr_eq(realm.global_env) {
+            function.set_environment_edge(Some(environment.as_any()));
+        }
+        function
+    };
     // The paired `this_writes` pattern is re-applied to each fresh
     // constructor record below (Cut 43: the compiled body is shared per
     // site, so the pattern is computed once and copied).
-    let entry = shared_compiled_body(agent, &data, body_key)?;
+    let entry = {
+        let _phase = phases::enter(phases::COMPILE);
+        shared_compiled_body(agent, &data, body_key)?
+    };
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
-    agent.register_ecma_function(function.id(), data);
+    {
+        let _phase = phases::enter(phases::REGISTER);
+        agent.register_ecma_function(function.id(), data);
+    }
     // Cut 35 slice 30: store collected `this.*` property writes for
     // constructor store-cache pre-warming in `construct_this_object`.
-    crate::ir::store_construct_patterns(agent, function.id(), this_writes);
+    {
+        let _phase = phases::enter(phases::PATTERNS);
+        crate::ir::store_construct_patterns(agent, function.id(), this_writes);
+    }
     // Cut 67: SetFunctionLength + SetFunctionName + (for sloppy ordinary
     // functions) AddRestrictedFunctionProperties as ONE pre-forked-shape
     // adoption instead of 2-4 sequential boilerplate defines (the shape's
@@ -1795,18 +1836,21 @@ fn register_function(
     // (spec 10.2.4: own caller/arguments are created only for ordinary
     // non-method functions).
     let restricted = !strict && !kind.is_method && !kind.is_async && !kind.is_generator;
-    if !set_function_properties_batched(agent, &function, &params, name.as_ref(), restricted) {
-        set_function_properties(&function, &params, name.as_ref())?;
-        if restricted {
-            for name in ["caller", "arguments"] {
-                // Cut 66: fresh-object fast append (see `set_function_properties`).
-                function.object.fresh_data_define_attrs(
-                    &PropertyKey::from_utf8(name),
-                    Value::Undefined,
-                    false,
-                    false,
-                    false,
-                );
+    {
+        let _phase = phases::enter(phases::PROPS);
+        if !set_function_properties_batched(agent, &function, &params, name.as_ref(), restricted) {
+            set_function_properties(&function, &params, name.as_ref())?;
+            if restricted {
+                for name in ["caller", "arguments"] {
+                    // Cut 66: fresh-object fast append (see `set_function_properties`).
+                    function.object.fresh_data_define_attrs(
+                        &PropertyKey::from_utf8(name),
+                        Value::Undefined,
+                        false,
+                        false,
+                        false,
+                    );
+                }
             }
         }
     }
@@ -5715,5 +5759,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, Value::Boolean(true));
+    }
+}
+
+/// Temporary phase instrument for the closure-creation path
+/// (`SLAG_CLOSURE_PHASES=1`, dumped by `runtime::jit::dump_closure_phases`).
+///
+/// `instantiate_function_with_source` is called once per closure and measured at
+/// ~340 ns (`tools/corpus` ablation): two orders above a scalar-replaced object
+/// literal. This splits that into the phases a cut could address, in TSC cycles
+/// so the timer itself stays cheap. Instrument only — the guards are a cached
+/// bool away from free when the variable is unset, and nothing here changes what
+/// the path does.
+pub(crate) mod phases {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const TOTAL: usize = 0;
+    pub const SOURCE_INFO: usize = 1;
+    pub const BODY: usize = 2;
+    pub const PARAMS: usize = 3;
+    pub const FUNCTION_NEW: usize = 4;
+    pub const COMPILE: usize = 5;
+    pub const REGISTER: usize = 6;
+    pub const PATTERNS: usize = 7;
+    pub const PROPS: usize = 8;
+    /// The pre-allocation block: strictness, realm/context lookups, and the
+    /// `EcmaFunction` record build.
+    pub const RECORD: usize = 9;
+    /// An empty timed block in the same call as the others: its measurement
+    /// IS the instrument's per-phase overhead (two TSC reads plus the atomic
+    /// add), to be subtracted from every other phase.
+    pub const OVERHEAD: usize = 10;
+    /// The remaining setup, split out of the pre-allocation block: the body
+    /// directive scan, the realm lookup, and the two context lookups.
+    pub const STRICT: usize = 11;
+    pub const REALM: usize = 12;
+    pub const CONTEXT: usize = 13;
+
+    const NAMES: [&str; 14] = [
+        "total",
+        "source_info",
+        "body",
+        "params",
+        "function_new",
+        "compile",
+        "register",
+        "patterns",
+        "props",
+        "record",
+        "overhead",
+        "strict",
+        "realm",
+        "context",
+    ];
+
+    static CYCLES: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SLAG_CLOSURE_PHASES").is_ok())
+    }
+
+    #[inline]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: `_rdtsc` reads the time-stamp counter. It touches no
+            // memory and needs no feature gate on the x86_64 targets this
+            // engine builds for.
+            unsafe { core::arch::x86_64::_rdtsc() }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    }
+
+    /// A phase timer: `enter` samples the counter, `drop` adds the delta.
+    pub struct Phase(usize, u64);
+
+    impl Drop for Phase {
+        fn drop(&mut self) {
+            CYCLES[self.0].fetch_add(now().wrapping_sub(self.1), Ordering::Relaxed);
+        }
+    }
+
+    /// Start timing `phase`, or `None` (and no timer) when the instrument is off.
+    pub fn enter(phase: usize) -> Option<Phase> {
+        enabled().then(|| Phase(phase, now()))
+    }
+
+    pub fn count_call() {
+        if enabled() {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Print one line per phase: total cycles and cycles per closure.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let calls = CALLS.load(Ordering::Relaxed).max(1);
+        println!("closure-phase\tcalls\t{calls}");
+        for (index, name) in NAMES.iter().enumerate() {
+            let cycles = CYCLES[index].load(Ordering::Relaxed);
+            println!(
+                "closure-phase\t{name}\t{cycles}\t{:.1}/call",
+                cycles as f64 / calls as f64
+            );
+        }
     }
 }

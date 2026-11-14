@@ -1466,6 +1466,12 @@ pub struct JitSlowPaths {
         extern "C" fn(ctx: *mut c_void, callee: u64, args: *mut u64, argc: u64) -> u64,
 }
 
+/// Print the closure-creation phase instrument's per-phase cycles
+/// (`SLAG_CLOSURE_PHASES=1`). One line per phase: total and per closure.
+pub fn dump_closure_phases() {
+    crate::function::phases::dump();
+}
+
 /// The runtime's slow-path table, installed into every `JitHook`.
 pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     binary_slow,

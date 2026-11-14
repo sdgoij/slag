@@ -283,6 +283,9 @@ fn run(command: Command) -> Result<(), u8> {
                     "  JIT_DUMP_STEPS=1          dump blocking steps and shapes on a lift refusal"
                 );
                 eprintln!("  JIT_HELPER_STATS=1        print per-helper call counts at exit");
+                eprintln!(
+                    "  SLAG_CLOSURE_PHASES=1     print closure-creation phase cycles at exit"
+                );
                 eprintln!("  JIT_LEAF_TRACE=1          trace leaf-probe rejections");
                 eprintln!("  SLAG_JIT_DEOPT_PROBE=N    force a deopt guard at step N");
                 eprintln!("  SLAG_JIT_DEOPT_TRACE=1    trace each deopt");
@@ -943,6 +946,9 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
     if jit {
         jit::dump_helper_counts();
     }
+    // The closure-creation phase instrument (`SLAG_CLOSURE_PHASES`); inert
+    // unless the variable is set.
+    runtime::jit::dump_closure_phases();
     // The I5a call-site probe runs in the INTERPRETER (`--jitless`), so it dumps
     // in either mode; inert unless `SLAG_FEEDBACK` is set.
     jit::dump_feedback_summary();
