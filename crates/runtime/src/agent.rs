@@ -3356,6 +3356,18 @@ impl Agent {
         self.roots.regexp_data.borrow().get(&id).cloned()
     }
 
+    /// The two fields a match needs — the compiled program and the flags —
+    /// without the [`Self::regexp_state`] clone, which copies the source
+    /// string and its heap-allocated flag text. `test`/`exec` read the state
+    /// on every call and use neither.
+    pub fn regexp_program(&self, id: u64) -> Option<(std::rc::Rc<regexp::Regex>, regexp::Flags)> {
+        self.roots
+            .regexp_data
+            .borrow()
+            .get(&id)
+            .map(|state| (std::rc::Rc::clone(&state.compiled), state.flags))
+    }
+
     pub(crate) fn register_regexp(&self, id: u64, state: crate::builtins::regexp::RegExpState) {
         self.roots.regexp_data.borrow_mut().insert(id, state);
     }

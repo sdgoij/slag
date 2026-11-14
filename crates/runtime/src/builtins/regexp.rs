@@ -372,10 +372,10 @@ fn regexp_match_parts(
     let ValueKind::Object(obj) = regexp.kind() else {
         return Err(regexp_receiver_error());
     };
-    let Some(state) = agent.regexp_state(obj.id()) else {
+    let Some((compiled, flags)) = agent.regexp_program(obj.id()) else {
         return Err(regexp_receiver_error());
     };
-    Ok((obj, std::rc::Rc::clone(&state.compiled), state.flags))
+    Ok((obj, compiled, flags))
 }
 
 /// `lastIndex` as an interned property key: the protocol reads and writes it on
