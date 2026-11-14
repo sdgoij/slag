@@ -681,8 +681,7 @@ fn try_leaf_call_cached(
     // three-step body does not repay (21.0 ms against 18.1 ms on
     // `opcost/array_for_each`'s shape). Above the threshold the compiled body
     // is the winner and keeps the lane.
-    const INTERPRET_AT_MOST_STEPS: usize = 8;
-    let interpreted = entry.ir.steps.len() <= INTERPRET_AT_MOST_STEPS;
+    let interpreted = entry.ir.steps.len() <= crate::ir::CALLBACK_INTERPRET_AT_MOST_STEPS;
     let result = {
         vm.stack.push(this_arg);
         vm.stack.push(*func);

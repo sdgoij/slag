@@ -653,6 +653,26 @@ This corrects a claim made earlier in this note, "there is nothing to win by
 shaving the Rust dispatch either". That was true *of the compiled lane*; the win
 was in not entering it at all.
 
+**Landed 2026-11-15: `forEach` is an intrinsic, and its loop runs in place.**
+`Intrinsic::ArrayForEach` reuses the mechanism's three free pieces (recognition
+by member name, the callee-identity guard, the `do_call_fast` fallback), and
+`do_call_intrinsic` runs the loop on the invoking `Vm`: the element walk is the
+builtin's own (`dense_own_element`, then the chain via `has_property` /
+`get_property` for a hole), and the callback runs through the leaf lane on that
+Vm instead of a pooled one, so the builtin dispatch, `to_object`,
+`length_of_array_like` and the pool round trip are gone. Measured on
+`opcost/array_for_each`, jitless: 19.0-21.1 → **13.7-14.2 ms**. The `map_for_each`
+and `typed_array_for_each` rows are untouched (they use their own methods), and
+the corpus differential is exact in both modes, with 313 `built-ins` fixtures
+matching `*forEach*` passing.
+
+**The jit column does not move, by design.** `emit_intrinsic`'s arm for the new
+kind jumps to its shared `slow` edge (the general call), because a machine-code
+loop is the remaining piece; the alternative, leaving the kind unhandled, would
+hit the `Unsupported` return and drop every body containing `.forEach(` out of
+the optimizing tier, which is the exact row's hot caller. So the tier still
+compiles the caller and the call is what it was.
+
 **The fused loop's integration point is the `Intrinsic` mechanism** (mapped
 2026-11-14), and it removes most of the plumbing this note assumed. `Intrinsic`
 already gives the three things the loop needs: the *recognition* (`try_compile_intrinsic`

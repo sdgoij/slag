@@ -78,11 +78,23 @@ pub enum Intrinsic {
     /// `%String.prototype.split%`: the separator-only form on a String
     /// primitive, where the builtin runs no user code.
     StringSplit,
+    /// `%Array.prototype.forEach%` with a single callback argument: the loop
+    /// runs on this Vm, so a certified leaf callback is called without the
+    /// builtin dispatch, `to_object`, `length_of_array_like` and the pooled-Vm
+    /// round trip the callback lane pays per call.
+    ArrayForEach,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 16;
+pub const INTRINSIC_COUNT: usize = 17;
+
+/// A callback the fused array loop runs through the interpreter rather than the
+/// compiled lane: from a Rust caller the JIT entry point costs a code-cache
+/// lookup, a generation bump and the whole leaf prologue per element, which a
+/// three-step body does not repay (`opcost/array_for_each` measured 21.0 ms
+/// against 18.1 ms). Both callback paths share this threshold.
+pub(crate) const CALLBACK_INTERPRET_AT_MOST_STEPS: usize = 8;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -103,6 +115,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::ArrayPop,
     Intrinsic::ArrayReverse,
     Intrinsic::StringSplit,
+    Intrinsic::ArrayForEach,
 ];
 
 impl Intrinsic {
@@ -125,6 +138,7 @@ impl Intrinsic {
             Intrinsic::ArrayPop => "pop",
             Intrinsic::ArrayReverse => "reverse",
             Intrinsic::StringSplit => "split",
+            Intrinsic::ArrayForEach => "forEach",
         }
     }
 
@@ -153,6 +167,7 @@ impl Intrinsic {
             Intrinsic::ArrayPop => "%Array.prototype.pop%",
             Intrinsic::ArrayReverse => "%Array.prototype.reverse%",
             Intrinsic::StringSplit => "%String.prototype.split%",
+            Intrinsic::ArrayForEach => "%Array.prototype.forEach%",
         }
     }
 }
@@ -13423,6 +13438,87 @@ impl Vm {
                 Some(()) => this,
                 None => return Ok(false),
             },
+            Intrinsic::ArrayForEach => {
+                // The callback only (`argc == 1` is the compiler's gate). The
+                // element walk is the builtin's own (`dense_own_element`, then
+                // the chain for a hole), but the callback runs on *this* Vm
+                // instead of a pooled one: the call both discards no result and
+                // observes the same environment, so the per-element cost is the
+                // leaf run alone.
+                let callback = self.stack[arg_start];
+                if !is_callable(&callback) {
+                    // The builtin throws the spec's TypeError with its own
+                    // wording, and the message names the method.
+                    return Ok(false);
+                }
+                let Some(length) = this
+                    .as_object()
+                    .and_then(|object| object.array_length_dense())
+                else {
+                    return Ok(false);
+                };
+                let leaf = match callback.kind() {
+                    ValueKind::Function(function)
+                        if matches!(function.kind, crux::function::FunctionKind::EcmaScript) =>
+                    {
+                        agent.leaf_lookup(function.id())
+                    }
+                    _ => None,
+                };
+                let Some(entry) = leaf else {
+                    return Ok(false);
+                };
+                let object = this.as_object();
+                for index in 0..length {
+                    let element = match crate::builtins::array::dense_own_element(&this, index) {
+                        Some(value) => value,
+                        None => {
+                            // A hole: `HasProperty` decides, exactly as the
+                            // builtin's own per-element step does (the chain can
+                            // shadow a hole).
+                            let name = crate::builtins::array::key(index);
+                            let present = match &object {
+                                Some(object) => object.has_property(&name)?,
+                                None => return Ok(false),
+                            };
+                            if !present {
+                                continue;
+                            }
+                            crate::context::get_property(agent, &this, &name, this)?
+                        }
+                    };
+                    let index_value = Value::Number(index as f64);
+                    if self.can_inline_leaf() {
+                        self.stack.push(Value::Undefined);
+                        self.stack.push(callback);
+                        self.stack.push(element);
+                        self.stack.push(index_value);
+                        self.stack.push(this);
+                        if entry.ir.steps.len() <= CALLBACK_INTERPRET_AT_MOST_STEPS {
+                            self.run_leaf_entry_interpreted(
+                                agent,
+                                3,
+                                Value::Undefined,
+                                entry.clone(),
+                                2,
+                            )?;
+                        } else {
+                            self.run_leaf_entry(agent, 3, Value::Undefined, entry.clone(), 2)?;
+                        }
+                        self.stack.pop();
+                    } else {
+                        // Inside a try or a for-of head the leaf lane cannot
+                        // run; the general call keeps the semantics.
+                        crate::function::call(
+                            agent,
+                            &callback,
+                            Value::Undefined,
+                            &[element, index_value, this],
+                        )?;
+                    }
+                }
+                Value::Undefined
+            }
         };
         self.stack.truncate(arg_start - 2);
         self.stack.push(result);
@@ -24227,6 +24323,11 @@ impl Compiler {
         // `split`'s lane is the separator-only form; a `limit` keeps the
         // general call.
         if kind == Intrinsic::StringSplit && call.args.len() != 1 {
+            return Ok(false);
+        }
+        // `forEach` reads its callback only; a `thisArg` or a spread argument
+        // keeps the general call.
+        if kind == Intrinsic::ArrayForEach && call.args.len() != 1 {
             return Ok(false);
         }
         if tail

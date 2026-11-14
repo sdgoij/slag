@@ -3541,7 +3541,8 @@ fn emit_intrinsic(
         | Intrinsic::ArrayIncludes
         | Intrinsic::ArrayPush
         | Intrinsic::ArrayPop
-        | Intrinsic::ArrayReverse => {}
+        | Intrinsic::ArrayReverse
+        | Intrinsic::ArrayForEach => {}
     }
     builder.ins().brif(gate, fast, &[], slow, &[]);
     builder.seal_block(fast);
@@ -3619,6 +3620,15 @@ fn emit_intrinsic(
         }
         Intrinsic::ArrayPush => {
             emit_array_push_inline(builder, helpers, abi, this, arg1, slow, merge, value)?;
+        }
+        Intrinsic::ArrayForEach => {
+            // The fused loop runs in the interpreter's `do_call_intrinsic`; a
+            // lifted body keeps the general call, and jumping to the shared
+            // `slow` edge spells exactly that (it materializes the arguments at
+            // the working-region base and goes through the leaf-call lane with
+            // `call_slow` behind it). The body therefore still lifts, which is
+            // what keeps this from costing the caller its tier.
+            builder.ins().jump(slow, &[]);
         }
         _ => {
             let result = match kind {

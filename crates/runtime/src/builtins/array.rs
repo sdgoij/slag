@@ -91,7 +91,7 @@ fn placeholder(name: &'static str) -> NativeFn {
     })
 }
 
-fn key(index: u64) -> JsString {
+pub(crate) fn key(index: u64) -> JsString {
     JsString::from_utf8(&index.to_string())
 }
 
@@ -101,7 +101,7 @@ fn key(index: u64) -> JsString {
 /// consulting the chain. `None` for a hole, a beyond-length index, or a
 /// non-dense/exotic receiver: the caller keeps the exact per-element
 /// machinery (which observes chain shadowing of holes and proxy traps).
-fn dense_own_element(value: &Value, index: u64) -> Option<Value> {
+pub(crate) fn dense_own_element(value: &Value, index: u64) -> Option<Value> {
     let ValueKind::Object(object) = value.kind() else {
         return None;
     };
