@@ -876,6 +876,27 @@ fn slice(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
     Ok(Value::String(JsString::slice_view(&parent, from, to)))
 }
 
+/// The `%String.prototype.split%` intrinsic lane (the `Step::CallIntrinsic`
+/// fast path): the separator-only call on a String primitive with a String
+/// separator. Every shape the general path could observe differently — an
+/// object separator (whose `@@split` or `ToString` can run user code), a
+/// non-string receiver, a `limit` — is declined, so the lane is exactly the
+/// builtin's own behaviour without the call funnel in front of it.
+///
+/// `Ok(None)` hands the call back to the general path.
+pub(crate) fn split_intrinsic(
+    agent: &mut Agent,
+    this: &Value,
+    separator: &Value,
+) -> Result<Option<Value>, JsError> {
+    if !matches!(this.kind(), ValueKind::String(_))
+        || !matches!(separator.kind(), ValueKind::String(_))
+    {
+        return Ok(None);
+    }
+    split(agent, this, &[*separator]).map(Some)
+}
+
 /// spec 22.1.3.26 String.prototype.split: `@@split` delegation, then the pure
 /// StringSplit algorithm.
 fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsError> {

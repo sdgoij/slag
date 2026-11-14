@@ -7422,6 +7422,16 @@ impl<'a> Lowerer<'a> {
                         let this_ok = self.is_string(this);
                         self.builder.ins().band(arg, this_ok)
                     }
+                    // `split`'s `this` and separator are both String primitives
+                    // (the helper declines everything else, so a non-string
+                    // shape never reaches it — the number `arg_ok` above does
+                    // not apply).
+                    Intrinsic::StringSplit => {
+                        let sep_ok = self.is_string(arg1);
+                        let gate = self.builder.ins().band(callee_gate, sep_ok);
+                        let this_ok = self.is_string(this);
+                        self.builder.ins().band(gate, this_ok)
+                    }
                     // The `Math` unaries ignore `this` and need a Number argument.
                     _ => self.builder.ins().band(callee_gate, arg_ok),
                 };
@@ -7614,6 +7624,20 @@ impl<'a> Lowerer<'a> {
                         self.set_sp_offset(offset);
                         self.push(value);
                         self.builder.ins().jump(merge, &[]);
+                    }
+                    Intrinsic::StringSplit => {
+                        let result = self.emit_raw_call(
+                            self.sig_get_name,
+                            Helper::StringSplit,
+                            &[this, arg1],
+                        )?;
+                        self.emit_intrinsic_hit(
+                            result,
+                            Value::hole().bits() as i64,
+                            slow,
+                            merge,
+                            this_ptr,
+                        );
                     }
                     _ => {
                         let num = self.value_as_f64(arg1);

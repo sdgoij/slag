@@ -191,6 +191,10 @@ pub enum Helper {
     CreateArguments,
     TypeofTop,
     CharCodeAt,
+    /// `Step::CallIntrinsic` for `%String.prototype.split%`: the receiver and
+    /// the String separator; the result array, or the hole sentinel to fall
+    /// back to the general call.
+    StringSplit,
     ArrayIndexOf,
     MapGet,
     SetHas,
@@ -350,6 +354,7 @@ impl Helper {
             Helper::CreateArguments => "create_arguments",
             Helper::TypeofTop => "typeof_top",
             Helper::CharCodeAt => "char_code_at",
+            Helper::StringSplit => "string_split",
             Helper::ArrayIndexOf => "array_index_of",
             Helper::MapGet => "map_get",
             Helper::SetHas => "set_has",
@@ -882,6 +887,8 @@ pub struct JitHelpers {
     /// `Step::CallIntrinsic` for `%String.prototype.charCodeAt%`: `(this, arg)`
     /// are the String receiver and the Number position; never errors.
     pub char_code_at: Option<extern "C" fn(vm: *mut c_void, this: u64, arg: u64) -> u64>,
+    /// `%String.prototype.split%` (see `Step::CallIntrinsic`).
+    pub string_split: Option<extern "C" fn(vm: *mut c_void, this: u64, separator: u64) -> u64>,
     /// `Step::CallIntrinsic` for `%Array.prototype.indexOf%`: `(this, search,
     /// from)`; returns the index or the `undefined` fall-back sentinel.
     pub array_index_of:
@@ -1078,6 +1085,7 @@ impl JitHelpers {
             create_arguments: None,
             typeof_top: None,
             char_code_at: None,
+            string_split: None,
             array_index_of: None,
             map_get: None,
             set_has: None,
@@ -1244,6 +1252,7 @@ impl JitHelpers {
             Helper::CreateArguments => self.create_arguments.map(|f| f as usize as u64),
             Helper::TypeofTop => self.typeof_top.map(|f| f as usize as u64),
             Helper::CharCodeAt => self.char_code_at.map(|f| f as usize as u64),
+            Helper::StringSplit => self.string_split.map(|f| f as usize as u64),
             Helper::ArrayIndexOf => self.array_index_of.map(|f| f as usize as u64),
             Helper::MapGet => self.map_get.map(|f| f as usize as u64),
             Helper::SetHas => self.set_has.map(|f| f as usize as u64),
@@ -1978,6 +1987,10 @@ pub extern "C" fn test_typeof_top(_vm: *mut c_void, _value: u64) -> u64 {
 
 pub extern "C" fn test_char_code_at(_vm: *mut c_void, _this: u64, _arg: u64) -> u64 {
     Value::Number(0.0).bits()
+}
+
+pub extern "C" fn test_string_split(_vm: *mut c_void, _this: u64, _separator: u64) -> u64 {
+    Value::hole().bits()
 }
 
 pub extern "C" fn test_array_index_of(

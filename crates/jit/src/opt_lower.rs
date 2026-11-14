@@ -3365,6 +3365,13 @@ fn emit_intrinsic(
             let this_ok = is_string(builder, this);
             gate = builder.ins().band(gate, this_ok);
         }
+        // `split`'s `this` and separator are both String primitives.
+        Intrinsic::StringSplit => {
+            let sep_ok = is_string(builder, arg1);
+            gate = builder.ins().band(gate, sep_ok);
+            let this_ok = is_string(builder, this);
+            gate = builder.ins().band(gate, this_ok);
+        }
         Intrinsic::MathAbs
         | Intrinsic::MathCeil
         | Intrinsic::MathFloor
@@ -3518,6 +3525,14 @@ fn emit_intrinsic(
                     abi.sig_bool,
                     Helper::ArrayReverse,
                     &[this],
+                )?,
+                Intrinsic::StringSplit => call_helper(
+                    builder,
+                    helpers,
+                    abi,
+                    abi.sig_unary,
+                    Helper::StringSplit,
+                    &[this, arg1],
                 )?,
                 // Every remaining kind is handled by an outer arm above; an
                 // unhandled one here is a lowering bug, not a fallback case.

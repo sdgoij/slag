@@ -1369,6 +1369,11 @@ pub struct JitSlowPaths {
     /// argument; returns the code unit as a Number, or NaN out of range. Never
     /// errors, never triggers the collector.
     pub char_code_at: extern "C" fn(ctx: *mut c_void, this: u64, arg: u64) -> u64,
+    /// `Step::CallIntrinsic` for `%String.prototype.split%`: the receiver (a
+    /// String primitive per the compiled guard) and the String separator.
+    /// Returns the result array, or the hole sentinel when the runtime fast
+    /// path declines (the compiled site then takes the general call).
+    pub string_split: extern "C" fn(ctx: *mut c_void, this: u64, separator: u64) -> u64,
     /// `Step::CallIntrinsic` for `%Array.prototype.indexOf%`: the raw receiver,
     /// the search element, and `fromIndex` (or `undefined`). Returns the index
     /// as a Number, or `undefined` to fall back (a hole, a sparse or non-Array
@@ -1588,6 +1593,7 @@ pub static JIT_SLOW_PATHS: JitSlowPaths = JitSlowPaths {
     create_arguments,
     typeof_top,
     char_code_at,
+    string_split,
     array_index_of,
     map_get,
     set_has,
@@ -6104,6 +6110,24 @@ extern "C" fn char_code_at(ctx: *mut c_void, this: u64, arg: u64) -> u64 {
         return Value::Number(f64::NAN).bits();
     }
     Value::Number(string.code_unit(position as usize).unwrap_or(0) as f64).bits()
+}
+
+/// `Step::CallIntrinsic` for `%String.prototype.split%`: the receiver (a String
+/// primitive per the compiled guard) and the String separator. Returns the
+/// result array, or the hole sentinel when the runtime fast path declines (the
+/// compiled site then takes the general call, which is the spec's own path).
+extern "C" fn string_split(ctx: *mut c_void, this: u64, separator: u64) -> u64 {
+    let ctx = unsafe { ctx_of(ctx) };
+    let agent = unsafe { &mut *ctx.agent };
+    match crate::builtins::string::split_intrinsic(
+        agent,
+        &Value::from_bits(this),
+        &Value::from_bits(separator),
+    ) {
+        Ok(Some(value)) => value.bits(),
+        Ok(None) => Value::hole().bits(),
+        Err(error) => slow_error(ctx, error),
+    }
 }
 
 /// `Step::CallIntrinsic` for `%Array.prototype.indexOf%`: `this` is the raw

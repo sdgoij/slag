@@ -75,11 +75,14 @@ pub enum Intrinsic {
     ArrayPush,
     ArrayPop,
     ArrayReverse,
+    /// `%String.prototype.split%`: the separator-only form on a String
+    /// primitive, where the builtin runs no user code.
+    StringSplit,
 }
 
 /// The number of recognized intrinsics (a `Intrinsic` discriminant is an index
 /// into the per-run intrinsic-bit snapshot).
-pub const INTRINSIC_COUNT: usize = 15;
+pub const INTRINSIC_COUNT: usize = 16;
 
 /// Every recognized intrinsic, in discriminant order: the order that pairs an
 /// `intrinsic_bits` slot with its `Intrinsic`.
@@ -99,6 +102,7 @@ pub const INTRINSICS: [Intrinsic; INTRINSIC_COUNT] = [
     Intrinsic::ArrayPush,
     Intrinsic::ArrayPop,
     Intrinsic::ArrayReverse,
+    Intrinsic::StringSplit,
 ];
 
 impl Intrinsic {
@@ -120,6 +124,7 @@ impl Intrinsic {
             Intrinsic::ArrayPush => "push",
             Intrinsic::ArrayPop => "pop",
             Intrinsic::ArrayReverse => "reverse",
+            Intrinsic::StringSplit => "split",
         }
     }
 
@@ -147,6 +152,7 @@ impl Intrinsic {
             Intrinsic::ArrayPush => "%Array.prototype.push%",
             Intrinsic::ArrayPop => "%Array.prototype.pop%",
             Intrinsic::ArrayReverse => "%Array.prototype.reverse%",
+            Intrinsic::StringSplit => "%String.prototype.split%",
         }
     }
 }
@@ -13351,6 +13357,16 @@ impl Vm {
                     None => return Ok(false),
                 }
             }
+            Intrinsic::StringSplit => {
+                match crate::builtins::string::split_intrinsic(
+                    agent,
+                    &this,
+                    &self.stack[arg_start],
+                )? {
+                    Some(value) => value,
+                    None => return Ok(false),
+                }
+            }
             Intrinsic::MapSet => {
                 let value = self
                     .stack
@@ -24183,6 +24199,11 @@ impl Compiler {
         // The single-element `push` form only (the helper appends one value); a
         // multi-element push keeps the general call.
         if kind == Intrinsic::ArrayPush && call.args.len() != 1 {
+            return Ok(false);
+        }
+        // `split`'s lane is the separator-only form; a `limit` keeps the
+        // general call.
+        if kind == Intrinsic::StringSplit && call.args.len() != 1 {
             return Ok(false);
         }
         if tail
