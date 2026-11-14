@@ -401,10 +401,10 @@ its JIT and with it disabled — see `tools/corpus/README.md`). The optimization
 switches behind these numbers (`SLAG_OPT`, `SLAG_TYPER`, the inline/pass seams,
 and the `JIT_*` diagnostics) are documented in `ENVIRONMENT.md`. The numbers
 below are one machine (AMD Ryzen 9 7950X, Windows 11, rustc 1.96.0, node
-v24.12.0): medians of five runs for the micro-suite and of two for the
-corpus (a corpus row's spread is wide — `for-in/head-let-fresh-binding` has
-measured 590-820 ms across sessions — so two runs are compared row by row and
-the median is reported).
+v24.12.0): medians of five runs for the micro-suite and of three for the
+corpus. A corpus row's spread is wide — the `for-in` language row's
+interpreter column spans 706-861 ms across those three runs — so the runs are
+compared row by row and the row and family medians are what is reported.
 The release profile is part of the measurement, not an aside: `[profile.release]`
 pins `codegen-units = 1` + `lto = "thin"`, because at cargo's default 16 codegen
 units the same source built two ways is laid out differently and differs by up
@@ -463,49 +463,53 @@ decision rests on the column totals (interpreter −12%), not on that row.
 
 The corpus runner checks parity as well as time: all four engine/mode
 combinations return the same value for every workload (`mismatches 0`).
-Gap = Slag ms / V8 ms, so > 1 means V8 was faster:
+Gap = Slag ms / V8 ms, so > 1 means V8 was faster. The corpus is 81 workloads
+(77 at the previous release; the new rows are `builtins/async_churn`,
+`builtins/promise_churn`, and two fresh-object `opcost` rows). Family rows are
+per-family medians across the three runs, the `All` row the median of the three
+run totals:
 
 | Family | Workloads | JIT gap | Interpreter gap |
 |---|---|---|---|
-| arrays | 6 | 10.80x | 3.71x |
-| builtins | 5 | 7.76x | 4.06x |
-| calls | 6 | 11.03x | 5.25x |
-| control | 5 | 15.41x | 4.52x |
-| globals | 4 | 2.46x | 0.84x |
-| language | 3 | 9.36x | 8.60x |
-| objects | 7 | 9.10x | 2.49x |
-| opcost | 36 | 14.42x | 3.81x |
-| strings | 5 | 14.69x | 4.57x |
-| **All** | **77** | **12.22x** | **3.94x** |
+| arrays | 6 | 9.60x | 3.21x |
+| builtins | 7 | 21.00x | 14.72x |
+| calls | 6 | 8.84x | 3.04x |
+| control | 5 | 12.45x | 3.21x |
+| globals | 4 | 2.19x | 0.74x |
+| language | 3 | 5.14x | 4.56x |
+| objects | 7 | 8.36x | 1.86x |
+| opcost | 38 | 11.60x | 3.21x |
+| strings | 5 | 9.48x | 4.15x |
+| **All** | **81** | **10.75x** | **4.12x** |
 
-A sample of the per-workload rows (the command above prints all 77), ms per
+A sample of the per-workload rows (the command above prints all 81), ms per
 `bench()` call:
 
 | Workload | Slag JIT | Slag interp | V8 JIT | V8 `--jitless` | JIT gap | Interp gap |
 |---|---|---|---|---|---|---|
-| `arrays/for_of_dense.js` | 7.6 | 55.8 | 1.8 | 64.2 | 4.21x | 0.87x |
-| `arrays/typed_array.js` | 22.4 | 167.6 | 1.1 | 42.8 | 20.06x | 3.92x |
-| `builtins/json_roundtrip.js` | 55.9 | 59.0 | 13.1 | 16.1 | 4.29x | 3.65x |
-| `builtins/math_intrinsics.js` | 10.1 | 69.7 | 151.9 | 183.6 | 0.07x | 0.38x |
-| `calls/direct_leaf.js` | 12.0 | 77.6 | 1.2 | 37.7 | 10.27x | 2.06x |
-| `calls/recursive_fib.js` | 50.5 | 517.0 | 7.4 | 37.0 | 6.81x | 14.04x |
-| `control/generator_loop.js` | 63.0 | 89.8 | 2.3 | 10.5 | 26.81x | 8.58x |
-| `globals/declarative_read.js` | 2.5 | 19.8 | 0.6 | 13.4 | 4.30x | 1.48x |
-| `globals/hoisted_local.js` | 3.2 | 19.4 | 0.6 | 12.8 | 5.46x | 1.52x |
-| `globals/nested_read.js` | 2.5 | 18.5 | 90.7 | 106.0 | 0.03x | 0.17x |
-| `globals/object_read.js` | 2.5 | 20.2 | 84.6 | 103.9 | 0.03x | 0.20x |
-| `objects/destructure.js` | 4.7 | 147.9 | 0.8 | 50.8 | 6.01x | 2.92x |
-| `objects/own_read.js` | 3.0 | 32.9 | 1.2 | 49.7 | 2.42x | 0.67x |
-| `objects/warm_store.js` | 29.6 | 122.0 | 2.3 | 53.6 | 12.76x | 2.28x |
-| `strings/char_ops.js` | 12.1 | 22.8 | 0.4 | 6.2 | 31.37x | 3.71x |
+| `arrays/for_of_dense.js` | 7.6 | 48.7 | 1.8 | 67.7 | 4.22x | 0.72x |
+| `arrays/typed_array.js` | 17.3 | 149.8 | 1.1 | 40.7 | 15.73x | 3.68x |
+| `builtins/json_roundtrip.js` | 38.9 | 40.7 | 12.5 | 15.5 | 3.11x | 2.63x |
+| `builtins/math_intrinsics.js` | 10.2 | 62.1 | 149.9 | 182.0 | 0.07x | 0.34x |
+| `calls/direct_leaf.js` | 11.3 | 55.1 | 1.1 | 36.4 | 10.27x | 1.51x |
+| `calls/recursive_fib.js` | 47.4 | 217.3 | 7.2 | 38.1 | 6.58x | 5.70x |
+| `control/generator_loop.js` | 33.9 | 46.7 | 2.3 | 10.0 | 14.74x | 4.67x |
+| `globals/declarative_read.js` | 2.4 | 17.5 | 0.6 | 13.8 | 4.00x | 1.27x |
+| `globals/hoisted_local.js` | 2.5 | 17.7 | 0.6 | 13.8 | 4.17x | 1.28x |
+| `globals/nested_read.js` | 2.4 | 17.6 | 95.0 | 102.7 | 0.03x | 0.17x |
+| `globals/object_read.js` | 2.4 | 17.9 | 89.4 | 99.1 | 0.03x | 0.18x |
+| `objects/destructure.js` | 3.6 | 158.5 | 0.8 | 52.3 | 4.50x | 3.03x |
+| `objects/own_read.js` | 2.9 | 36.8 | 1.3 | 59.8 | 2.23x | 0.62x |
+| `objects/warm_store.js` | 34.5 | 78.6 | 2.4 | 54.3 | 14.38x | 1.45x |
+| `strings/char_ops.js` | 3.4 | 19.8 | 0.4 | 5.9 | 8.50x | 3.36x |
 
 The `globals` family is the one family that is a controlled experiment rather
 than a workload: the same loop reading the same value as a top-level `const`
 (`declarative_read`), hoisted into a local first (`hoisted_local`), read through
 the global object (`object_read`), and read through the same global object from a
 helper nested inside another function (`nested_read` — the shape a mod's kernels
-have). All four stay in a 2.4-3.3 ms band, with `hoisted_local` the slowest at
-~3.2 ms. Two gaps were closed there: the cell
+have). All four stay in a 2.4-2.5 ms band, with `hoisted_local` the slowest at
+~2.5 ms. Two gaps were closed there: the cell
 was never warmed for the global env's declarative record (a top-level `const`
 cost 52.5 ms — 21x), and it was never *probed* from a body whose env chain was
 not the bare global record (a nested helper's global read cost 130.2 ms per 1M
@@ -515,17 +519,37 @@ mutation, and because an in-place member write to a global refreshes the cell
 (the in-place store deliberately does not bump). See
 `.notes/frame-cost-profile.md` §4b.
 
+The `builtins` family is the noisiest row here and its ratio is now set by the
+two async workloads: `promise_churn` and `async_churn` queue 2000
+promises/awaits per `bench()` and the runner never drains the job queue between
+timed calls, so what they time is the pending-await state table — whose cost is
+quadratic in the queue depth (`.notes/perf.md`) — against a sub-millisecond V8
+baseline. `async_churn` alone reads 69-132x across the three runs, which is why
+that family's mean lands anywhere between 18.1 and 27.0.
+
 Read the gaps as "where the work is", not as a verdict on the engine shape:
 the corpus's own README records the workloads V8 folds or scalar-evolves to a
 near-constant, so a row's JIT ratio can measure V8's specialization as much as
 Slag's machinery; a sub-1 gap means Slag was faster on that workload.
 
+The cost that remains is structural rather than interpretive. The two
+`language` fixtures are ~45% of the corpus's total gap, and their bodies are
+per-iteration closures plus the `for (let x in obj)` per-iteration environment;
+a closure costs ~340 ns to create, where node eliminates the non-escaping one
+outright (0.6 ns/iteration). Register work does not reach that: the
+materialization census and the per-iteration lifts measured at parity
+(1.00-1.02x against `SLAG_OPT=0`), so the phase plan starts at function-object
+creation — inlining plus escape analysis — and returns to the typed value only
+after it. `.notes/register-tier-plan.md` has the ablation behind each number.
+
 ### Against the previous release (`v0.1.0-preview.2`)
 
 The same corpus and micro-suite were run against the `v0.1.0-preview.2` tag
-(2026-09-26). The micro-suite is the cleaner comparison — both binaries print
-`result-ok`, i.e. every row compiled on both — and there three rows moved 2x or
-more while the rest are flat:
+(2026-09-26). That session's corpus was 77 workloads; it is 81 now, so this
+section is a fixed snapshot and its "now" column is the build of that session,
+not the table above. The micro-suite is the cleaner comparison — both binaries
+print `result-ok`, i.e. every row compiled on both — and there three rows moved
+2x or more while the rest are flat:
 
 | Micro row | preview.2 JIT | now JIT | Change |
 |---|---|---|---|
