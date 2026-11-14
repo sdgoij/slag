@@ -546,10 +546,30 @@ belongs at the call sites the lowering *emits*, not at the ops: `is_safepoint`
 naming `Op::Call | Op::Intrinsic` is a claim about `emit_leaf_call` that must be
 re-checked whenever a new call-emitting op lands.
 
-**Slice 3 (next): spill and declare.** At each reported safepoint, spill the
-roots into sized stack slots and call `append_user_stack_map_entry` on the call
-instruction `emit_leaf_call` produces (it must hand the `Inst` back), then the
-collector registry and the PC lookup.
+**Slice 3 (landed 2026-11-14): spill and declare, gated.** `SLAG_STACKMAPS`
+spills the whole root set into sized stack slots — each initialized to
+`undefined` in the prologue and rewritten at every definition and block
+parameter, so a slot always holds a valid `Value` — and names every slot in a
+stack map at **every** safepoint in the body. Threading a root set through the
+lowering's call funnels (`call_helper`, the four leaf-lane `call_indirect`s,
+`call_slow`) was the alternative; naming the full set at each call instead
+over-approximates the roots, which is sound because the slot only ever holds a
+value that is already dead at that call. Entries are attached after lowering by
+walking the CLIF layout for `opcode().is_safepoint()`, so a new call-emitting op
+needs no change here.
+
+Measured on the probe bodies: 71 safepoint maps, 10 entries each, and the rows
+do not move — `d4` 2.07-2.09 → 2.09-2.16 ms, `e4` 20.5 → 20.7-21.5 ms — because
+those ten candidates are defined *outside* the loop, so the spill stores run
+once per body rather than per iteration. A body that redefines them inside the
+loop would pay per iteration and is not measured; that is the case to check
+before the set is narrowed. Results are identical with the gate on and off over
+`opcost` in both `jit` and `jitless`.
+
+Still off by default, and the maps are still not **walked**: the collector has
+to find them from a return PC (a registry of code ranges, then the lookup), and
+until it does, the slots are inert — a collection inside a call cannot see them.
+That is slice 4, and it is what turns this from bookkeeping into roots.
 
 **D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
 call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms

@@ -8,9 +8,10 @@
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Offset32;
+use cranelift_codegen::ir::stackslot::{StackSlotData, StackSlotKind};
 use cranelift_codegen::ir::{
-    Block, BlockArg, Function, InstBuilder, MemFlagsData, SigRef, UserFuncName, Value as ClifValue,
-    types,
+    Block, BlockArg, Function, InstBuilder, MemFlagsData, SigRef, StackSlot, UserFuncName,
+    UserStackMapEntry, Value as ClifValue, types,
 };
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -172,6 +173,30 @@ fn lower(
         sig_entry: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
+    // C2 (gated by `SLAG_STACKMAPS`): one sized slot per value a collection
+    // must be able to find, named in a stack map at every safepoint. The slot
+    // starts as `undefined`, so it is always a valid `Value` even before its
+    // definition runs, and it is written again at every definition and block
+    // parameter. Naming a value at a call it is not live at over-approximates
+    // the roots — sound, since the slot only ever holds a value that is dead
+    // there — and it is why this stays off by default until a measurement says
+    // the store traffic pays for itself.
+    let mut map_slots: Vec<(ValueId, StackSlot)> = Vec::new();
+    if std::env::var("SLAG_STACKMAPS").is_ok() {
+        let mut values_to_map = std::collections::BTreeSet::new();
+        for site in crate::opt::live::safepoint_roots(ir) {
+            values_to_map.extend(site.roots);
+        }
+        for value in values_to_map {
+            let slot = builder
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            map_slots.push((value, slot));
+        }
+        for &(_, slot) in &map_slots {
+            let empty = builder.ins().iconst(types::I64, undefined);
+            builder.ins().stack_store(types::I64, empty, slot, 0);
+        }
+    }
     if loops_to_entry {
         builder.ins().jump(clif[0], &[]);
     }
@@ -217,11 +242,17 @@ fn lower(
         };
         for (i, p) in block.params.iter().enumerate() {
             values[*p as usize] = Some(params[i]);
+            if let Some(&(_, slot)) = map_slots.iter().find(|(v, _)| v == p) {
+                builder.ins().stack_store(types::I64, params[i], slot, 0);
+            }
         }
         for inst in &block.insts {
             let result = lower_inst(&mut builder, inst, &abi, helpers, &values, types)?;
             if let Some(id) = inst.result {
                 values[id as usize] = Some(result);
+                if let Some(&(_, slot)) = map_slots.iter().find(|(v, _)| *v == id) {
+                    builder.ins().stack_store(types::I64, result, slot, 0);
+                }
             }
         }
         match &block.term {
@@ -293,6 +324,34 @@ fn lower(
                 );
             }
             _ => return Err(Unsupported::Step("opt:term")),
+        }
+    }
+    if !map_slots.is_empty() {
+        // Every call in the body is a safepoint, and the full slot set is named
+        // at each: the lowering's call sites (`call_helper`, the leaf-lane
+        // `call_indirect`s, `call_slow`) are too many separate funnels to
+        // thread a root set through, and an entry at a call the value is not
+        // live at is harmless. The instructions are collected first because
+        // appending borrows the DFG.
+        let mut safepoints = Vec::new();
+        for block in builder.func.layout.blocks() {
+            for inst in builder.func.layout.block_insts(block) {
+                if builder.func.dfg.insts[inst].opcode().is_safepoint() {
+                    safepoints.push(inst);
+                }
+            }
+        }
+        for inst in safepoints {
+            for &(_, slot) in &map_slots {
+                builder.func.dfg.append_user_stack_map_entry(
+                    inst,
+                    UserStackMapEntry {
+                        ty: types::I64,
+                        slot,
+                        offset: 0,
+                    },
+                );
+            }
         }
     }
     builder.seal_all_blocks();
