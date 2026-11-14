@@ -7423,6 +7423,13 @@ impl Vm {
         let Some(object) = Self::store_cell_object(base) else {
             return false;
         };
+        // No own properties and no vector-free map fields: there is nothing a
+        // (id, name) store cell could name, and the map-field fallback has no
+        // descriptor to serve — the caller's fresh-define path owns this case.
+        // A fresh object is exactly this state, and it is the common store.
+        if !object.props_deferred.get() && object.properties.borrow().is_empty() {
+            return false;
+        }
         // A vector-free receiver keeps its own properties in map fields, so the
         // (id, name) cell's vector slot cannot serve it (`write_data_property_slot`
         // declines an empty vector). The shared shape cell pins the descriptor

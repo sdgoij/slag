@@ -2603,6 +2603,18 @@ fn certified_lane_inline(
         (saved, call_args)
     };
     let global_bits = Value::Object(global).bits();
+    // The realm's %String.prototype% word is a per-run snapshot the compiled
+    // string member read keys its cell by. A callee in the CALLER's realm
+    // shares the snapshot the caller's context already holds — re-resolving
+    // it here is a realm lookup and a cache probe on every nested call. The
+    // globals are the realm identity the lane already resolved (the callee's
+    // `realm.global_object` against the parent context's).
+    let string_prototype_bits =
+        if global.as_ptr() as *mut c_void == ctx.global_object && ctx.string_prototype_bits != 0 {
+            ctx.string_prototype_bits
+        } else {
+            string_prototype_bits(agent)
+        };
     let mut nested = JitCallContext {
         pending: false,
         error: None,
@@ -2631,7 +2643,7 @@ fn certified_lane_inline(
         apply_builtin_bits,
         call_builtin_bits,
         intrinsic_bits,
-        string_prototype_bits: string_prototype_bits(agent),
+        string_prototype_bits,
         dispatch_value: 0,
         suspension: None,
         suspend_sp: 0,
