@@ -334,24 +334,31 @@ instrument's own per-phase cost (~31 cycles, subtracted below):
 | phase | cycles/closure | what it is |
 |---|---:|---|
 | `source_info` | 230 | the `SourceInfo` cache lookup + slice/hash for `Function.prototype.toString` |
-| `props` | 199 | `length`/`name` (+ sloppy `caller`/`arguments`) adoption |
 | `register` | 195 | the `EcmaFunction` record insert into the agent's table |
-| `function_new` | 169 | the `Function` object allocation with its prototype |
-| `record`, `strict`, `body`, `params`, `compile`, `patterns`, `realm`, `context` | ~60 total | every cached lookup is cheap; the record build is ~25 |
-| **unaccounted** | **~446** | outside the instrumented phases: the `outer_chain`/`per_iteration_chain`/`named` clones passed by value at each creation site, and the call plumbing |
+| `function_new` | 185 | the `Function` object allocation with its prototype |
+| `props` | 120–200 | `length`/`name` (+ sloppy `caller`/`arguments`) adoption |
+| `record`, `strict`, `body`, `params`, `compile`, `patterns`, `realm`, `context`, `callee_tail` | < 25 each | every cached lookup is cheap |
+| `call_register` − `callee_total` | ~70 | the call itself |
+| `tail` (caller) | ~0 | the per-iteration-chain install is free when there is no chain |
 
-The picture is diffuse — four ~200-cycle items and a third of the cost in
-plumbing — so there is no single 2× cut:
+**A0b is resolved, against its own hypothesis.** The guess was that a quarter of
+the cost sat in the by-value `outer_chain`/`per_iteration_chain`/`named` clones
+at the caller. Measuring both sides says otherwise: the caller's own work is
+`source_info` plus three cached lookups plus ~70 cycles of call overhead, and the
+remaining ~40% is *inside* `register_function` between its phase boundaries —
+prologue/epilogue on a twelve-argument function, the record move, and the
+instrument's own ±50-cycle noise, which is where this method stops resolving.
+So the cuts are the four named items, not the plumbing:
 
 - **A0a — `source_info` laziness** (230 cycles): resolve the source slice only
   when a consumer asks (`toString`, a span-carrying frame). Nothing else needs
-  it at creation time.
-- **A0b — the caller-side plumbing** (~446 cycles, the largest chunk): drop the
-  by-value environment/chain/name clones at the creation sites and instrument
-  the caller side to confirm the split before moving code.
-- **A0c — `props` and `register`** (199 + 195): defer `name`/`length` behind the
-  same pending flag the `prototype` already uses, and fold the record into the
+  it at creation time, and it is the largest single named item.
+- **A0c — `props` and `register`** (120–200 + 195): defer `name`/`length` behind
+  the same pending flag `prototype` already uses, and fold the record into the
   function box (or at least avoid a second allocation for it).
+- **A0d — `function_new`** (185): one object; at ~44 ns per empty object this is
+  ~1.5 objects' worth, so there is not much here beyond avoiding the allocation
+  entirely (`A0c`'s fold would do that).
 
 **Accept:** the closure micro (§1.4) falls; both fixtures fall with it; the
 corpus differential and `--gc-stress` stay exact (a closure is a heap object with
@@ -645,11 +652,11 @@ Added 2026-11-14 by the B0 census:
   measured 31 cycles, i.e. ~20% of a 160-cycle phase, and 12 phases put ~370
   cycles inside the `total` they inflate. Time an empty block beside the real
   phases and subtract it, or the split will read as nine equal slices.
-- **Phases that sum to three quarters mean the missing quarter is plumbing.**
-  The closure instrument accounted for ~74% of the path; the rest was the
-  by-value `Rc` chains cloned at each creation site, which no phase boundary
-  covered. When the parts do not add up, instrument the *caller* next — the
-  cost is often not in the function being profiled.
+- **A hypothesis that names a chunk is not a measurement that locates it.** The
+  missing quarter of the closure path looked like caller-side `Rc` clones;
+  instrumenting both sides showed ~70 cycles of call overhead and put the rest
+  *inside* the callee, between phase boundaries. Instrument the other side
+  before designing the cut — this guess was simply wrong.
 - **A corpus total is only comparable within a session and a corpus size.** The
   morning revision's 2.70× and this session's 2.68–3.06× are not a regression:
   81 rows vs 77, and a different load window. Four passes on one binary in one

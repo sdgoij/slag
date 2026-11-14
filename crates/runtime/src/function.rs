@@ -1046,24 +1046,30 @@ pub fn instantiate_function_with_source(
         let _phase = phases::enter(phases::PARAMS);
         shared_params(&body, &f.params)
     };
-    let value = register_function(
-        agent,
-        default_binding_display_name(named.or_else(|| f.name.map(crux::lookup))),
-        params,
-        body,
-        environment,
-        enclosing_strict,
-        DefinitionKind::function(f.is_async, f.is_generator),
-        source_info,
-        None,
-        outer_chain,
-        named_expression,
-    )?;
-    if !per_iteration_chain.is_empty()
-        && let Some(function) = value.as_function()
-        && let Some(mut data) = agent.ecma_function_mut(&function.id())
+    let value = {
+        let _phase = phases::enter(phases::CALL_REGISTER);
+        register_function(
+            agent,
+            default_binding_display_name(named.or_else(|| f.name.map(crux::lookup))),
+            params,
+            body,
+            environment,
+            enclosing_strict,
+            DefinitionKind::function(f.is_async, f.is_generator),
+            source_info,
+            None,
+            outer_chain,
+            named_expression,
+        )?
+    };
     {
-        data.per_iteration_chain = per_iteration_chain;
+        let _phase = phases::enter(phases::TAIL);
+        if !per_iteration_chain.is_empty()
+            && let Some(function) = value.as_function()
+            && let Some(mut data) = agent.ecma_function_mut(&function.id())
+        {
+            data.per_iteration_chain = per_iteration_chain;
+        }
     }
     Ok(value)
 }
@@ -1709,6 +1715,7 @@ fn register_function(
     // `strict` overrides the body-directive check (CreateDynamicFunction
     // computes it against its assembled source, which the running context
     // cannot provide); `enclosing_strict` still forces strictness.
+    let _self = phases::enter(phases::SELF);
     let (strict, this_mode) = {
         let _phase = phases::enter(phases::STRICT);
         let strict =
@@ -1864,22 +1871,26 @@ fn register_function(
     // record above — and materialized on first observation of the own
     // `prototype` property (a read, `new`, `instanceof`, own-key
     // enumeration, descriptor access, delete, or redefine).
-    if kind.is_generator {
-        let intrinsic = if kind.is_async {
-            "%AsyncGenerator.prototype%"
-        } else {
-            "%Generator.prototype%"
-        };
-        let proto = agent
-            .current_realm()?
-            .intrinsics
-            .function_prototype(intrinsic)
-            .and_then(|value| crate::context::as_object(&value));
-        let prototype = JsObject::ordinary_object_create(proto);
-        make_constructor(&function, prototype, true, !kind.is_generator)?;
+    {
+        let _phase = phases::enter(phases::CALLEE_TAIL);
+        if kind.is_generator {
+            let intrinsic = if kind.is_async {
+                "%AsyncGenerator.prototype%"
+            } else {
+                "%Generator.prototype%"
+            };
+            let proto = agent
+                .current_realm()?
+                .intrinsics
+                .function_prototype(intrinsic)
+                .and_then(|value| crate::context::as_object(&value));
+            let prototype = JsObject::ordinary_object_create(proto);
+            make_constructor(&function, prototype, true, !kind.is_generator)?;
+        }
     }
     // Cut 74: no trailing set_function_prototype — the object was born with
     // its [[Prototype]] (see above).
+    drop(_self);
     Ok(Value::Function(function))
 }
 
@@ -5796,8 +5807,19 @@ pub(crate) mod phases {
     pub const STRICT: usize = 11;
     pub const REALM: usize = 12;
     pub const CONTEXT: usize = 13;
+    /// The `register_function` call *including its callee* (whose own `total`
+    /// is reported separately), so the caller's identity can be closed.
+    pub const CALL_REGISTER: usize = 14;
+    /// Everything after the call: the per-iteration-chain install and the
+    /// return.
+    pub const TAIL: usize = 15;
+    /// `register_function`'s own total, so the caller's `call_register` can be
+    /// split into named phases plus call/prologue overhead.
+    pub const SELF: usize = 16;
+    /// The callee's tail: the generator `prototype` block and the return.
+    pub const CALLEE_TAIL: usize = 17;
 
-    const NAMES: [&str; 14] = [
+    const NAMES: [&str; 18] = [
         "total",
         "source_info",
         "body",
@@ -5812,9 +5834,13 @@ pub(crate) mod phases {
         "strict",
         "realm",
         "context",
+        "call_register",
+        "tail",
+        "callee_total",
+        "callee_tail",
     ];
 
-    static CYCLES: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    static CYCLES: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
     static CALLS: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
