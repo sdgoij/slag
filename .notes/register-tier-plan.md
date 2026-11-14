@@ -566,10 +566,30 @@ loop would pay per iteration and is not measured; that is the case to check
 before the set is narrowed. Results are identical with the gate on and off over
 `opcost` in both `jit` and `jitless`.
 
-Still off by default, and the maps are still not **walked**: the collector has
-to find them from a return PC (a registry of code ranges, then the lookup), and
-until it does, the slots are inert — a collection inside a call cannot see them.
-That is slice 4, and it is what turns this from bookkeeping into roots.
+Still off by default, and the maps are still not **walked** — and that is where
+the arc stops, for a reason outside this crate.
+
+**Slice 4 is blocked on a native-code convention** (found 2026-11-14 reading
+Cranelift). A map's offsets are SP-relative: `sp_to_sized_stack_slots()` is the
+frame's `outgoing_args_size`, added to each sized slot's frame offset, so the
+base is `rsp` at the safepoint. CLIF cannot produce that value — `stack_addr`
+addresses a sized slot, and there is no `get_sp`/`get_fp` instruction in
+0.134.3. So a helper called from compiled code cannot be handed the base its
+callee `rsp` is offset from by the return address and its own prologue, and no
+portable Rust can recover it. The options are a per-target assembly shim that
+captures `rsp` at the call and passes it as an extra argument to every helper
+(the four-file mirror, plus x64 and aarch64 shims), or a frame-pointer
+convention with the same shim to read it. Both are an ABI change, and neither
+belongs inside this cut.
+
+**Consequence: D5 does not need any of this.** The fused loop's roots — the
+array and the callback — can live in traced `vm.stack` storage (the
+scratch-slot variant this note rejected earlier as the fallback), which the
+collector already walks: no map, no SP, no shim. C2's *register* case is the
+only thing the shim buys, so the order returns to **D5 via traced slots first**,
+with the shim only if a later cut genuinely needs a heap value in a register
+across a safepoint. Slices 1-3 stay as the producer half, gated off, and are
+the thing to finish if that cut appears.
 
 **D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
 call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms
