@@ -3765,8 +3765,11 @@ impl Agent {
     /// collision simply drops the old entry (the box stays alive while anything
     /// else references it).
     pub(crate) fn atom_string_value(&self, atom: crux::AtomId) -> Value {
-        let index = (atom as usize).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            & (crate::ir::ATOM_STRING_CELLS - 1);
+        #[cfg(target_pointer_width = "64")]
+        const MUL: usize = 0x9E37_79B9_7F4A_7C15;
+        #[cfg(target_pointer_width = "32")]
+        const MUL: usize = 0x9E37_79B9;
+        let index = (atom as usize).wrapping_mul(MUL) & (crate::ir::ATOM_STRING_CELLS - 1);
         let cell = &self.roots.atom_string_cells[index];
         if let Some((cached, value)) = cell.get()
             && cached == atom
