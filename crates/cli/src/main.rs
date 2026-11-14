@@ -25,7 +25,6 @@ use std::time::Instant;
 use crux::error::JsError;
 use runtime::embed::{Context, JsValue};
 
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The stack the headless runner's thread gets. A debug build's parser frame is

@@ -16,7 +16,6 @@
 pub use crux::error::{ErrorKind, JsError};
 pub use runtime::HostHooks;
 pub use runtime::dump;
-pub use runtime::sampler;
 pub use runtime::embed::{
     BindingView, BufferInfo, CallbackWindow, CompiledScript, Context, FunctionCall, HostCallbacks,
     HostFn, JsModule, JsObject, JsValue, ModuleNamespacePhase, OwnProperty, OwnPropertyView,
@@ -26,6 +25,7 @@ pub use runtime::embed::{
     value_type_mask,
 };
 pub use runtime::embed::{OutputFn, RandomFn};
+pub use runtime::sampler;
 
 /// The V8-shaped Rust surface — [`Isolate`](api::Isolate), [`Context`](api::Context),
 /// [`Local`](api::Local), [`Module`](api::Module) and the rest — re-exported so a
