@@ -1153,19 +1153,32 @@ fn shared_source_info(
     node: usize,
     span: crux::Span,
 ) -> Option<std::rc::Rc<SourceInfo>> {
+    let (start, end) = (span.start, span.end);
+    // Fast path: a closure created in a loop resolves the same site on every
+    // iteration, and the work below (walk the context stack, clone the text,
+    // build the key, probe `SOURCE_INFO_CACHE`) is what the closure path spends
+    // in its `source_info` phase. The memo is keyed by the running context's
+    // text address and the span, which is the same identity `SOURCE_INFO_CACHE`
+    // uses, and every entry pins the text it names, so a recycled address cannot
+    // serve the wrong slice.
+    let running = running_source_identity(agent);
+    if let Some(text_id) = running
+        && let Some(info) = memo_get(text_id, start, end)
+    {
+        return Some(info);
+    }
     let text = enclosing_source(agent, span)?;
-    let (start, end) = (span.start as usize, span.end as usize);
     let realm = agent
         .current_realm()
         .map(|realm| crux::handle::Handle::as_ptr(realm) as usize)
         .unwrap_or(0);
     let source_key = source_site_identity(&text);
-    let key = (node, realm, start, end, source_key);
-    SOURCE_INFO_CACHE.with(|cache| {
+    let key = (node, realm, start as usize, end as usize, source_key);
+    let resolved = SOURCE_INFO_CACHE.with(|cache| {
         if let Some(info) = cache.borrow().get(&key) {
-            return Some(info.clone());
+            return info.clone();
         }
-        let slice = JsString::from_utf16(&text.as_slice()[start..end]);
+        let slice = JsString::from_utf16(&text.as_slice()[start as usize..end as usize]);
         // The cache outlives every record and is not traced, so a non-leaf text
         // (`ConsString`/`Rope`/`Sliced`) would leave arena handles dangling in
         // it. Materialise a leaf once; script and module texts are already
@@ -1181,8 +1194,56 @@ fn shared_source_info(
             key: source_key,
         });
         cache.borrow_mut().insert(key, info.clone());
-        Some(info)
+        info
+    });
+    if let Some(text_id) = running {
+        memo_put(text_id, start, end, &resolved);
+    }
+    Some(resolved)
+}
+
+/// The address of the running context's own source, when it is a leaf that can be
+/// named by one. `None` for a frame with no text (the realm bootstrap, a
+/// synthesized body) and for the forms that have no stable base, which take the
+/// full resolution.
+fn running_source_identity(agent: &Agent) -> Option<usize> {
+    agent.roots.execution_context_stack.with(|stack| {
+        let source = stack.last()?.source.as_ref()?;
+        match source {
+            JsString::Flat(units) if !units.is_empty() => Some(units.as_ptr() as usize),
+            _ => None,
+        }
     })
+}
+
+type SiteMemoEntry = (usize, u32, u32, std::rc::Rc<SourceInfo>);
+
+thread_local! {
+    /// The last few site resolutions, direct-mapped. Small on purpose: a loop's
+    /// closures come from a handful of sites, and a miss only costs the
+    /// resolution it was going to do anyway.
+    static SITE_MEMO: std::cell::RefCell<[Option<SiteMemoEntry>; 8]> =
+        std::cell::RefCell::new(std::array::from_fn(|_| None));
+}
+
+fn memo_slot(text: usize, start: u32, end: u32) -> usize {
+    let mixed = text.rotate_left(17) ^ ((u64::from(start) << 32) | u64::from(end)) as usize;
+    mixed & 7
+}
+
+fn memo_get(text: usize, start: u32, end: u32) -> Option<std::rc::Rc<SourceInfo>> {
+    SITE_MEMO.with(|memo| {
+        let slot = memo_slot(text, start, end);
+        let entry = memo.borrow()[slot].clone()?;
+        (entry.0 == text && entry.1 == start && entry.2 == end).then_some(entry.3)
+    })
+}
+
+fn memo_put(text: usize, start: u32, end: u32, info: &std::rc::Rc<SourceInfo>) {
+    SITE_MEMO.with(|memo| {
+        let slot = memo_slot(text, start, end);
+        memo.borrow_mut()[slot] = Some((text, start, end, info.clone()));
+    });
 }
 
 type SourceInfoKey = (usize, usize, usize, usize, usize);

@@ -371,8 +371,22 @@ So the cuts are the four named items, not the plumbing:
   (-5.7%); `body`, `props` and `patterns` moved inside the instrument's
   ±50-cycle band. The wall clock does not resolve it in this window (that row
   spans 337-602 ms within one binary), so this is an isolated win, not a row
-  claim. What is left in the phase is `enclosing_source`, a walk of the
-  execution-context stack plus a `JsString` clone per closure, and the frame
+  claim. What is left in the phase is `enclosing_source` (a walk of the
+  execution-context stack plus a `JsString` clone per closure) and the
+  `SOURCE_INFO_CACHE` probe.
+
+  **The resolution is now memoized per site** (2026-11-15): a closure created in
+  a loop re-enters `shared_source_info` with the same text and span every
+  iteration, so an eight-entry direct-mapped memo keyed by the running context's
+  text address and the span returns the `Rc<SourceInfo>` without the stack walk,
+  the clone, the key build or the cache probe. The key is the identity the cache
+  already uses, and each entry holds the `Rc`, which pins the text exactly as the
+  cache does, so a recycled address cannot serve the wrong slice. `source_info`
+  **183.9 → 31.7** cycles per call and `total` **1799.7 → 1639.0** (-8.9%); the
+  head-let row goes 331.7 → 322.6 ms on the mean of three interleaved pairs
+  (minima 318.2 → 314.7), which is the same direction but below this host's
+  resolution. 676 `built-ins` `*toString*` fixtures still pass, which is what
+  would catch a wrong slice.
   already carries its source, so it can carry the site key with it: that is
   the next item.
 - **A0c, `props` and the record insert** (120–200 + 195): property adoption
