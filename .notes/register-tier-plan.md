@@ -350,12 +350,25 @@ prologue/epilogue on a twelve-argument function, the record move, and the
 instrument's own ±50-cycle noise, which is where this method stops resolving.
 So the cuts are the four named items, not the plumbing:
 
-- **A0a — `source_info` laziness** (230 cycles): resolve the source slice only
-  when a consumer asks (`toString`, a span-carrying frame). Nothing else needs
-  it at creation time, and it is the largest single named item.
-- **A0c — `props` and `register`** (120–200 + 195): defer `name`/`length` behind
-  the same pending flag `prototype` already uses, and fold the record into the
-  function box (or at least avoid a second allocation for it).
+- **A0a — `source_info` laziness (blocked: not a cost, a correctness guard).**
+  The 230 cycles are dominated by the FNV hash of the function's source slice,
+  and that hash is what keys `SOURCE_INFO_CACHE` and `FUNCTION_BODY_CACHE`.
+  Node addresses are reused after a parse is dropped, and two parses of
+  same-length sources collide on `(address, realm, span)` alone — the comment on
+  `shared_function_body` records this as observed. So the hash cannot be dropped
+  or shortened without returning another parse's source text to
+  `Function.prototype.toString`. Making it lazy needs the whole site-key design
+  changed: materialize the enclosing text to a canonical leaf *first*, then key
+  by `(node, realm, span, leaf identity)` — sound because the cache entry pins
+  the leaf, so its address cannot be recycled — and do the same for
+  `shared_arrow_body`, `shared_accessor_body` and `source_info_with_slice`,
+  which each hash per closure today. That is a coherent cut, not a one-liner.
+- **A0c — `props` and the record insert** (120–200 + 195): the largest safely
+  cuttable items now. Defer `name`/`length` behind the same pending flag
+  `prototype` already uses; and `ecma_functions` is an `IdMap<EcmaFunction>`, so
+  every insert moves the whole record (and every rehash moves all of them) —
+  boxing the value makes the insert and the rehash pointer-sized, at the cost of
+  a `&**` at each accessor.
 - **A0d — `function_new`** (185): one object; at ~44 ns per empty object this is
   ~1.5 objects' worth, so there is not much here beyond avoiding the allocation
   entirely (`A0c`'s fold would do that).
