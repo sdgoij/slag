@@ -3,7 +3,7 @@
 **Status: open, started 2026-10-06.** Base measurement: tag `v0.1.0`
 (`e380d9b2`). Goal: **3–5x wall-clock** on the 77-workload corpus and the
 micro-suite, both columns (`jit` and `--jitless`), measured against that tag.
-This is the successor to `.notes/jit-quality-plan.md`, whose JIT-side work list
+This is the successor to `.notes/archive/perf/jit-quality-plan.md`, whose JIT-side work list
 is exhausted (its remaining items are architectural, not inline paths); this
 program is **interpreter-first**, because the interpreter is the deopt target,
 the `--jitless` column, and the floor under every compiled row — a win there
@@ -89,7 +89,7 @@ not machinery) and `strings` (28.69).
    iteration; ~950 ms/rep against 1,058 ms jitless — no inline path can pay).
   This is the **memory** priority (§3 of the project priorities) wearing a perf
   hat; the win is bigger than it looks because those rows dominate absolute time.
-- **L3 — JIT coverage.** Resume `.notes/jit-quality-plan.md` where it stopped —
+- **L3 — JIT coverage.** Resume `.notes/archive/perf/jit-quality-plan.md` where it stopped —
   the L1c shape end-state for chain reads, and the general call's pooled private
   Vm (its Stage 9) — only if L1/L2 leave a compiled-row gap worth it.
 - **L4 — codegen.** Cranelift is the backend; no front-half (feedback → SSA →

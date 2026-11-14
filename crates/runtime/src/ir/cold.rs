@@ -1,7 +1,7 @@
 //! The interpreter's cold step handlers.
 //!
 //! `run_inner_inner`'s dispatch is one `match` over 233 `Step` variants. The
-//! census (`.notes/perf.md`, 2026-11-11) says 40 of them run 99% of all
+//! census (`.notes/archive/perf/perf.md`, 2026-11-11) says 40 of them run 99% of all
 //! dispatched steps and the other 193 run 1% — yet all 233 shared one function,
 //! so an edit anywhere in the interpreter re-laid every arm after it (a no-op
 //! arm swap measured 6.8% on `promise_churn`).

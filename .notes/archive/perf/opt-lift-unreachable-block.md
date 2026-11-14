@@ -1,7 +1,7 @@
 # The opt lift's `Malformed("unreachable block")` on dead code after a `return`
 
 **Status: fixed (2026-10-11).** Distinct from the typer-guard miscompile
-(`.notes/typer-guard-miscompile.md`); found while building a minimal repro for
+(`.notes/archive/perf/typer-guard-miscompile.md`); found while building a minimal repro for
 it.
 
 ## Symptom

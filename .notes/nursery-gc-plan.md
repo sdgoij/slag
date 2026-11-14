@@ -39,7 +39,7 @@ workload now hits the collector's cost model:
   **the garbage batch is itself O(live)**. Pause therefore grows with
   retention — and retention grows because the conservative stack scan pins
   floating garbage. That is the feedback loop this plan breaks.
-- `Heap::register` costs ~3ns/alloc (`.notes/perf.md` 2026-09-10, corrected
+- `Heap::register` costs ~3ns/alloc (`.notes/archive/perf/perf.md` 2026-09-10, corrected
   2026-09-11) and exists only to serve the collector.
 
 A minor collection whose cost is O(young) rather than O(live) breaks the
@@ -944,7 +944,7 @@ one to two orders of magnitude cheaper than a major.
   enumeration the sweep now uses.
 
 **Pointers.** `.notes/gc-plan.md` and `.notes/engine-redesign.md` open with a
-superseded note pointing here; `.notes/perf.md`'s memory bullet names the
+superseded note pointing here; `.notes/archive/perf/perf.md`'s memory bullet names the
 generational collector.
 
 **Gate met.** The A6 gate run is the A7 gate (docs-only after it): clippy clean,

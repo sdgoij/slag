@@ -2053,12 +2053,12 @@ phase therefore delivers:
    `--dump-ast`, `--dump-tokens`.
 
 **Exit criteria:** conformance target met; GC stress clean; perf milestones each pass their gate
-or are explicitly deferred in `.notes/perf.md`; embedding API documented with examples.
+or are explicitly deferred in `.notes/archive/perf/perf.md`; embedding API documented with examples.
 
 **Status (in progress):** the embedding API and CLI workstreams are delivered and documented
 with doc-tests/examples; the conformance target is certified at **100% of runnable** across
 all three sweep areas (see `.notes/conformance.md`); the GC and performance milestones are
-explicitly deferred (gates and rationale in `.notes/perf.md`).
+explicitly deferred (gates and rationale in `.notes/archive/perf/perf.md`).
 
 Delivered:
 - **Embedding API** (`crates/runtime/src/embed.rs`, exported as `runtime::Context`):
@@ -2086,7 +2086,7 @@ Delivered:
   `built-ins`, and `annexB` (new `Area::AnnexB`) with `SWEEP`/`SWEEP_SAMPLE` knobs;
   `.notes/conformance.md` documents methodology, the 3317 passing vendored fixtures, the
   skip taxonomy, and the expected non-runnable categories (Intl, `dynamic import` without a
-  loader, host-dependent behavior). `.notes/perf.md` documents the benchmark gate and the
+  loader, host-dependent behavior). `.notes/archive/perf/perf.md` documents the benchmark gate and the
   deferred milestones.
 - **Conformance certification**: the full ~49k-fixture release sweep (`test262-sweep`, all
   three areas, long config) measures **100% of runnable** — language 18,052 / built-ins
@@ -2099,7 +2099,7 @@ Delivered:
 Remaining before exit criteria:
 - GC milestone (arena heap + mark-sweep, `--gc-stress`, leak harness) and the performance
   milestones (NaN-boxed `Value`, bytecode VM, shapes/ICs, string ropes) stay deferred per
-  `.notes/perf.md`.
+  `.notes/archive/perf/perf.md`.
 
 ---
 

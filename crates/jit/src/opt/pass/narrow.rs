@@ -1,4 +1,4 @@
-//! Numeric effect narrowing (`.notes/optimizing-tier-impl.md` §2, `pass/`).
+//! Numeric effect narrowing (`.notes/archive/perf/optimizing-tier-impl.md` §2, `pass/`).
 //!
 //! An arithmetic op's *sound* default effects are `call()` — `+` may run
 //! `valueOf`, `-` may throw on a BigInt/Symbol. That default is what stops CSE

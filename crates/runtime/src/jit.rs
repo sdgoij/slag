@@ -1652,13 +1652,13 @@ pub const MAX_JIT_DEPTH: usize = 128;
 /// corpus's one-shot script/function bodies run once each, so they never
 /// amortize a Cranelift compile; loop bodies bypass the gate entirely
 /// (they run once with many internal iterations, so a pure count would
-/// never promote them). See `.notes/jit-compile-threshold.md`.
+/// never promote them). See `.notes/archive/perf/jit-compile-threshold.md`.
 pub(crate) const JIT_COMPILE_THRESHOLD: u32 = 16;
 
 /// The largest body (in steps) the JIT will compile at all. Compile cost is
 /// roughly linear in a body's step count, and a body above this cap costs more
 /// to compile than a pass over the workload repays, so the interpreter serves
-/// it. Measured on deno's tsc probe (`.notes/non-leaf-jit.md` §6): in a debug
+/// it. Measured on deno's tsc probe (`.notes/archive/perf/non-leaf-jit.md` §6): in a debug
 /// build the 567 compiled bodies cost **52.2 s** to compile, and the 125 of them
 /// above this cap cost **36.6 s** of that (18 bodies over 256 steps alone cost
 /// 17.3 s, the 2,277-step scanner ~2.8 s). Refusing them, two samples each in
@@ -6938,7 +6938,7 @@ extern "C" fn pop_var_reference(ctx: *mut c_void) -> u64 {
 }
 
 /// A callee resolved for the optimizing-tier inline pass
-/// (`.notes/optimizing-tier-impl.md` I5c-2c-ii): its compiled body and the input
+/// (`.notes/archive/perf/optimizing-tier-impl.md` I5c-2c-ii): its compiled body and the input
 /// frame layout the splice binds.
 pub struct ResolvedCallee {
     pub body: std::rc::Rc<CompiledBody>,

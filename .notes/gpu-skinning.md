@@ -1,6 +1,6 @@
 # GPU skinning — the client-side change
 
-`.notes/perf.md` (the 2026-09-16 GPU-skinning entry) has the engine mechanism and
+`.notes/archive/perf/perf.md` (the 2026-09-16 GPU-skinning entry) has the engine mechanism and
 how it is verified; `frame-cost-profile.md` §7.1 item 4 has the cost attribution.
 This is what a *scene* does to use it.
 

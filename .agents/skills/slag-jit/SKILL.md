@@ -716,7 +716,7 @@ previously claimed the opposite, and the claim was stale: `emit_step` has a
 construct-inline leaf cache / general path), `max_stack_usage` accounts for it
 (net 0), and `step_name` answers `"Construct"` — so a body containing `new`
 compiles, and the catch-all would NOT report `"unsupported step"` for it.
-It cost a plan entry: `.notes/non-leaf-jit.md` §6 named `Construct` as the next
+It cost a plan entry: `.notes/archive/perf/non-leaf-jit.md` §6 named `Construct` as the next
 milestone on this section's word, and the step that actually bailed deno's last
 offered body was **`TypeofIdent`** (a `typeof x` over a `BindingLoc::Env`
 name; lowered as Cut 93). **Lesson: verify a "not lowered" claim against
@@ -1342,7 +1342,7 @@ string loop, which made 0 safepoint calls), and the eventual collection was a
 ~46 ms pause. It is process-lifetime visible — a workload's JIT time depended on
 what ran before it (`strings/search_slice` 60 -> 1739 ms in the whole-corpus
 process) while `--jitless` was unaffected. Full write-up:
-`.notes/corpus-regression.md`.
+`.notes/archive/perf/corpus-regression.md`.
 
 - **A new lowered-loop form needs its safe point.** The probe is emitted in
   `opt_lower::lower` at each loop header — a block targeted by a back edge

@@ -1,5 +1,5 @@
 //! Common-subexpression elimination over the SSA IR
-//! (`.notes/optimizing-tier-impl.md` §2, `pass/cse.rs`).
+//! (`.notes/archive/perf/optimizing-tier-impl.md` §2, `pass/cse.rs`).
 //!
 //! Block-local: two instructions with the same op, immediate and (already
 //! resolved) arguments produce the same value, so the second's uses are

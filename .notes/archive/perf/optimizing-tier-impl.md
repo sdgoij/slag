@@ -1,6 +1,6 @@
 # Implementing the optimizing tier
 
-`.notes/optimizing-tier-plan.md` is the design and the strategy: why a
+`.notes/archive/perf/optimizing-tier-plan.md` is the design and the strategy: why a
 TurboFan-shaped tier, what the three engines teach, and the stage order O →
 I → E → L → T. This document is the engineering plan: where the code goes,
 what the interfaces are, in what order it lands, and what proves each step.
@@ -748,7 +748,7 @@ green, `cargo clippy --workspace --all-targets -- -D warnings` clean. The
 so the lift's loop path is exercised by `do`/`while` today. Still no perf claim.
 
 **I3a status (2026-10-07): the feedback substrate and the count probe landed.**
-The store is **per body** (`.notes/optimizing-tier-impl.md` §10.1, resolved
+The store is **per body** (`.notes/archive/perf/optimizing-tier-impl.md` §10.1, resolved
 per-body to match §5's `(body, step)` keying): `crates/runtime/src/feedback.rs`
 defines `IcState` (the `Specialized → Megamorphic → Generic` valve),
 `MAX_OPTIMIZED_STUBS`/`max_failures`, a bounded `MemberReadSite` (the receiver
@@ -1004,7 +1004,7 @@ the guarded, hoisted read needs. It required lifting `Step::LoadIdent` (a
 `BindingLoc::Env` global read) — every body the lift previously accepted was
 leaf-eligible and ran through the leaf lane, which has no deopt handling, so a
 non-leaf body is what runs through `run_jit_body`, where the resume works (see
-`.notes/tier-resume-fidelity.md`). The slice also fixed a latent nested-deopt bug:
+`.notes/archive/perf/tier-resume-fidelity.md`). The slice also fixed a latent nested-deopt bug:
 `run_jit_body`'s DEOPT arm shifted the operands to the stack bottom, which
 destroyed a nested certified call's carved frame. Gates: `cargo test --workspace`
 5683 passed / 0 failed (incl. a `load_ident` e2e and a deopt-resume e2e);

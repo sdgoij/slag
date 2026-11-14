@@ -2,7 +2,7 @@
 
 **Status: Stages B and A LANDED (2026-10-19). Stage D not started — the
 stop rule was not met.** Baseline, profile, and the rejected alternatives were
-measured 2026-10-19; the measured numbers live in `.notes/perf.md` ("Closure
+measured 2026-10-19; the measured numbers live in `.notes/archive/perf/perf.md` ("Closure
 creation, profiled properly", "share the per-site source info", and "box the
 class-only slots").
 
@@ -160,7 +160,7 @@ bench();
   (~550 ms; the 733 ms seen once was thermal/load).
 - Full corpus: `node tools/corpus/bench.js` (parity must stay 0).
 - Profiling method: accumulate per-phase means over ≥1,000 calls and print
-  once; never trust a single sample (see `.notes/perf.md`).
+  once; never trust a single sample (see `.notes/archive/perf/perf.md`).
 - Isolated map bench: `scratch/insert_bench.rs` reproduced in the perf note
   (248-byte record: 52 ns/insert steady, 224 with growth; boxed 128).
 
@@ -170,7 +170,7 @@ bench();
 warnings`; `rustfmt --edition 2024` on touched files; `sweep.exe all --timeout
 15 --recheck-timeout 15` and `sweep.exe intl402 ...` must stay 48,633 + 3,365 =
 51,998 at 100%; corpus parity 0; same-binary A/B for every claimed win; a
-`.notes/perf.md` entry per stage.
+`.notes/archive/perf/perf.md` entry per stage.
 
 ## Outcome (2026-10-19)
 
@@ -205,7 +205,7 @@ path already borrows scoped and clones only the fields it needs.
 The two chain fields are now `CaptureChain<T> = Option<Rc<[T]>>`, shared per
 creation site, 216 -> **200 bytes**. `e7` reads 75.8 ms median, so this plan's
 ~85 ms stop gate is met and **Stage D is eligible**. Details and the A/B
-numbers: `.notes/perf.md` ("capture chains shared per closure site").
+numbers: `.notes/archive/perf/perf.md` ("capture chains shared per closure site").
 Eligibility is not an expectation: Stage D's arena record is still unmeasured.
 
-**Stage D measured (2026-10-20), not viable in its map form.** Storing `Gc<EcmaFunction>` in `ecma_functions` cut the insert phase 100 -> 56 ns and made calls 13% faster (`e5`), but rooting every record from the map promotes each one on its first minor: `e7` +8% (77.5 -> 83.7 ms) and the for-in head-let row +70% (540-558 -> 916-1393 ms). Reverted. Details in `.notes/perf.md` ("the function record in the GC arena"). The remaining shape — the record reachable only from its function object, with no traced map — would need `EcmaFunction` (or a handle to it) reachable from `crux`, and is still unmeasured.
+**Stage D measured (2026-10-20), not viable in its map form.** Storing `Gc<EcmaFunction>` in `ecma_functions` cut the insert phase 100 -> 56 ns and made calls 13% faster (`e5`), but rooting every record from the map promotes each one on its first minor: `e7` +8% (77.5 -> 83.7 ms) and the for-in head-let row +70% (540-558 -> 916-1393 ms). Reverted. Details in `.notes/archive/perf/perf.md` ("the function record in the GC arena"). The remaining shape — the record reachable only from its function object, with no traced map — would need `EcmaFunction` (or a handle to it) reachable from `crux`, and is still unmeasured.

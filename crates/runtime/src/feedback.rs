@@ -1,4 +1,4 @@
-//! Per-site feedback records for the optimizing tier (`.notes/optimizing-tier-plan.md`
+//! Per-site feedback records for the optimizing tier (`.notes/archive/perf/optimizing-tier-plan.md`
 //! stage O).
 //!
 //! A record is keyed by `(body, step)`: it lives on the
@@ -27,7 +27,7 @@ pub enum IcState {
     Generic,
 }
 
-/// `MaxOptimizedStubs` (`.notes/optimizing-tier-plan.md` §3.2): the number of
+/// `MaxOptimizedStubs` (`.notes/archive/perf/optimizing-tier-plan.md` §3.2): the number of
 /// distinct shapes a site may accumulate before it turns megamorphic.
 pub const MAX_OPTIMIZED_STUBS: usize = 6;
 
@@ -128,7 +128,7 @@ pub enum Observed {
     Frozen,
 }
 
-/// A call site's record (stage I, `.notes/optimizing-tier-impl.md` I5a): the
+/// A call site's record (stage I, `.notes/archive/perf/optimizing-tier-impl.md` I5a): the
 /// distinct callee identities it has seen, in first-seen order (bounded by
 /// [`MAX_OPTIMIZED_STUBS`]), and the valve state. The identity is the callee's
 /// encoded `Value` bits — the same `u64` the compiled call path keys its leaf
@@ -364,7 +364,7 @@ pub(crate) fn force_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// The count probe of stage O (`.notes/optimizing-tier-plan.md` §6): how many
+/// The count probe of stage O (`.notes/archive/perf/optimizing-tier-plan.md` §6): how many
 /// records were written, how many sites went polymorphic ("retirements that
 /// would fire" for a monomorphic guard built on the first shape), and how many
 /// overflowed their stub budget and turned generic.
@@ -414,7 +414,7 @@ pub fn writes() -> usize {
 }
 
 /// The provisional callee-size budget for the I5a probe
-/// (`.notes/optimizing-tier-impl.md`): a monomorphic site whose callee's
+/// (`.notes/archive/perf/optimizing-tier-impl.md`): a monomorphic site whose callee's
 /// compiled body is at most this many steps counts as inlinable. The printed
 /// size histogram is what fixes the real number for I5c.
 pub const CALLEE_BUDGET_STEPS: u32 = 128;

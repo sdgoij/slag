@@ -708,7 +708,7 @@ fn finish_gc_trace() {
 /// (interning, hooks), then timed. The sources use `var` (not `let`) so a
 /// second evaluation in the same realm is legal and the timed run measures
 /// the real loop rather than a re-declaration error. The timings are only
-/// comparable within a build profile; see `.notes/perf.md` for the benchmark
+/// comparable within a build profile; see `.notes/archive/perf/perf.md` for the benchmark
 /// gates.
 ///
 /// The last three rows exercise the Cut 3 continuation certification

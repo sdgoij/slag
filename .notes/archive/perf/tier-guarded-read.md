@@ -1,7 +1,7 @@
 # The guarded, hoisted member read
 
 **Status: plan (2026-10-07).** The `Op::Check` guard + resume is landed
-(`.notes/tier-resume-fidelity.md`); this is the transform that consumes it. It is
+(`.notes/archive/perf/tier-resume-fidelity.md`); this is the transform that consumes it. It is
 a multi-slice feature and has one load-bearing open decision (below), so the
 design is pinned before code.
 

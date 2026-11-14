@@ -2089,7 +2089,7 @@ pub struct CompiledBody {
     /// re-alloc): `do_call_fast` inlines it when the caller's shared stacks
     /// are empty. A leaf cannot recurse (it contains no calls), so the
     /// flat save/restore of the few fields it touches is safe. See
-    /// `.notes/perf.md` Cut 25.
+    /// `.notes/archive/perf/perf.md` Cut 25.
     pub leaf: bool,
     /// Cut 28: whether the leaf reads captured per-iteration heads — its
     /// steps contain `LoadPerIteration`/`StorePerIteration`/
@@ -2203,7 +2203,7 @@ pub struct CompiledBody {
     /// function of the step list — 20% of a non-leaf call's cost measured
     /// (`scratch/iso/c4`, 2026-11-13).
     pub certified_gate: std::cell::Cell<Option<bool>>,
-    /// Stage O: the per-site feedback store (`.notes/optimizing-tier-plan.md`),
+    /// Stage O: the per-site feedback store (`.notes/archive/perf/optimizing-tier-plan.md`),
     /// keyed by step index. Allocated lazily and only when the probe
     /// (`SLAG_FEEDBACK`) is enabled, so a default build allocates nothing.
     pub feedback: std::cell::RefCell<Option<crate::feedback::Feedback>>,
@@ -2336,7 +2336,7 @@ impl CompiledBody {
     /// the `Vm::args` builders/consumers (`save_scratch`'s watermark unwinds
     /// them). Refusing these cost every function with a `try` or a cold
     /// `throw new Error(...)` its call lane entirely — one never-taken step,
-    /// ~12x the call (`.notes/perf.md`, 2026-10-20).
+    /// ~12x the call (`.notes/archive/perf/perf.md`, 2026-10-20).
     fn has_certified_lane_step_hazard(&self) -> bool {
         self.has_lane_step_hazard(true)
     }
@@ -2572,7 +2572,7 @@ impl Trace for CompiledBody {
         // function (and thus its box) stays alive: compiled `Op::GuardCallee`
         // code cannot be cleared the way the leaf caches are, so the retained
         // value is what keeps the guard exact against box recycling
-        // (`.notes/optimizing-tier-impl.md` I5c-2c-ii). A `RefCell` borrowed
+        // (`.notes/archive/perf/optimizing-tier-impl.md` I5c-2c-ii). A `RefCell` borrowed
         // mid-collection aborts the trace (safe).
         if let Ok(feedback) = self.feedback.try_borrow()
             && let Some(store) = feedback.as_ref()
@@ -3341,7 +3341,7 @@ const INLINE_FRAME: usize = 8;
 /// letting a pathological body grow the stack without limit. It is also the
 /// ceiling the JIT's compiled working region sizes itself to: `run_jit_body`
 /// reserves `vm.stack` up to this cap, so no helper push can reallocate it and
-/// the baked region pointer stays valid (`.notes/call-frame-plan.md` C0a,
+/// the baked region pointer stays valid (`.notes/archive/perf/call-frame-plan.md` C0a,
 /// mechanism 1). 64K slots (512 KB) is far beyond any real body's operand
 /// depth and bounds the per-`Vm` reservation.
 const MAX_VALUE_STACK: usize = 1 << 16;
@@ -6589,7 +6589,7 @@ impl Vm {
     }
 
     /// Record a call site for the I5a probe
-    /// (`.notes/optimizing-tier-impl.md`). A no-op unless the probe is enabled;
+    /// (`.notes/archive/perf/optimizing-tier-impl.md`). A no-op unless the probe is enabled;
     /// `body` is the caller's compiled body (the record key is `(body, ip)`).
     fn record_call_site(&self, agent: &Agent, body: &CompiledBody, callee: &Value) {
         if !crate::feedback::enabled() {
@@ -24583,7 +24583,7 @@ pub fn is_compound_assign(op: &AssignOp) -> bool {
 ///
 /// The answer is the session flag: a point is one extra step dispatch per
 /// statement in the interpreter, and `--jitless` measured **+1.11%** for it
-/// corpus-wide (2.35 ns a dispatch; `.notes/perf.md`, 2026-11-01). The compiled
+/// corpus-wide (2.35 ns a dispatch; `.notes/archive/perf/perf.md`, 2026-11-01). The compiled
 /// tier pays nothing, so the product never saw it, but a normal run should not
 /// pay it either. `SLAG_DEBUG_POINTS` overrides the flag (`1` on, `0` off) for
 /// the same-binary A/B those numbers came from.

@@ -1,5 +1,5 @@
 //! Loop-invariant code motion over the SSA IR
-//! (`.notes/optimizing-tier-impl.md` §2, `pass/licm.rs`).
+//! (`.notes/archive/perf/optimizing-tier-impl.md` §2, `pass/licm.rs`).
 //!
 //! The fused-test slice gave lifted loops a real preheader, which is what LICM
 //! needs. For each natural loop (a back edge whose target dominates the source)

@@ -1,4 +1,4 @@
-//! The IR -> Cranelift lowering (`.notes/optimizing-tier-impl.md` §4).
+//! The IR -> Cranelift lowering (`.notes/archive/perf/optimizing-tier-impl.md` §4).
 //!
 //! Increment I1: an identity lowering of the lifted straight-line IR, reusing
 //! the helper table and the `JitCallContext` ABI unchanged, so a body lowered
@@ -616,7 +616,7 @@ fn lower_inst(
         // region, points the context and `vm.ip` at the resume step, and
         // returns `DISPATCH_DEOPT`; `run_jit_body` rebuilds `vm.stack` from the
         // region and the interpreter re-executes the step (see
-        // `.notes/tier-resume-fidelity.md`). The continuation is a separate
+        // `.notes/archive/perf/tier-resume-fidelity.md`). The continuation is a separate
         // block, so a guard may sit mid-block with the CFG intact.
         // The continuation is a separate block, so a guard may sit mid-block
         // with the CFG intact.
@@ -647,7 +647,7 @@ fn lower_inst(
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
         }
-        // A type guard (`.notes/tier-typer.md` T1): `args[0]`'s runtime value
+        // A type guard (`.notes/archive/perf/tier-typer.md` T1): `args[0]`'s runtime value
         // is asserted to have the result type, so a dominated op on it may
         // lower tag-free; the guarded value is the same bits re-typed, so the
         // success path emits no work. Only `Number` is checked for now — the
@@ -1789,7 +1789,7 @@ fn bits_to_int(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
     builder.ins().fcvt_to_sint_sat(types::I32, f)
 }
 
-/// The fused for-of fetch-and-bind (`.notes/optimizing-tier-impl.md` §6, the
+/// The fused for-of fetch-and-bind (`.notes/archive/perf/optimizing-tier-impl.md` §6, the
 /// certified for-of lift). Returns the code the branch terminator tests: 1 when
 /// an element was bound to `slot`, 0 when the iteration is done. Ports the
 /// per-step `emit_for_of_fast_bind` (G17): the fast-array cursor reads the
@@ -5155,7 +5155,7 @@ fn emit_leaf_result_tail(
     builder.ins().jump(merge, &[]);
 }
 
-/// The opt-tier call (`.notes/optimizing-tier-impl.md` §6 G): reproduce the
+/// The opt-tier call (`.notes/archive/perf/optimizing-tier-impl.md` §6 G): reproduce the
 /// per-step leaf-call lane — the record-reuse gate, the probe/restamp miss
 /// split, the in-frame/aliased/fill/env lanes and the certified lane — with
 /// `call_slow` as the universal fallback, so a lifted call-heavy body inlines

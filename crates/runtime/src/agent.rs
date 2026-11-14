@@ -2944,7 +2944,7 @@ impl Agent {
     /// One walk for every frame view (`Error.stack` and the host-facing
     /// `StackFrame` list) so that "what is on the stack" is answered in one
     /// place. The next source of frames is the interpreter's same-stack call
-    /// chain (`.notes/call-frame-plan.md` §8), and it has to be taught to each
+    /// chain (`.notes/archive/perf/call-frame-plan.md` §8), and it has to be taught to each
     /// of them identically.
     pub(crate) fn for_each_frame(&self, mut visit: impl FnMut(&ExecutionContext) -> bool) {
         self.roots.execution_context_stack.with(|stack| {

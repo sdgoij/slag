@@ -8,11 +8,11 @@ the interpreter and the JIT both address — the thing V8 and SpiderMonkey
 have had since their bytecode VMs.
 
 No code lands from this document until a stage is written up and probed;
-each stage owes the full gate (`.notes/perf.md`, "Working rules").
+each stage owes the full gate (`.notes/archive/perf/perf.md`, "Working rules").
 
 ## 0. The measurements this exists to move
 
-From `.notes/perf.md` (release, isolated probes):
+From `.notes/archive/perf/perf.md` (release, isolated probes):
 
 | shape | cost | where |
 |---|---|---|

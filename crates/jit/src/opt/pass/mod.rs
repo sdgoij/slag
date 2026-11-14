@@ -1,4 +1,4 @@
-//! The pass pipeline over the optimizing SSA IR (`.notes/optimizing-tier-impl.md`
+//! The pass pipeline over the optimizing SSA IR (`.notes/archive/perf/optimizing-tier-impl.md`
 //! §2, `pass/`).
 //!
 //! The pipeline is folding, numeric effect narrowing, read-guard pruning, trial
@@ -13,13 +13,13 @@
 //! (a cloned callee body may hold foldable arithmetic), so a body that inlines
 //! may benefit from a second round — a missed fold in the inlined region is a
 //! missed optimization, never a wrong program. Verified
-//! empirically (`.notes/pass-pipeline-fixpoint.md`): iterating the pipeline to a
+//! empirically (`.notes/archive/perf/pass-pipeline-fixpoint.md`): iterating the pipeline to a
 //! fixpoint performs no additional work on any sampled body, so the single round
 //! is kept. The caller re-verifies the graph after the pipeline, because a pass
 //! bug must be a refusal (the per-step path), never a wrong program.
 //!
 //! `mem2reg` runs on a callee's lifted IR inside the trial-inline resolver
-//! (I5c-2c-iii-b) — and, since `.notes/opt-per-op-overhead.md` §8, also on the
+//! (I5c-2c-iii-b) — and, since `.notes/archive/perf/opt-per-op-overhead.md` §8, also on the
 //! TOP-LEVEL body when its frame slots are unobservable and it holds no guard,
 //! promoting only non-heap slots (a frame slot is a GC root). `SLAG_MEM2REG=0`
 //! disables the top-level promotion.
@@ -172,7 +172,7 @@ fn edge_args(func: &Function, from: BlockId) -> Vec<(BlockId, Vec<ValueId>)> {
 }
 
 /// Promote the top-level body's frame slots to SSA when nothing can observe them
-/// (`.notes/opt-per-op-overhead.md` §8). A promoted slot must also never hold a
+/// (`.notes/archive/perf/opt-per-op-overhead.md` §8). A promoted slot must also never hold a
 /// heap value: a frame slot is a GC root, so promoting a heap value into an
 /// untraced register would unroot it.
 fn promote_frame_slots(func: &mut Function) -> bool {

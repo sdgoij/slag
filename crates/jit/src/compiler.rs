@@ -75,7 +75,7 @@ const TRY_FRAME_ENV_DEPTH_OFFSET: usize = std::mem::offset_of!(TryFrame, env_dep
 /// compilation contexts.
 pub struct JitEngine {
     isa: Arc<dyn TargetIsa>,
-    /// Whether the optimizing-tier IR lowering (`.notes/optimizing-tier-impl.md`)
+    /// Whether the optimizing-tier IR lowering (`.notes/archive/perf/optimizing-tier-impl.md`)
     /// is enabled (`SLAG_OPT`). Off by default; a body the lift refuses falls
     /// through to the per-step path either way.
     opt: bool,
@@ -667,7 +667,7 @@ struct Lowerer<'a> {
     frame_var: Variable,
     /// The working region's absolute base. `sp_var` stays an absolute top, but
     /// the persisted snapshots (`entry_sp_var`, `handler_sp_vars`, `error_sp`)
-    /// are offsets from this base (see `.notes/call-frame-plan.md` C0a-i).
+    /// are offsets from this base (see `.notes/archive/perf/call-frame-plan.md` C0a-i).
     base_var: Variable,
     sp_var: Variable,
     /// Cut 70: one variable per handler, holding the working-sp at the
@@ -1428,7 +1428,7 @@ impl<'a> Lowerer<'a> {
 
     /// Convert an absolute working-region pointer to an offset from the region
     /// base (C0a-i: the region model is base+offset so a region that moves can
-    /// be re-based with one add; see `.notes/call-frame-plan.md`).
+    /// be re-based with one add; see `.notes/archive/perf/call-frame-plan.md`).
     fn stack_offset(&mut self, ptr: ClifValue) -> ClifValue {
         let base = self.builder.use_var(self.base_var);
         self.builder.ins().isub(ptr, base)

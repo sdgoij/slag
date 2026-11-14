@@ -606,7 +606,7 @@ pub fn dump_helper_counts() {
     }
 }
 
-/// Print the I5a feedback call-site probe summary (`.notes/optimizing-tier-impl.md`)
+/// Print the I5a feedback call-site probe summary (`.notes/archive/perf/optimizing-tier-impl.md`)
 /// — the corpus runner's closing dump. A no-op unless `SLAG_FEEDBACK` is set.
 pub fn dump_feedback_summary() {
     runtime::feedback::dump_call_summary();
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn apply_call_step_lowers_and_runs_the_helper() {
-        // The compiled `Step::CallApply` (.notes/perf.md "remaining apply floor")
+        // The compiled `Step::CallApply` (.notes/archive/perf/perf.md "remaining apply floor")
         // lowers to the `call_apply` helper: `[f, apply/call, thisArg,
         // a1..aN]` on the work stack, the argument region passed by pointer.
         // The test double sums the argument region (the `thisArg` first), so
@@ -2723,7 +2723,7 @@ mod tests {
 
     #[test]
     fn opt_tier_flushes_a_promoted_slot_before_a_deopt() {
-        // Cut B (`.notes/opt-per-op-overhead.md` §8) keeps a numeric frame slot
+        // Cut B (`.notes/archive/perf/opt-per-op-overhead.md` §8) keeps a numeric frame slot
         // in a register even when the body holds guards. A guard that fails
         // resumes the interpreter at the next step, and every later step reads
         // the frame, so the promoted value must be materialized into its slot
@@ -2954,7 +2954,7 @@ mod tests {
 
     #[test]
     fn opt_guard_type_lowers_tag_free_and_deopts_on_a_mismatch() {
-        // T1 (`.notes/tier-typer.md`): `Op::GuardType` asserted on a hand-built
+        // T1 (`.notes/archive/perf/tier-typer.md`): `Op::GuardType` asserted on a hand-built
         // IR body. Two contracts are proven end to end:
         //  (a) the fast path is tag-free — arithmetic on the guarded
         //      (Number-typed) value lowers to the bare f64 op, which needs no
@@ -3073,7 +3073,7 @@ mod tests {
 
     #[test]
     fn opt_guard_callee_holds_or_deopts() {
-        // I5c-2b (`.notes/optimizing-tier-impl.md`): `Op::GuardCallee` asserted
+        // I5c-2b (`.notes/archive/perf/optimizing-tier-impl.md`): `Op::GuardCallee` asserted
         // on a hand-built IR body. On a match the guard yields the callee
         // unchanged (the box identity a splice assumes); on a mismatch the body
         // retires (`DISPATCH_DEOPT`) so a splice compiled for one callee never
@@ -10304,7 +10304,7 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     /// path (`opt_lower::emit_gc_probe`). A body that LIFTS allocates in machine
     /// code, and before the probe was added its allocations never reached the
     /// collector: the `coercion_concat`-shaped loop allocated 1,503,182 young
-    /// boxes with no collection, then paid a 46ms one (`.notes/corpus-regression.md`).
+    /// boxes with no collection, then paid a 46ms one (`.notes/archive/perf/corpus-regression.md`).
     /// `f` is a function body because that is the shape that lifts (the string
     /// literal widening admits it); the cohort bound is the same probe-interval
     /// evidence the per-step test uses.

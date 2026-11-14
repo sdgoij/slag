@@ -41,7 +41,7 @@ behaviours beyond this note's scope are pinned by new tests:
 
 Both fail if the bump is removed (verified by stubbing it out). Full detail,
 including the audit of every mutation path into the global record, is in
-`.notes/perf.md` (2026-09-16).
+`.notes/archive/perf/perf.md` (2026-09-16).
 
 ## The finding
 

@@ -140,7 +140,7 @@ script itself times at 3.5 ms.
 - **The inliner.** Measured: corpus 2436 vs 2444 ms (wash). It needs post-inline
   specialization to pay, which is a compiler project.
 - **ns-level slices** on rows not in the tables above.
-- **PGO / function alignment.** Already measured and rejected in `.notes/perf.md`.
+- **PGO / function alignment.** Already measured and rejected in `.notes/archive/perf/perf.md`.
 
 ## Measurement protocol for every item
 

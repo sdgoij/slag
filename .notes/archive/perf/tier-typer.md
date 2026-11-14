@@ -12,7 +12,7 @@ block — ~11-13 instructions plus a branch. That is at per-step parity, but it 
 **register-tight**, and the pressure is load-bearing for everything downstream:
 
 - The LICM read hoist cost **~1.8x** because the hoisted value could not stay live
-  across the loop (`.notes/tier-guarded-read.md` G2b). A tag-free loop has the
+  across the loop (`.notes/archive/perf/tier-guarded-read.md` G2b). A tag-free loop has the
   headroom for it.
 - A member/element/call result is `Unknown`, so *every* op on it re-checks. These
   are the `read`/`obj_prop`/`prim_prop` rows.
@@ -23,7 +23,7 @@ hoists and the register allocator pay off.
 ## The one piece of machinery it needs is already landed
 
 A type specialization is **speculate → guard → deopt**, and the guard half is
-landed: `Op::Check` + `DISPATCH_DEOPT` resume (`.notes/tier-resume-fidelity.md`).
+landed: `Op::Check` + `DISPATCH_DEOPT` resume (`.notes/archive/perf/tier-resume-fidelity.md`).
 So a type guard is a `Check` on a type predicate, and a wrong guess *exits* rather
 than miscomputes. That precedent is the whole reason this is now tractable — the
 plan notes it as the machinery V8/SM/JSC can't share, and Slag already has it.
@@ -52,7 +52,7 @@ safe to exit on*. Lowering (`opt_lower`):
 - downstream ops with all-`Number` operands lower to the existing bare path
   (`emit_bare_numeric`), i.e. one f64 op and no tag checks.
 
-The feedback records (`.notes/optimizing-tier-impl.md` §5, the `I3` substrate)
+The feedback records (`.notes/archive/perf/optimizing-tier-impl.md` §5, the `I3` substrate)
 say *what* type a site sees; the typer turns that into a guard. Where the type is
 statically provable (`narrow`), no guard is needed at all.
 

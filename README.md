@@ -50,7 +50,8 @@ embedding API, and drop-in JavaScriptCore C-API bindings.
   fast loops. Compiled with the `jit` feature (on by default in the CLI;
   the embed crate opts in with `--features slag/jit`) and active for every
   run unless `--jitless` disables it; `--jit-bench` times JIT vs
-  interpreter. Design, status, and remaining work: `.notes/jit-report.md`.
+  interpreter. Design and status: `.notes/archive/perf/jit-report.md`; the
+  plan of record: `.notes/register-tier-plan.md`.
 - **Portable** — no third-party runtime dependencies beyond the Rust
   standard library (see `PLAN.md` §4.10), with opt-in exceptions: the
   experimental JIT (`crates/jit`) pulls in Cranelift and `region` when the
@@ -410,7 +411,8 @@ pins `codegen-units = 1` + `lto = "thin"`, because at cargo's default 16 codegen
 units the same source built two ways is laid out differently and differs by up
 to ~13% on the interpreter's own paths — a spread larger than any source change
 these tables record. The standing detail, the benchmark gates, and the deferred
-work live in `.notes/perf.md`.
+work live in `.notes/perf.md`; the record before it — the dated journal and the
+per-arc notes — is archived at `.notes/archive/perf/`.
 
 ### The JIT against the interpreter
 
@@ -441,7 +443,7 @@ that contains a call is not a leaf, and a crux-native builtin is not a JS leaf �
 so both engines run the general call path there and the ratio is set by that
 machinery, not by code generation. `typed-array read` is the one row this suite
 gained over `v0.1.0-preview.2`; the rest of the set is unchanged.
-`.notes/perf.md` has the per-shape probe and what each row moved.
+`.notes/archive/perf/perf.md` has the per-shape probe and what each row moved.
 
 Most of the suite lifts into the optimizing tier now — 13 of the 16 bodies on
 this build; the three that keep the per-step body are blocked on `CallApply` or
@@ -450,7 +452,7 @@ registers: `bare loop` is 0.590 ms against the per-step lane's 0.70 ms. In
 `arithmetic` the counter is an int32 (the loop-counter pass proved it) and its
 float uses convert, which was measured ~18% behind a per-step loop-carried f64
 counter (whose back edge is a 4-cycle `vaddsd`) when the tier became the
-default; `.notes/perf.md` has the measurement.
+default; `.notes/archive/perf/perf.md` has the measurement.
 
 One row needs a caveat: `wide leaf call`'s interpreter column is the suite's
 noisiest (±20% run to run), and it is the single row the pinned release profile
@@ -517,13 +519,13 @@ reads — 50x). A declarative cell is load-only, and both stay valid because the
 global environment bumps the global object's generation on every declarative
 mutation, and because an in-place member write to a global refreshes the cell
 (the in-place store deliberately does not bump). See
-`.notes/frame-cost-profile.md` §4b.
+`.notes/archive/perf/frame-cost-profile.md` §4b.
 
 The `builtins` family is the noisiest row here and its ratio is now set by the
 two async workloads: `promise_churn` and `async_churn` queue 2000
 promises/awaits per `bench()` and the runner never drains the job queue between
 timed calls, so what they time is the pending-await state table — whose cost is
-quadratic in the queue depth (`.notes/perf.md`) — against a sub-millisecond V8
+quadratic in the queue depth (`.notes/archive/perf/perf.md`) — against a sub-millisecond V8
 baseline. `async_churn` alone reads 69-132x across the three runs, which is why
 that family's mean lands anywhere between 18.1 and 27.0.
 
@@ -539,8 +541,9 @@ a closure costs ~340 ns to create, where node eliminates the non-escaping one
 outright (0.6 ns/iteration). Register work does not reach that: the
 materialization census and the per-iteration lifts measured at parity
 (1.00-1.02x against `SLAG_OPT=0`), so the phase plan starts at function-object
-creation — inlining plus escape analysis — and returns to the typed value only
-after it. `.notes/register-tier-plan.md` has the ablation behind each number.
+creation itself — the allocation, not another lift, with inlining and escape
+analysis behind it. `.notes/register-tier-plan.md` has the ordering and the
+ablation behind each number.
 
 ### Against the previous release (`v0.1.0-preview.2`)
 
@@ -670,10 +673,9 @@ time (`crates/runtime/src/builtins/array.rs` is the model) and need nothing.
 - `.notes/gc-plan.md` — the GC milestone plan (arena heap + mark-sweep, cut-by-cut)
 - `.notes/barrier-uaf.md` — open: a write-barrier miss / suspected use-after-free in the promise/arguments path under `--gc-stress`
 - `.notes/intl-plan.md` — the ECMA-402 (Intl) implementation plan and cut status
-- `.notes/jit-report.md` — the experimental Cranelift JIT: design, fast paths, hardening, validation, and remaining work
-- `.notes/memory-model.md` — ECMAScript ch. 28 shared-memory model
-- `.notes/wasm-plan.md` — the WebAssembly engine plan: cuts, decisions, conformance status
-- `.notes/perf.md` — performance milestones and deferred work
+- `.notes/perf.md` — performance: the current numbers, the gates, and the measuring protocol
+- `.notes/register-tier-plan.md` — the plan of record for closing the gap to V8 (function-object creation, then inlining and the typed value)
+- `.notes/archive/perf/` — the closed performance history (its `README.md` indexes the log and the per-arc notes)
 
 ## License
 

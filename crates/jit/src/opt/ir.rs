@@ -2,7 +2,7 @@
 //!
 //! The IR is deliberately Cranelift-free: the lowering lives in
 //! `crate::opt_lower`, and the lift out of the interpreter's `Step` stream
-//! builds on top of this. See `.notes/optimizing-tier-impl.md` §2–§4.
+//! builds on top of this. See `.notes/archive/perf/optimizing-tier-impl.md` §2–§4.
 
 /// A value: a block parameter or an instruction result.
 pub type ValueId = u32;

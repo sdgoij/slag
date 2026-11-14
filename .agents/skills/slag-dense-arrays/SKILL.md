@@ -135,7 +135,7 @@ loads:
 - loop + `l === 10000` test + counter: ~1.0 ns (`l++` itself is free)
 
 The **realm-level elements protector** (V8's `no_elements_protector`) landed
-as Stage 1 of `.notes/dense-store-redesign.md`: a per-realm epoch
+as Stage 1 of `.notes/archive/perf/dense-store-redesign.md`: a per-realm epoch
 (`crux::PROTOTYPE_EPOCH` — process-global, so it over-invalidates across
 agents, which is sound) plus a prototype *registry* (`is_prototype` on
 `JsObject`). `mark_prototype` registers a link from `canonical_empty_map`

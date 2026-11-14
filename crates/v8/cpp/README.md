@@ -81,7 +81,7 @@ are what the engine guarantees today (`.notes/chromium-facade.md` §14.4).
 debug point per statement and per loop back edge only while one is, and
 recompiles its bytecode on both transitions, so a normal run carries none. The
 measured price is 0 on the compiled tier and +1.11% interpreted when attached
-(`.notes/perf.md`).
+(`.notes/archive/perf/perf.md`).
 - **A stop is an outcome, never an error.** `finally` blocks and `catch`
 handlers do not run, which is why `Script::Run` answers empty with nothing
 pending rather than throwing.

@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn apply_call_compiled_step_preserves_shadowing_and_order() {
         // The compiler recognizes `f.apply(x, arr)` / `f.call(x, ...)`
-        // member calls (.notes/perf.md "remaining apply floor") and emits the
+        // member calls (.notes/archive/perf/perf.md "remaining apply floor") and emits the
         // `CallApply` step: the member read still resolves a shadowed
         // `apply`/`call`, and the intrinsic's is-callable check still runs
         // before any argument-list user code.

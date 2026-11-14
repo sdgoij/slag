@@ -1,7 +1,7 @@
 //! Prune the typer's read guards that pay nothing.
 //!
 //! The lift emits `Op::GuardType` on a member/element read's result for every
-//! read (`.notes/tier-typer.md` T2). A guard only pays where a *type-sensitive*
+//! read (`.notes/archive/perf/tier-typer.md` T2). A guard only pays where a *type-sensitive*
 //! op consumes the value — the ops whose lowering reads the operand type to pick
 //! the cheaper path (`emit_bare_numeric`, or the known-operand tag-check skip).
 //! Everywhere else (the read flows to a call argument, a `return`, a member

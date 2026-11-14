@@ -64,7 +64,7 @@ between `b3fd0d9e` and HEAD):
 1. **Lift coverage moved bodies into the opt tier, which is slower on some
    shapes.** `opcost/baseline` was per-step at `b3fd0d9e` (0.26 ms) and is opt
    at HEAD (1.36 ms) — the opt tier's known ~5x loss on the `i & MASK`/`| 0`
-   loop (`.notes/opt-per-op-overhead.md` §1), now applied because the body lifts.
+   loop (`.notes/archive/perf/opt-per-op-overhead.md` §1), now applied because the body lifts.
 2. **The opt tier has a severe cross-workload pathology the per-step tier does
    not.** `search_slice` is *faster* in the opt tier isolated (22 ms vs the
    per-step ~60 ms) but 29x slower in a long-lived process (1739 ms) — §3-4.
@@ -196,7 +196,7 @@ loop runs minors and its cohort stays bounded).
 
 Component 1 (§2b) is untouched: the opt tier is still slower than the per-step
 register lane on shapes like `opcost/baseline` (1.36 ms vs 0.26 ms), which now
-lifts into it — that is the read-parity work in `.notes/opt-per-op-overhead.md`,
+lifts into it — that is the read-parity work in `.notes/archive/perf/opt-per-op-overhead.md`,
 not this regression.
 
 ## 7. Component 1: the opt tier vs the per-step register lane (measured)
@@ -234,5 +234,5 @@ patterns, so every int op converts f64<->i32 and re-guards.
 **Direction:** keep an `Int`-typed value as i32 through the lowering (a
 per-type representation) so a chain of int ops stays in i32 — no `fcvt`, no
 `sextend`, no guard-visible f64 round trip. That is the `Int`-lattice work's
-natural continuation (`.notes/opt-per-op-overhead.md` §6); the lift-decision
+natural continuation (`.notes/archive/perf/opt-per-op-overhead.md` §6); the lift-decision
 refusal is ruled out by the table above.

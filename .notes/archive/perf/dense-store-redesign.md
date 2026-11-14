@@ -8,9 +8,9 @@ clean; `scratch/stage1_proto.js` (9 warmed invalidation fixtures) and
 jit / `--jitless` / `--gc-stress` and vs node; the language / built-ins /
 annexB sweeps match the `scratch/sl|sa|sb.json` baseline exactly (0 fail /
 0 crash). Stages 2-4 remain PLAN. Supersedes the
-"residual / O1 / O2 / O3" scoping in `.notes/perf.md` (the `buildString
+"residual / O1 / O2 / O3" scoping in `.notes/archive/perf/perf.md` (the `buildString
 shape` follow-up section). Supersedes nothing in
-`.notes/array-store-plan.md`, which is the (resolved) Phase C record.
+`.notes/archive/perf/array-store-plan.md`, which is the (resolved) Phase C record.
 
 ## Goal, non-goal, and the honest target
 
@@ -188,5 +188,5 @@ trip), an `f64`-free length field, and elements kinds with a dictionary
 fallback — i.e. adopting V8's object model for arrays. That is a
 Value-representation change touching every consumer, not an array-store
 change. Do not start it for one `--jit-bench` row. Scoped as its own project
-in `.notes/v8-shaped-arrays.md` (WS1-WS5, migration surface, increment order,
+in `.notes/archive/perf/v8-shaped-arrays.md` (WS1-WS5, migration surface, increment order,
 risks).

@@ -6,7 +6,7 @@ SpiderMonkey is the primary source. The organizing principle is that Slag does *
 
 ## 1. Why this exists
 
-The inline-coverage arc (`.notes/jit-quality-plan.md`) did what it set out to do: the helper-share census named the hot surfaces (G1–G21) and each landed slice moved its row. But four of those slices moved individual corpus rows 17–46% and **moved nothing else** (`jit-quality-plan.md` §6), because the design they work inside is unchanged: compiled dispatch with inline fast paths, no type feedback, and no speculation. Every non-trivial `Step` either inlines a narrow case or calls one of the helpers.
+The inline-coverage arc (`.notes/archive/perf/jit-quality-plan.md`) did what it set out to do: the helper-share census named the hot surfaces (G1–G21) and each landed slice moved its row. But four of those slices moved individual corpus rows 17–46% and **moved nothing else** (`jit-quality-plan.md` §6), because the design they work inside is unchanged: compiled dispatch with inline fast paths, no type feedback, and no speculation. Every non-trivial `Step` either inlines a narrow case or calls one of the helpers.
 
 The 2026-10-03 re-baseline against the SpiderMonkey js shell (`tools/corpus/sm-ab.sh`, 36 `opcost` rows, all parity `ok`) says the deficit is not "our machinery is slow." SM is ahead on **every** row, from `js_call` 3.6x to `object_keys` 234x, and the pattern is uniform: SM inlines the builtin and elides the allocation; we emit a generic call and allocate.
 

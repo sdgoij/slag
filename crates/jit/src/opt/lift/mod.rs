@@ -61,14 +61,14 @@ pub enum Unsupported {
 /// A diagnostic guard depth (tests only). When non-zero, [`lift`] emits a
 /// constant-false `Op::Check` at the first step whose incoming operand stack has
 /// this depth, so the body deopts there and the interpreter resumes. It
-/// exercises the tier's resume fidelity (`.notes/tier-resume-fidelity.md`);
+/// exercises the tier's resume fidelity (`.notes/archive/perf/tier-resume-fidelity.md`);
 /// zero (the default) is off and a normal run never sets it. It is ignored for a
 /// leaf-eligible body: the leaf lane has no `DISPATCH_DEOPT` handling.
 pub(crate) static OPT_PROBE_DEPTH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the typer guards a member read's result in place (the T2 in-loop
-/// placement, `.notes/tier-typer.md`). On by default like `SLAG_OPT`;
+/// placement, `.notes/archive/perf/tier-typer.md`). On by default like `SLAG_OPT`;
 /// `SLAG_TYPER=0` disables it. `1`/`2` force it on/off (tests).
 pub(crate) static OPT_TYPER: AtomicU8 = AtomicU8::new(0);
 
@@ -938,7 +938,7 @@ fn emit_opt_probe(builder: &mut Builder<'_>, block: BlockId, stack: &[ValueId], 
 }
 
 /// The typer's in-loop type guard on a just-produced read value
-/// (`.notes/tier-typer.md` T2): assert the value is a Number so the arithmetic
+/// (`.notes/archive/perf/tier-typer.md` T2): assert the value is a Number so the arithmetic
 /// that consumes it lowers tag-free. The resume step is `index + 1` — the *next*
 /// step, since the read has already run once and the interpreter must not re-run
 /// it (a getter would fire twice); the mirrored stack is the post-read stack,

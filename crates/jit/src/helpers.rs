@@ -725,7 +725,7 @@ pub struct JitHelpers {
     /// `TemplateLiteral` payload. Runs the tag and returns the result.
     pub tagged_template:
         Option<extern "C" fn(vm: *mut c_void, tag: u64, this: u64, step: u64) -> u64>,
-    /// The compiled `Step::CallApply` (.notes/perf.md "remaining apply floor"):
+    /// The compiled `Step::CallApply` (.notes/archive/perf/perf.md "remaining apply floor"):
     /// `args` points at the JIT buffer's argument region (`argc` slots, the
     /// `thisArg` first); `kind` is 0 for `apply`, 1 for `call`. Runs the
     /// interpreter's `do_call_apply` — the intrinsic check, the direct call

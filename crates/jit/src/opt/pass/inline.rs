@@ -1,4 +1,4 @@
-//! Trial inlining over the SSA IR (`.notes/optimizing-tier-impl.md` I5c-2c).
+//! Trial inlining over the SSA IR (`.notes/archive/perf/optimizing-tier-impl.md` I5c-2c).
 //!
 //! At a monomorphic call site, replace the call with the callee's IR — the same
 //! exact `lift`, cloned into the caller. This cut handles only a call that is its

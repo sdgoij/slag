@@ -1,4 +1,4 @@
-//! Promote a body's storable frame slots to SSA (`.notes/optimizing-tier-impl.md`
+//! Promote a body's storable frame slots to SSA (`.notes/archive/perf/optimizing-tier-impl.md`
 //! I5c-2c-iii-b).
 //!
 //! A callee lifted for a trial splice still reads and writes its own frame slots
@@ -29,7 +29,7 @@ pub fn run(func: &mut Function) -> bool {
     promote(func, None)
 }
 
-/// Promote only the slots `allow` names (`.notes/opt-per-op-overhead.md` §8).
+/// Promote only the slots `allow` names (`.notes/archive/perf/opt-per-op-overhead.md` §8).
 /// The top-level pipeline uses it to promote a sealed body's slots, restricted
 /// to those that never hold a heap value: a frame slot is a GC root, so
 /// promoting a heap value into an untraced register would unroot it.
@@ -160,7 +160,7 @@ fn promote_slot(
 
 /// Materialize the slot's promoted value into its frame slot before every
 /// guard, because a guard that fails resumes the interpreter, and the
-/// interpreter reads the frame (`.notes/opt-per-op-overhead.md` §8, Cut B).
+/// interpreter reads the frame (`.notes/archive/perf/opt-per-op-overhead.md` §8, Cut B).
 /// Without this a promoted slot is invisible to the resumed code.
 ///
 /// `flushes` holds `(block, instruction index, value)` positions as they were

@@ -1,7 +1,7 @@
 # JIT execution quality: the inline-coverage plan
 
 The plan of record for making a compiled body fast, as opposed to compilable.
-`.notes/non-leaf-jit.md` is the coverage plan and reached its own definition of
+`.notes/archive/perf/non-leaf-jit.md` is the coverage plan and reached its own definition of
 done (0 emitter refusals) — this plan exists because coverage turned out not to
 be the thing, and because the architecture below was read out of the code
 rather than inferred from timings.
@@ -24,7 +24,7 @@ edited away — it is the reason Stage 0 is now a code read.
 The JIT's coverage work finished with the picture unchanged: 497 bodies
 compiled in a forced `deno test` check and the JIT **14% net-negative** there,
 while a plain leaf loop is 2.4× faster compiled
-(`.notes/non-leaf-jit.md` §1/§6). Four "optimization" slices since then moved
+(`.notes/archive/perf/non-leaf-jit.md` §1/§6). Four "optimization" slices since then moved
 individual corpus rows 17-46% and moved nothing else. The questions this plan
 has to answer are therefore **architectural**, and the way to answer them is to
 read what the compiler actually emits.
@@ -458,7 +458,7 @@ The list, in the measured order:
   re-opened as an inline path.
 - **G5 — string building: mostly landed before this arc, plus the template
   append (landed, Stage 6).** The big G5 win was already in the tree (2026-09-07,
-  `.notes/perf.md`): `crux::number::to_string` writes an exactly-representable
+  `.notes/archive/perf/perf.md`): `crux::number::to_string` writes an exactly-representable
   integer's decimal directly (no ryu + digit-vector rebuild) and `Add` with one
   string operand and a Number/Boolean/Null/Undefined fuses to a two-string
   concat in `apply_binary` and the register executor — `coercion_concat` went
@@ -495,7 +495,7 @@ The list, in the measured order:
     behind it the plan's bar is not met.
   - **`ForInNext` is 9.1M over one row, but the compiled step is within ~3.5%
     of the interpreter.** The for-in `fast` verdict and the generation-skip
-    per-key check already landed (2026-09-06, `.notes/perf.md`), as did the
+    per-key check already landed (2026-09-06, `.notes/archive/perf/perf.md`), as did the
     `ForInBegin` enumeration cache, so `control/for_in.js` is 34.9 ms jit /
     49.7 ms jitless and the protocol is *not* the row's cost. Isolating it
     (150k re-entries of a 5-key loop): a for-in with no computed read is
@@ -677,7 +677,7 @@ The list, in the measured order:
 - **Stage 5 — G10, G11, G1, member writes.** **G1's read side is done** (§3
   G1). The others are **closed by measurement, not landed**: G10's shape-free
   inline chain probe was already measured and reverted (2026-09-01, 5-10%
-  slower than the helper — `.notes/perf.md`), and warm chain reads are
+  slower than the helper — `.notes/archive/perf/perf.md`), and warm chain reads are
   fixed-cost rather than walk-cost, so the fix is the L1c shape end-state, not
   an inline path; G11's `switch` is already 3.1x faster under the JIT than
   jitless (`switch_dispatch` 68 vs 213 ms) with the helper chain at ~6 calls
@@ -975,14 +975,14 @@ GC-root discipline, the compile-size budget).
 ## 6. Out of scope, and the traps
 
 - **Not a TurboFan rewrite — superseded 2026-10-02 by
-  `.notes/optimizing-tier-plan.md`.** This plan works inside the per-`Step`
+  `.notes/archive/perf/optimizing-tier-plan.md`.** This plan works inside the per-`Step`
   lowering and the helper ABI: inline fast paths with guards, wider use of the
   register path, and a feedback record. That subset is landed or measured, and
   the 2026-10-02 baseline shows the rows still at the top need transforms this
   plan cannot reach — inlining, escape analysis, LICM — which needs a JS-level
   SSA IR. That is the subject of the successor plan; read this one for the
   census (§3) and the traps, that one for the direction.
-- **Not more coverage.** `.notes/non-leaf-jit.md` is done; do not reopen it
+- **Not more coverage.** `.notes/archive/perf/non-leaf-jit.md` is done; do not reopen it
   without a census that says a new shape refuses.
 - **Not row-only slices.** Four slices moved rows 17-46% and moved nothing
   else; a stage is judged by the instrument and by real-world wall time.
@@ -1452,7 +1452,7 @@ One line per landed stage, newest last. This log is the arc's journal —
   `ForInNext` is 9.1M over `control/for_in.js`, and the decomposition shows the
   compiled step is already within ~3.5% of the interpreter: the `fast` verdict,
   the generation-skip per-key check and the `ForInBegin` enumeration cache all
-  landed 2026-09-06 (`.notes/perf.md`), so the row is 34.9 ms jit / 49.7 ms
+  landed 2026-09-06 (`.notes/archive/perf/perf.md`), so the row is 34.9 ms jit / 49.7 ms
   jitless. Isolated (150k re-entries of a 5-key loop, min-of-reps) a for-in
   with no computed read is **8.53 ms jit** against an equivalent plain
   `for (i = 0; i < 5; i++) n += 1` loop at **1.82 ms** — the whole protocol is

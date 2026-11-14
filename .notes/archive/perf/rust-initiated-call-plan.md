@@ -1,7 +1,7 @@
 # Rust-initiated calls: closing the 15x gap to a compiled call site
 
 **Status: PLAN.** Measured 2026-10-21. Nothing here is implemented. The numbers
-live in `.notes/perf.md` ("own accessors skip the chain walk…").
+live in `.notes/archive/perf/perf.md` ("own accessors skip the chain walk…").
 
 ## 1. The shape of the gap
 

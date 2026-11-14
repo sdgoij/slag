@@ -1,4 +1,4 @@
-//! Dead-code elimination over the SSA IR (`.notes/optimizing-tier-impl.md` §2,
+//! Dead-code elimination over the SSA IR (`.notes/archive/perf/optimizing-tier-impl.md` §2,
 //! `pass/dce.rs`).
 //!
 //! An instruction is dead when its result is used by nothing and it is safe to

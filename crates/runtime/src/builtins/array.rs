@@ -1574,7 +1574,7 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     };
     // Assemble in UTF-16. Each element appends its units directly, so nothing
     // is encoded to UTF-8 and decoded back per element — the same defect the
-    // JSON stringifier carried (see `.notes/perf.md`'s string records).
+    // JSON stringifier carried (see `.notes/archive/perf/perf.md`'s string records).
     let mut result: Vec<u16> = Vec::new();
     for k in 0..length {
         if k > 0 {

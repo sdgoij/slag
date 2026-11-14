@@ -299,7 +299,7 @@ value cell does not cover.**
 > name use the cell from any body (the proof the scope analysis already has), and
 > giving the declarative record a cell of its own, are both local changes, and
 > neither needs a scene to change. The declarative half is analysed in its own
-> note — `.notes/global-read-cells.md` — and **landed on 2026-09-16**: the cell
+> note — `.notes/archive/perf/global-read-cells.md` — and **landed on 2026-09-16**: the cell
 > is warmed for a declarative binding too (load-only, validated by a generation
 > the global environment bumps on every declarative mutation), which takes the
 > corpus row from 52.5 ms to 2.5 ms and closes the 21x gap. The nested-body half
@@ -308,7 +308,7 @@ value cell does not cover.**
 > read costs what a top-level one does (130 ms → 2.5 ms per 1M reads). That
 > change also exposed and fixed a store-side gap — an in-place member write to a
 > global object does not bump the generation the read cell validates, so the
-> write now refreshes the cell directly. `.notes/perf.md`'s 2026-09-16 entries
+> write now refreshes the cell directly. `.notes/archive/perf/perf.md`'s 2026-09-16 entries
 > have both, including the hazard that forced the per-name verdict.
 >
 > Re-measure before sizing the win: the rows above are from a pin that is not
@@ -366,7 +366,7 @@ newly-called body as provisional until it is repeated.)
 >
 > The engine's cache policy changed, not the scene's calling pattern: the cache
 > holds 1024 bodies (evicting to 512) and an evicted body re-earns the 16-consult
-> compile threshold. `.notes/perf.md` (2026-09-16) has the numbers and the
+> compile threshold. `.notes/archive/perf/perf.md` (2026-09-16) has the numbers and the
 > verification; a client should confirm the scene-level win with `rl.getTime()`,
 > which the engine cannot do for itself (no sub-millisecond timer).
 
@@ -602,7 +602,7 @@ compiles today. Two local gaps, both measured — one closed, one open:
   — so the corpus `globals` row goes **52.5 ms → 2.5 ms** and the family gap
   30.9x → 2.8x. No scene change needed (our `TUNING` is a mod-wrapper
   `const`, i.e. already a context slot), but every top-level binding in a
-  bundled script now reads like a local. `.notes/perf.md` (2026-09-16).
+  bundled script now reads like a local. `.notes/archive/perf/perf.md` (2026-09-16).
 - **Landed (2026-09-16): the `clean_chain` gate**, which skipped
   `LoadIdent`'s cell probe for any body whose env is not the bare global
   record — i.e. every helper nested inside a mod wrapper, where §4b measured
@@ -611,7 +611,7 @@ compiles today. Two local gaps, both measured — one closed, one open:
   corpus for both shapes. This is the half the scene paid on `rl.*`/`Math`
   reads inside mod functions. One caveat to expect: the relaxation also had to
   fix a store-side gap it exposed (an in-place member write to a global
-  left the read cell stale) — see `.notes/perf.md` (2026-09-16).
+  left the read cell stale) — see `.notes/archive/perf/perf.md` (2026-09-16).
 2. **The calling-pattern dependence (§4b) — resolved (2026-09-16): it was the
 JIT cache.** A ~9 µs/call burst body costing ~226 µs/call once per frame was
 the cache recompiling what it had just evicted: the app's body set exceeds
@@ -620,7 +620,7 @@ body reached once per frame paid a ~0.4 ms compile per frame. Landed: the cap
 is 1024 (evicting to 512) and an evicted body re-earns the compile threshold,
 which cuts the recompile rate by the threshold factor under pressure. The
 scene-level win wants a client-side `rl.getTime()` re-measure — the engine has
-no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
+no sub-millisecond timer — see `.notes/archive/perf/perf.md` (2026-09-16).
 3. **The per-crossing cost — measured (2026-09-16): it is not a frame lever.**
    A host call costs **~35 ns** (jit) / 53 ns (jitless) against ~6 ns for a JS
    leaf call, and an `rl` CONSTANT read costs 4.2 ns with no crossing at all
@@ -637,7 +637,7 @@ no sub-millisecond timer — see `.notes/perf.md` (2026-09-16).
    the probe body being interpreted (the nested-body global reads, now closed)
    plus this 35 ns. Attack the call COUNT (item 5) or the work per call (item
    4), not the crossing. Measurements and the reproducible probe are in
-   `.notes/perf.md` ("Premises falsified by probe").
+   `.notes/archive/perf/perf.md` ("Premises falsified by probe").
 4. **GPU skinning — the blocker was a raylib build switch, not the `rl` surface
    (landed 2026-09-16).** The draw-side plumbing was already there and was not
    the problem: `LoadShaderFromMemory` maps a shader's `boneMatrices` uniform and

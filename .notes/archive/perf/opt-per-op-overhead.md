@@ -99,7 +99,7 @@ So it is **not** a prototype-read IC: both tiers resolve `.sum` identically
 the opt tier's probe fires on every call and always misses to `CallSlow`,
 while the per-step tier's probe is cached (867 verdicts → 3.5M `LeafCallFill`).
 That is the "the inline leaf-call path is reached and never fires" finding in
-`.notes/jit-quality-plan.md` §3 (G2), which the G port was meant to close but
+`.notes/archive/perf/jit-quality-plan.md` §3 (G2), which the G port was meant to close but
 which still bites a `this`-taking prototype method. The opt also makes **2x the
 `GetMemberName` calls** (7M vs 3.5M) — the `CallSlow` path re-resolving, or a
 duplicate read; to pin.

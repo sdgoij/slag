@@ -1,7 +1,7 @@
 # V8-shaped arrays: Smi integers + elements kinds
 
 **Status: SCOPE (not started).** This is the large-risky-change option, scoped
-as a project of its own. It is the successor to `.notes/dense-store-redesign.md`
+as a project of its own. It is the successor to `.notes/archive/perf/dense-store-redesign.md`
 (Stage 1 — the prototype-elements protector — landed; Stages 2-4 were shelved).
 It is *not* a shortcut for the `buildString shape` row, and it does not inherit
 that row's validation-only risk profile: it changes the representation of every

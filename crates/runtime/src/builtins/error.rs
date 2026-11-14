@@ -1026,7 +1026,7 @@ mod tests {
     /// The other half of that contract is the exact frame list a same-stack
     /// recursion produces, pinned here because the lane's per-call
     /// `ExecutionContext` is what puts those frames on the stack today, and
-    /// `.notes/call-frame-plan.md` §8 proposes deriving them from the Vm's
+    /// `.notes/archive/perf/call-frame-plan.md` §8 proposes deriving them from the Vm's
     /// frame chain instead. A change to that source must reproduce this string
     /// byte for byte.
     #[test]

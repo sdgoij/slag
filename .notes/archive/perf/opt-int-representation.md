@@ -1,7 +1,7 @@
 # The optimizing tier's int representation: `Int` as i32
 
 **Status: proposed 2026-10-10 (plan, probe-first).** Follows
-`.notes/corpus-regression.md` §7 and `.notes/opt-per-op-overhead.md` §6.
+`.notes/archive/perf/corpus-regression.md` §7 and `.notes/archive/perf/opt-per-op-overhead.md` §6.
 
 ## 1. Why
 
@@ -9,7 +9,7 @@ The optimizing tier carries `Int`-typed values as f64 bit patterns (the 64-bit
 `Value` encoding), so every int op converts f64<->i32 and re-guards. The per-step
 register lane carries the accumulator as an **i32 register** and folds a whole
 `k = i & MASK; s = (s + k) | 0` loop into ~3 i32 instructions. Measured
-(`.notes/corpus-regression.md` §7): `opcost/baseline` opt 1.354 ms vs per-step
+(`.notes/archive/perf/corpus-regression.md` §7): `opcost/baseline` opt 1.354 ms vs per-step
 0.264, `object_alloc` 1.372 vs 0.272, `compound_assign` 55.6 vs 43.9 — while the
 opt tier *wins* on element bodies (`element_write` 0.699 vs 1.134). Refusing the
 lift is a wash; the fix is the representation.

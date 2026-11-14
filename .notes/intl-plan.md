@@ -266,4 +266,4 @@ months), sub-minute offset matching, and a few edge singles.
   forces it (bounded: `icu_collator` only).
 - No Temporal work beyond the intl402 integration points (Temporal
   itself is implemented and its skips are closed).
-- No Intl performance gates in `.notes/perf.md`.
+- No Intl performance gates in `.notes/archive/perf/perf.md`.

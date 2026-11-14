@@ -4,7 +4,7 @@
 //!
 //! The module is deliberately Cranelift-free: the lowering lives in
 //! `crate::opt_lower`, so the IR and its passes can be tested without a
-//! backend. See `.notes/optimizing-tier-impl.md` for the layering and the
+//! backend. See `.notes/archive/perf/optimizing-tier-impl.md` for the layering and the
 //! increment plan.
 //!
 //! Status: I0–I2 (the IR core, the lift, the lowering) plus the fold + DCE

@@ -57,7 +57,7 @@ conversions are where the flatten-cache trap lives.
 - Do NOT re-propose sharing the cache across clones
   (`Rc<OnceLock<...>>` per node): it was tried and reverted — the extra
   allocation per `ConsString` node cost ~2x on append loops
-  (`.notes/perf.md`, Failed experiments).
+  (`.notes/archive/perf/perf.md`, Failed experiments).
 
 ## 3. Handles are arena pointers — lifetime rules for owned values
 

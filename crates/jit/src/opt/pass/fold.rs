@@ -1,4 +1,4 @@
-//! Constant folding over the SSA IR (`.notes/optimizing-tier-impl.md` §2,
+//! Constant folding over the SSA IR (`.notes/archive/perf/optimizing-tier-impl.md` §2,
 //! `pass/fold.rs`).
 //!
 //! Folding is exact: it rewrites an op only when its operands are constants of a

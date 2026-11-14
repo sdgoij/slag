@@ -3,7 +3,7 @@
 //! Both the per-step lowerer (`compiler.rs`) and the optimizing tier
 //! (`opt_lower.rs`) must compute the same cell address and validate it the same
 //! way; keeping the arithmetic here is the "single-source the probe" rule from
-//! `.notes/tier-guarded-read.md` §6 (a fork would drift from the store paths
+//! `.notes/archive/perf/tier-guarded-read.md` §6 (a fork would drift from the store paths
 //! that keep the cell current).
 
 use cranelift_codegen::ir::condcodes::IntCC;
