@@ -14625,6 +14625,29 @@ impl Vm {
         self.run_inline_leaf(agent, argc, this, entry, below, None)
     }
 
+    /// `run_leaf_entry` for a caller that has already decided the compiled lane
+    /// does not pay: a builtin's callback loop with a *small* leaf callee. From
+    /// a Rust caller the JIT entry point pays `lookup_info`, the `leaf_gen`
+    /// bump G15 requires at `jit_depth == 0`, and the whole `run_jit_leaf`
+    /// prologue per element, and a three-step body costs less to run than that
+    /// prologue: measured on `opcost/array_for_each`'s shape, the row is 21.0 ms
+    /// through the compiled lane against 18.1 ms interpreted. The threshold
+    /// lives with the caller.
+    pub(crate) fn run_leaf_entry_interpreted(
+        &mut self,
+        agent: &mut Agent,
+        argc: usize,
+        this: Value,
+        entry: LeafEntry,
+        below: usize,
+    ) -> Result<(), JsError> {
+        debug_assert!(self.can_inline_leaf());
+        if agent.is_terminating() {
+            return Err(crate::agent::termination_error());
+        }
+        self.run_inline_leaf(agent, argc, this, entry, below, None)
+    }
+
     /// Try the JIT leaf path at this call site, shared by every leaf entry
     /// point. `caller_arg_base` marks a fused call-store site whose
     /// arguments live in the caller's frame slots (Cut 35 slice 23) —

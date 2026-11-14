@@ -628,6 +628,31 @@ two fixtures (node eliminates their per-iteration closures outright). **Accept:*
 `array_for_each_js` and `map_for_each` fall, differential exact,
 `JIT_MAX_COMPILE_STEPS` body sizes recorded.
 
+**Landed 2026-11-14: the lane stops choosing the slower lane.** The premise
+correction above has a direct use. If a small leaf body runs faster through the
+interpreter than through the compiled lane — because from a Rust caller the JIT
+entry point pays `lookup_info`, the `leaf_gen` bump and the whole `run_jit_leaf`
+prologue per element — then the callback lane should not enter it.
+`CallbackVm::call` now runs a leaf of at most 8 steps through
+`run_leaf_entry_interpreted`, which skips `try_jit_leaf` entirely. Measured,
+three interleaved pairs, same session:
+
+| row | before | after |
+|---|---:|---:|
+| `opcost/array_for_each` | 21.0-22.2 | **14.7-15.0** |
+| `opcost/map_for_each` | 22.4-26.3 | **15.3-16.1** |
+| `opcost/typed_array_for_each` | 25.1-28.7 | **17.2-18.3** |
+| `opcost/array_for_each_js` (the hand-written twin, control) | 3.46 | 3.46 |
+
+−30% on the three rows, the control unmoved, and all 81 rows identical before
+and after in both modes. It lands *below* the jitless column (18.1) because the
+caller's loop is still compiled and only the callback changed lanes. What is
+left is the 4.1× to the twin (14.7 against 3.56), which is the fused loop's job.
+
+This corrects a claim made earlier in this note — "there is nothing to win by
+shaving the Rust dispatch either". That was true *of the compiled lane*; the win
+was in not entering it at all.
+
 **D5 is blocked on C2, which §5 did not price** (found 2026-11-14 reading
 `opt_lower.rs`). A fused loop must hold the array and the callback across every
 `emit_leaf_call` in its body, and that is a heap reference live at a safepoint

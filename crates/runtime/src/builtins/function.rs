@@ -675,6 +675,14 @@ fn try_leaf_call_cached(
         none => *none = Some(crate::ir::LeafRunGuard::open(&mut *vm, body)),
     }
     let argc = arg_list.len();
+    // A small leaf callee runs faster interpreted than through the compiled
+    // lane: from a Rust caller the JIT entry point pays `lookup_info`, the
+    // `leaf_gen` bump and the `run_jit_leaf` prologue per element, which a
+    // three-step body does not repay (21.0 ms against 18.1 ms on
+    // `opcost/array_for_each`'s shape). Above the threshold the compiled body
+    // is the winner and keeps the lane.
+    const INTERPRET_AT_MOST_STEPS: usize = 8;
+    let interpreted = entry.ir.steps.len() <= INTERPRET_AT_MOST_STEPS;
     let result = {
         vm.stack.push(this_arg);
         vm.stack.push(*func);
@@ -682,7 +690,11 @@ fn try_leaf_call_cached(
         // The entry is already resolved: run its leaf arm directly instead of
         // `do_call_fast`, which would re-derive the same entry (a second
         // `leaf_lookup`) and re-run the call-site gate on every element.
-        vm.run_leaf_entry(agent, argc, this_arg, entry, 2)
+        if interpreted {
+            vm.run_leaf_entry_interpreted(agent, argc, this_arg, entry, 2)
+        } else {
+            vm.run_leaf_entry(agent, argc, this_arg, entry, 2)
+        }
     }
     .and_then(|()| {
         vm.stack.pop().ok_or_else(|| {
