@@ -551,6 +551,30 @@ two fixtures (node eliminates their per-iteration closures outright). **Accept:*
 `array_for_each_js` and `map_for_each` fall, differential exact,
 `JIT_MAX_COMPILE_STEPS` body sizes recorded.
 
+**D5 is blocked on C2, which §5 did not price** (found 2026-11-14 reading
+`opt_lower.rs`). A fused loop must hold the array and the callback across every
+`emit_leaf_call` in its body, and that is a heap reference live at a safepoint
+inside compiled code — exactly what C1's policy forbids. The tier's answer today
+is the refusal: a heap value is never promoted, so it lives at level 1 in a
+frame slot. `Op::Call` can hold `callee`/`this` in SSA only because it needs
+them *up to* the call, never after it, and the helper roots its own arguments
+before allocating; a loop needs them after, across N calls and N allocations,
+where the collector cannot see a register. So they must live in traced storage
+for the duration of the loop, and there is nothing to use: the opt tier has no
+scratch-slot allocator (the frame layout is the body's own slots), the calling
+convention places the callee's frame above `args_ptr + argc*8` so the working
+region cannot be borrowed, and reloading the operands' *own* locals per
+iteration is wrong — the spec captures the callback value once, and the body
+may reassign the local.
+
+So §5's "C2 before any level-2 heap value ... nothing above requires it,
+because the tree's policy is refusal" is false for D5 as written: **D5 is the
+first cut that requires it**, and so is E, whose scalar replacement keeps a
+field that holds a heap value. The order becomes C2 → D5 → E, and D5 is not
+the next cut. The alternative to C2 — two scratch frame slots per fused loop —
+is a frame-layout change (the layout is a measured trap, §7), so it is the
+fallback, not the plan.
+
 **E (residue) — escape analysis beyond literals.** `pass/scalar.rs` already
 scalar-replaces a whole `ObjectFast`/`ArrayFast` whose reads are all
 constant-keyed. Generalizing it needs a body big enough to contain both the
@@ -594,9 +618,11 @@ name is a bucket you cannot size.
   for A0 on those rows, but the allocation cost is what has to move.
 - **D5 before E**: escape analysis has nothing to work on until a call boundary
   disappears, and the callback row is where the call traffic is.
-- **C2 before any level-2 heap value.** Nothing above requires it, because the
-  tree's policy is refusal; the first cut that keeps a heap reference in a
-  register pays for the stack map.
+- **C2 before any level-2 heap value — which now means before D5 and E.**
+  Nothing in A requires it, because the tree's policy is refusal; but D5's fused
+  loop holds the array and the callback across the calls in its body (§4 D5 has
+  the argument) and E's scalar replacement holds a field, so both pay for the
+  stack map. C2 is the next cut after the register work, not a later one.
 - **F1 after A and D5**, because narrowing the effects oracle only pays once the
   reads and calls it governs are inside a lifted body.
 - **B is no longer on the critical path.** The census (§1.3) is the number the
