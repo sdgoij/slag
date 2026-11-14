@@ -20460,3 +20460,43 @@ lanes — an inline cache on the *callee resolution* rather than on the frame),
 `LeafCallFill` 17.5M (rebuilding a leaf's frame that the probe just filled), and
 `LoadContext` 16.2M (environment reads that the `ctx_run` cache could serve).
 None of them is a 2-line change.
+
+## MEASURED (2026-11-13): the leaf frame is filled once, and the builtin→callback lane costs 5x a compiled call
+
+Two things were checked before changing anything.
+
+**1. No double frame fill.** The env lane looks like it fills twice
+(`LeafCallEnv`'s doc says "the frame was already rebuilt by `leaf_call_fill`",
+its body calls `fill_leaf_frame`, and the compiler's env lane calls the helper
+once). The emitter settles it: the env lane (`uses_env != 0`) branches to
+`emit_env_leaf_fast`, and its fallback calls `Helper::LeafCallEnv` — it never
+calls `LeafCallFill`. The doc comment on `leaf_call_env` is stale (the code
+comment inside it is right: "the frame is rebuilt here, in the same call").
+`LeafCallFill`'s 17.5M is the ordinary non-aliased, non-env hit path. Nothing to
+remove.
+
+**2. The callback lane is the `builtins`/`arrays` gap.** Per iteration, 5M-scale
+probes (`release`, one row per process):
+
+| probe (per call) | slag | node |
+|---|---:|---:|
+| `cb(1); cb(2); cb(3); cb(4)` from compiled code | **5.0 ns** | 40.1 |
+| `small.forEach(cb)` on a 4-element array | **52.6 ns** | 26.9 |
+| `s += small.length` (baseline for the row) | 4.7 | 40.6 |
+
+So a leaf call from compiled code is 5 ns (we beat node), and the same call
+through a builtin is ~52 ns — a **5–9x penalty for the same callee**, which is
+what `array_for_each` (19.7 ms of gap), `map_for_each` (20.6),
+`typed_array_for_each` (22.9), `hof_methods` (8.7) and `array_to_sorted` (22.3,
+a comparator per comparison) are made of.
+
+`CallbackVm::try_leaf_call_cached` already hoists the per-*loop* work (the entry
+and the `LeafRunGuard`). What is still per *element*: `realm_count`,
+`function.kind()`, the entry cache check, `agent.running_context()`,
+`slot.take()` + a Box move back, `Vm::rebind` (three stores plus an env-stack
+reset), `LeafRunGuard::retarget`, three stack pushes, `run_leaf_entry`, a pop.
+Hoisting the first three of those is worth perhaps 5–10 of the 45 ns — a real but
+small win that touches the pooled-Vm + GC-registered-run lane, so it needs the
+leaf-run discipline held in mind rather than a quick edit. The rest is the Rust
+lanes's own cost; closing it means a builtin calling a machine-code entry with a
+machine-code frame fill, which is the W5 item proper.
