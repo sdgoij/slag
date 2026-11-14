@@ -508,11 +508,25 @@ and add the test that a promoted slot's *load* after a call re-reads the frame
 
 **C2 — the stack map.** Cranelift user stack maps per safepoint; the collector
 walks them for the PC's code range. Prerequisite for any cut that keeps a heap
-reference at level 2 (a generalized E, an inlined callee's context) — but not
-for anything above, since both refusal and the landed splice keep heap values in
-frame slots. **Accept:** `--gc-stress` and `--gc-verify` exact on every row whose
+reference at level 2 (a generalized E, an inlined callee's context) — and now
+for D5 (§4). **Accept:** `--gc-stress` and `--gc-verify` exact on every row whose
 body holds a heap value across an allocation; a targeted test that allocates
 under a live register-held reference with `--nursery-stress`.
+
+**Slice 1 landed 2026-11-14: the mechanism.** `cranelift-codegen 0.134.3` has
+user stack maps — `DataFlowGraph::append_user_stack_map_entry` attaches entries
+to a safepoint instruction and `MachBufferFinalized::user_stack_maps` returns
+them finalized — so `assemble` now extracts every map into `Compiled::maps`
+(`StackMap { offset, entries: [StackEntry { sp_offset, width }] }`), keyed by the
+safepoint's code offset with the SP-relative offsets already resolved by
+regalloc, and `JIT_DUMP_STACKMAP` prints them. A test compiles a hand-built CLIF
+function whose call carries one entry and asserts the round trip, so the API,
+the finalized offsets and the extraction are pinned on this target.
+
+Nothing attaches a map yet: the tier's own lowering still produces empty vecs,
+because deciding what to spill is liveness (slice 2) and walking the maps from
+a collection is the collector registry plus the PC lookup (slice 3). A body with
+no maps compiles to exactly the code it did before.
 
 **D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
 call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms

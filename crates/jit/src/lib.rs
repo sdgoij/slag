@@ -184,6 +184,34 @@ pub struct Compiled {
     #[allow(dead_code)]
     pub(crate) code: ExecutableCode,
     pub(crate) info: JitCompiledInfo,
+    /// The body's safepoints and the GC references live at each (C2). Empty
+    /// until a lowering declares entries; a body with none compiled exactly as
+    /// it did before stack maps existed. Read by the collector registry and by
+    /// `JIT_DUMP_STACKMAP`.
+    #[allow(dead_code)]
+    pub(crate) maps: Vec<StackMap>,
+}
+
+/// One safepoint's user stack map, in the form the collector will walk.
+///
+/// `offset` is the code offset Cranelift keys the map by — the return address
+/// of the safepoint call, so the collector matches it against a running frame's
+/// return PC. Each entry is SP-relative: `sp + sp_offset` holds a live GC
+/// reference of `width` bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackMap {
+    pub offset: u32,
+    pub entries: Vec<StackEntry>,
+}
+
+/// One live GC reference in a [`StackMap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackEntry {
+    /// Bytes from the frame's stack pointer.
+    pub sp_offset: u32,
+    /// The width Cranelift recorded for the value's CLIF type (8 for the
+    /// NaN-boxed `Value`).
+    pub width: u8,
 }
 
 impl Compiled {

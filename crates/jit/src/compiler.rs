@@ -281,6 +281,31 @@ pub(crate) fn assemble(
         eprintln!("--- disasm ---\n{disasm}");
     }
     let code = ExecutableCode::new(compiled.code_buffer()).ok()?;
+    // C2: the user stack maps Cranelift finalized for this body, keyed by the
+    // safepoint's code offset and already resolved to SP-relative offsets. A
+    // lowering that spills a live GC reference attaches an entry with
+    // `DataFlowGraph::append_user_stack_map_entry`; nothing spills yet, so the
+    // usual body carries an empty vec and its code is unchanged.
+    let maps = compiled
+        .buffer
+        .user_stack_maps()
+        .iter()
+        .map(|(offset, _span, map)| crate::StackMap {
+            offset: *offset,
+            entries: map
+                .entries()
+                .map(|(ty, sp_offset)| crate::StackEntry {
+                    sp_offset,
+                    width: ty.bytes() as u8,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    if std::env::var("JIT_DUMP_STACKMAP").is_ok() {
+        for map in &maps {
+            eprintln!("stackmap {:x}: {:?}", map.offset, map.entries);
+        }
+    }
     // SAFETY: the allocation outlives the cast and is executable; a data
     // pointer to a fn pointer is a plain integer cast on every supported
     // target (no trampolines).
@@ -290,7 +315,7 @@ pub(crate) fn assemble(
         stack_usage,
         deopts,
     };
-    Some(Compiled { code, info })
+    Some(Compiled { code, info, maps })
 }
 
 /// The C ABI for the host platform: the JIT entry and the slow-path helpers
@@ -11432,5 +11457,69 @@ impl<'a> Lowerer<'a> {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_map_tests {
+    use super::*;
+    use cranelift_codegen::ir::stackslot::{StackSlotData, StackSlotKind};
+    use cranelift_codegen::ir::{InstBuilder, UserFuncName, UserStackMapEntry};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    /// C2's foundation: a safepoint can carry a user stack map, and the map
+    /// survives compilation as an SP-relative reference the collector can walk.
+    /// Nothing in the tier attaches one yet (that needs the liveness the next
+    /// slice adds), so this pins the mechanism itself: Cranelift records the
+    /// entry against the call, and `compile_fn` reports it.
+    #[test]
+    fn a_safepoint_round_trips_its_user_stack_map() {
+        let engine = JitEngine::with_opt(false).expect("native isa");
+        let mut sig = jit_sig(platform_call_conv(&*engine.isa));
+        sig.params.clear();
+
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let mut ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut ctx);
+            let entry = b.create_block();
+            b.switch_to_block(entry);
+            b.seal_block(entry);
+            // The value a stack map would name: held in a sized slot, so its
+            // frame offset is known after regalloc.
+            let held = b.ins().iconst(types::I64, 0x4142_4143);
+            let slot = b
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            b.ins().stack_store(types::I64, held, slot, 0);
+            // A safepoint: any non-tail call. The callee is never run, so a
+            // null entry is enough to compile.
+            let mut help_sig = sig.clone();
+            help_sig.params.push(AbiParam::new(types::I64));
+            let callee_sig = b.import_signature(help_sig);
+            let callee = b.ins().iconst(types::I64, 0);
+            let call = b.ins().call_indirect(callee_sig, callee, &[held]);
+            let result = b.func.dfg.inst_results(call)[0];
+            b.func.dfg.append_user_stack_map_entry(
+                call,
+                UserStackMapEntry {
+                    ty: types::I64,
+                    slot,
+                    offset: 0,
+                },
+            );
+            b.ins().return_(&[result]);
+            b.finalize(engine.isa.frontend_config());
+        }
+
+        let compiled = assemble(&*engine.isa, func, 0, false).expect("compiles");
+        assert_eq!(
+            compiled.maps.len(),
+            1,
+            "one safepoint, one map: {:?}",
+            compiled.maps
+        );
+        let map = &compiled.maps[0];
+        assert_eq!(map.entries.len(), 1, "one live reference: {map:?}");
+        assert_eq!(map.entries[0].width, 8, "a NaN-boxed Value is 8 bytes");
     }
 }
