@@ -275,6 +275,7 @@ fn run(command: Command) -> Result<(), u8> {
                 eprintln!(
                     "  JIT_DUMP_IR=1             dump the optimizing tier's SSA IR to stderr"
                 );
+                eprintln!("                            and its materialization census");
                 eprintln!(
                     "  JIT_DUMP_CLIF=1           dump Cranelift CLIF, disassembly, and bail reasons"
                 );

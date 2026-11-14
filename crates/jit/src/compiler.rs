@@ -195,6 +195,7 @@ impl JitEngine {
                     crate::opt::pass::run(&mut ir, Some(body), &sites, &mut resolve);
                     if std::env::var("JIT_DUMP_IR").is_ok() {
                         eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));
+                        eprintln!("--- census ---\n{}", crate::opt::census::report(&ir));
                     }
                     if crate::opt::verify::verify(&ir).is_ok()
                         && let Some(compiled) =

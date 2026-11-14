@@ -11,6 +11,7 @@
 //! pass pipeline.
 
 pub mod builder;
+pub mod census;
 pub mod ir;
 pub mod lift;
 pub mod pass;
