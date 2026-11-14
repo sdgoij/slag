@@ -64,6 +64,14 @@ pub fn compile(
     max_stack: usize,
 ) -> Option<Compiled> {
     let conv = platform_call_conv(isa);
+    if std::env::var("JIT_DUMP_LIVE").is_ok() {
+        for site in crate::opt::live::safepoint_roots(ir) {
+            eprintln!(
+                "opt live: b{} i{} roots {:?}",
+                site.block, site.index, site.roots
+            );
+        }
+    }
     let mut func =
         Function::with_name_signature(UserFuncName::testcase("jit_opt_body"), jit_sig(conv));
     let mut fctx = FunctionBuilderContext::new();

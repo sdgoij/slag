@@ -528,6 +528,29 @@ because deciding what to spill is liveness (slice 2) and walking the maps from
 a collection is the collector registry plus the PC lookup (slice 3). A body with
 no maps compiles to exactly the code it did before.
 
+**Slice 2 landed 2026-11-14: liveness.** `opt::live` answers the producer's
+question — `safepoint_roots` runs a backward data-flow fixpoint over the SSA CFG
+(a successor's `live_in` flows into this block's exit; loops need the fixpoint)
+and reports, per call, the values live *after* it, excluding the call's own
+result and filtered to the types that may be a GC reference (`Unknown`, `Object`,
+`String`, `Number`, `Hole`; `Int`/`Float`/`Bool`/the immediates cannot be).
+`JIT_DUMP_LIVE` prints them, which is how the numbers below were read.
+
+Two things the first real check showed. The set is **conservative and large**:
+a probe loop body with four calls reports the same ten live values at every one
+of them, because a frame load is `Type::Unknown` and untyped means heap-typed.
+That is the honest cost of the policy, and it is why slice 3 cannot simply spill
+everything at `Type::Unknown`: the typer's guards have to narrow the set first,
+or the store traffic will exceed what the roots are worth. Second, the analysis
+belongs at the call sites the lowering *emits*, not at the ops: `is_safepoint`
+naming `Op::Call | Op::Intrinsic` is a claim about `emit_leaf_call` that must be
+re-checked whenever a new call-emitting op lands.
+
+**Slice 3 (next): spill and declare.** At each reported safepoint, spill the
+roots into sized stack slots and call `append_user_stack_map_entry` on the call
+instruction `emit_leaf_call` produces (it must hand the `Inst` back), then the
+collector registry and the PC lookup.
+
 **D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
 call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms
 against its hand-written twin `array_for_each_js` at 3.55 ms — **6.3×** — and the

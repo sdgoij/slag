@@ -14,6 +14,7 @@ pub mod builder;
 pub mod census;
 pub mod ir;
 pub mod lift;
+pub mod live;
 pub mod pass;
 pub mod print;
 pub mod verify;

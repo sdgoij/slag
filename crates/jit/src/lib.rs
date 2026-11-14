@@ -10946,4 +10946,42 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
         assert_eq!(value.as_boolean(), Some(true));
         assert!(compiled >= 1, "{compiled} bodies");
     }
+
+    #[test]
+    fn a_call_reports_the_heap_value_live_across_it() {
+        // `LoadLocal 2` leaves a value on the stack, the call consumes the
+        // three values above it, and the add consumes the call's result plus
+        // that earlier value — so it is live across the call. A frame load is
+        // untyped (`Type::Unknown`), i.e. it may be a heap reference, which is
+        // exactly what C2 has to root.
+        let body = make_body(
+            vec![
+                Step::LoadLocal { slot: 2 },
+                Step::Push(Value::Undefined),
+                Step::LoadLocal { slot: 0 },
+                Step::LoadLocal { slot: 1 },
+                Step::CallFast {
+                    argc: 1,
+                    direct_eval: false,
+                    span: crux::Span::new(0, 0),
+                },
+                Step::Binary(syntax::ast::BinaryOp::Add),
+                Step::Return,
+            ],
+            3,
+        );
+        let ir = crate::opt::lift::lift(&body).expect("lifts");
+        let sites = crate::opt::live::safepoint_roots(&ir);
+        assert_eq!(sites.len(), 1, "one call: {sites:?}");
+        assert_eq!(
+            sites[0].roots.len(),
+            1,
+            "one value live across it: {sites:?}"
+        );
+        assert_eq!(
+            ir.value_type(sites[0].roots[0]),
+            crate::opt::ir::Type::Unknown,
+            "a frame load is untyped, so it may be a heap reference"
+        );
+    }
 }
