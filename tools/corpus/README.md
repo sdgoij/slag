@@ -63,6 +63,28 @@ standing "corpus probe" the perf notes keep gating deferred work on.
   wrapper, and the iteration count is calibrated so one `bench()` runs
   ~50ms under node. Only fixtures that run cleanly under both node and
   slag are kept.
+- `measure.py` — the cross-engine timing table, but **interleaved**: rounds
+  run slag-jit / slag-jitless / node-jit with the order reversed each round
+  and the min kept per row, plus a result differential across the columns.
+  Use this rather than one sequential pass of the runners above: a corpus
+  total moves 15-25% between windows of the same session and it moves every
+  engine, so a single pass reads host load as an engine difference.
+  `--rounds 5` for anything worth writing down.
+- `census_probe.py` — the optimizing tier's materialization census
+  (`.notes/register-tier-plan.md` §1.3): per row, the conversions per
+  iteration that leave the `Int`/raw-f64 registers for a `Value` word, split
+  by the cause that forced them. Reports whether a body lifted at all, so it
+  doubles as the coverage probe.
+- `refusal_probe.py` — for the rows with no census, the `opt bail` family,
+  the exact `opt-refuse` step and the `opt-blockers` variants. Auto-detects
+  the rows (`no-census`), or takes `all` / explicit row paths.
+- `ab_lift.py` — one row's optimizing tier against its per-step tier
+  (`SLAG_OPT=0`), interleaved, with both columns' results compared. The gate
+  for any lift cut: entering the tier must never be a pessimization.
+
+Both probes run one workload file directly with `JIT_DUMP_IR` (and the
+refusal probe with `JIT_DUMP_STEPS`/`JIT_DUMP_CLIF`), so they report the body
+that compiled rather than a timed window; `--slag PATH` selects the binary.
 
 ## Usage
 
@@ -78,6 +100,12 @@ node --jitless tools/corpus/run_node.js tools/corpus/workloads
 
 # or the full four-mode comparison
 node tools/corpus/bench.js [--slag <path-to-slag>]
+
+# the interleaved table (min per row over rounds) and the two probes
+python tools/corpus/measure.py --rounds 5
+python tools/corpus/census_probe.py            # pass rows to narrow it
+python tools/corpus/refusal_probe.py           # no-census rows by default
+python tools/corpus/ab_lift.py --rounds 5      # opt vs SLAG_OPT=0 per row
 ```
 
 `SLAG_BIN` also selects the slag binary. `bench.js` exits non-zero if any
