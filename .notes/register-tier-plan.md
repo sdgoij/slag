@@ -363,12 +363,16 @@ So the cuts are the four named items, not the plumbing:
   the leaf, so its address cannot be recycled — and do the same for
   `shared_arrow_body`, `shared_accessor_body` and `source_info_with_slice`,
   which each hash per closure today. That is a coherent cut, not a one-liner.
-- **A0c — `props` and the record insert** (120–200 + 195): the largest safely
-  cuttable items now. Defer `name`/`length` behind the same pending flag
-  `prototype` already uses; and `ecma_functions` is an `IdMap<EcmaFunction>`, so
-  every insert moves the whole record (and every rehash moves all of them) —
-  boxing the value makes the insert and the rehash pointer-sized, at the cost of
-  a `&**` at each accessor.
+- **A0c — `props` and the record insert** (120–200 + 195): property adoption
+  behind a pending flag like `prototype`'s is the remaining safe item. The
+  record insert was attempted the obvious way and **measured worse**:
+  `ecma_functions` is an `IdMap<EcmaFunction>`, so boxing the value
+  (`IdMap<Box<…>>`, pointer-sized inserts and rehashes) was the hypothesis —
+  it took `register` from 195 to **326 cycles**, because the box is one more
+  allocation per closure and the saved move is cheaper than the malloc. So the
+  insert's 195 is not the move; a dense `Vec` indexed by the (sequential) id is
+  the shape that would remove both, and it is a table-wide change rather than a
+  cut.
 - **A0d — `function_new`** (185): one object; at ~44 ns per empty object this is
   ~1.5 objects' worth, so there is not much here beyond avoiding the allocation
   entirely (`A0c`'s fold would do that).
@@ -670,6 +674,11 @@ Added 2026-11-14 by the B0 census:
   instrumenting both sides showed ~70 cycles of call overhead and put the rest
   *inside* the callee, between phase boundaries. Instrument the other side
   before designing the cut — this guess was simply wrong.
+- **Boxing an id-keyed record map does not pay.** The `register` phase read 195
+  cycles and the record is ~30 fields, so `IdMap<Box<EcmaFunction>>` looked like
+  the fix; measured, it is **326** — the box is a malloc per closure and the
+  move it removes is cheaper than that. The insert's cost is the table, not the
+  value's size; removing it means a dense `Vec` keyed by the id, not a box.
 - **A corpus total is only comparable within a session and a corpus size.** The
   morning revision's 2.70× and this session's 2.68–3.06× are not a regression:
   81 rows vs 77, and a different load window. Four passes on one binary in one
