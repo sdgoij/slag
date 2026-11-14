@@ -20418,3 +20418,45 @@ A diagnostic build that skipped the record insert + boilerplate in
 function's own properties need the record), so the plan's component split
 (record insert 44, boilerplate 29, compiled-body cache 26, preamble 35, boxes
 104) remains the only measurement of that path.
+
+## MEASURED (2026-11-13): the corpus-wide helper census, and why `typeof` inlining is not worth it
+
+`JIT_HELPER_STATS=1` over the **whole corpus** (one run, counts include the
+harness's repeat calls, so read them as shares, not per-iteration costs):
+
+| helper | calls | what it is |
+|---|---:|---|
+| `GetMemberName` | 89.9M | member reads that miss the compiled value cell |
+| `CallSlow` | 41.2M | calls that miss the leaf/certified lanes |
+| `LeafCallFill` | 17.5M | the leaf lane's frame rebuild |
+| `LoadContext` | 16.2M | environment-chain slot reads |
+| `ForInNext` | 13.6M | |
+| `BinarySlow` | 12.7M | |
+| `CharCodeAt` | 12.4M | the `%String.prototype.charCodeAt%` intrinsic lane |
+| `CertifiedCall` | 10.5M | |
+
+`GetMemberName`'s 89.9M is **not** a cliff: the calls are prototype-chain reads
+(`m.get`, `p.get`, `str.length`), and measured against node they are already
+cheaper —
+
+| probe (5M iterations, per iteration) | slag | node |
+|---|---:|---:|
+| `m.get(1)` on a Map (chain read + builtin call) | **5.2 ns** | 8.8 |
+| `p.get(1)` on a prototype method | **4.0** | 8.2 |
+| `a.length` on a dense array | **0.9** | 8.3 |
+
+So the helper count reflects how often the language does the operation, not
+overhead to reclaim.
+
+**`typeof` inlining (the candidate named last round) was checked before building
+it and dropped: exactly ONE workload in the corpus uses `typeof`** (`head-let`,
+six times per body, and three of those are `typeof fns.a` — a *function*, i.e.
+the one kind that still needs the box's `ObjectKind` and cannot be classified
+from the NaN-box tag alone). Inlining the seven tag-classifiable kinds would
+save ~12 ns × 6 of a 3593 ns body = 2%, in one row. Not worth an emitter arm.
+
+What the census does point at, in order: `CallSlow` 41.2M (calls that miss both
+lanes — an inline cache on the *callee resolution* rather than on the frame),
+`LeafCallFill` 17.5M (rebuilding a leaf's frame that the probe just filled), and
+`LoadContext` 16.2M (environment reads that the `ctx_run` cache could serve).
+None of them is a 2-line change.
