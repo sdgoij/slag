@@ -653,6 +653,30 @@ This corrects a claim made earlier in this note — "there is nothing to win by
 shaving the Rust dispatch either". That was true *of the compiled lane*; the win
 was in not entering it at all.
 
+**The fused loop's integration point is the `Intrinsic` mechanism** (mapped
+2026-11-14), and it removes most of the plumbing this note assumed. `Intrinsic`
+already gives the three things the loop needs: the *recognition* (`try_compile_intrinsic`
+matches a member call by property name, so `.forEach(` reaches it with no lift
+pattern and no bytecode change), the *identity guard* (`do_call_intrinsic`
+compares the resolved callee against `realm.intrinsics.intrinsic(kind)` and
+returns `false` to fall back to `do_call_fast` — a shadowed `forEach` therefore
+cannot take the fast path), and the *fallback*. `intrinsic_bits` publishes a
+kind's identity generically (`for (slot, kind) in bits.iter_mut().zip(INTRINSICS)`),
+so the JIT's `emit_intrinsic` guard needs no change either.
+
+Two things to watch. The compiler must restrict the shape (`argc == 1`, as
+`ArrayPush` restricts its single-element form), and **`emit_intrinsic`'s inner
+`match` returns `Unsupported` for an unhandled kind, which drops the whole body
+out of the optimizing tier** — so a new kind needs a JIT arm in the same change
+as the interpreter arm, even if that arm only routes to the shared slow path.
+Otherwise every body containing a `.forEach(` loses the tier, which on this
+corpus row is exactly the hot caller.
+
+The loop body itself is `for_each`'s element walk (`dense_own_element`, else the
+chain via `JsObject::has_property` + `get_property`) with the callback run on
+*this* Vm instead of a pooled one — the leaf lane `CallbackVm` uses, minus the
+builtin dispatch, `to_object`, `length_of_array_like` and the pool round trip.
+
 **D5 is blocked on C2, which §5 did not price** (found 2026-11-14 reading
 `opt_lower.rs`). A fused loop must hold the array and the callback across every
 `emit_leaf_call` in its body, and that is a heap reference live at a safepoint
