@@ -516,13 +516,40 @@ under a live register-held reference with `--nursery-stress`.
 
 **D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
 call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms
-against its hand-written twin `array_for_each_js` at 3.55 ms — **6.3×**, i.e.
-~19 ms of that row, and the same shape in `map_for_each`/`typed_array_for_each`,
-so ~50 ms corpus-wide. Real but not the corpus lever. With the splice landed, a
-certified callback is an inlined loop body; `E` then has a body big enough to
-contain the allocator and the consumer, which is the only route to the two
-fixtures (node eliminates their per-iteration closures outright). **Accept:** `array_for_each_js` and `map_for_each` fall,
-differential exact, `JIT_MAX_COMPILE_STEPS` body sizes recorded.
+against its hand-written twin `array_for_each_js` at 3.55 ms — **6.3×** — and the
+same shape in `map_for_each`/`typed_array_for_each`, so ~50 ms corpus-wide.
+
+**Split 2026-11-14** with a four-file probe (100k outer iterations each, min of
+three):
+
+| probe | jit | jitless | per unit |
+|---|---:|---:|---|
+| the outer loop plus `a.length` (base) | 0.585 | 2.77 | — |
+| four compiled direct calls `cb(a[0..3])` (the twin) | 2.15 | 14.0 | **3.9 ns/call** |
+| `[1].forEach(cb)` | 8.8 | 9.65 | **~41 ns fixed** per call |
+| `[1,2,3,4].forEach(cb)` | 21.0 | 18.1 | 41 ns + **40.7 ns/element** |
+
+Two things follow, and the second corrects this plan's premise. First, the row
+is ~90% lane (21.0 against the twin's 2.15) and splits ~20/80 between a fixed
+per-`forEach` cost and a per-element one; the per-element 40.7 ns against a
+compiled call's 3.9 ns is **10.4×**. Second, **the callback is already compiled
+and compiling it is not what the row is paying for**: `CallbackVm::call` →
+`run_leaf_entry` → `try_jit_leaf`, so the machine code runs — and `forEach` is
+*slower* with the JIT than without it (21.0 against 18.1), because `run_jit_leaf`
+costs the code-cache `lookup_info`, the `leaf_gen` bump G15 requires at
+`jit_depth == 0`, the `LeafEntry` clone, `running_context`, `rebind`, `retarget`
+and three stack pushes per element, while the interpreted leaf is a three-step
+body. So there is nothing to win by shaving the Rust dispatch either: its floor
+is the interpreted-leaf cost the jitless column already measures.
+
+**The cut is therefore a fused loop in the IR**, not a better callback entry: an
+`opcost`-shaped `forEach` lowered to a counted loop whose body *is* the callback
+(inlined, so the 40.7 ns boundary disappears rather than shrinking), with the
+length read once before the loop per spec 23.1.3.14. `E` then has a body big
+enough to contain the allocator and the consumer, which is the only route to the
+two fixtures (node eliminates their per-iteration closures outright). **Accept:**
+`array_for_each_js` and `map_for_each` fall, differential exact,
+`JIT_MAX_COMPILE_STEPS` body sizes recorded.
 
 **E (residue) — escape analysis beyond literals.** `pass/scalar.rs` already
 scalar-replaces a whole `ObjectFast`/`ArrayFast` whose reads are all
