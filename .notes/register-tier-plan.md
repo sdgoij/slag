@@ -373,6 +373,16 @@ So the cuts are the four named items, not the plumbing:
   insert's 195 is not the move; a dense `Vec` indexed by the (sequential) id is
   the shape that would remove both, and it is a table-wide change rather than a
   cut.
+- **A0c is also closed for `props`.** `set_function_properties_batched` already
+  adopts a pre-forked shape with a vector-free field write (Cut 67), so the
+  120–200 is a boilerplate-map lookup plus one adoption, not a sequence of
+  defines. Deferring `name`/`length` would mean the shape *lacks* those keys at
+  creation and gains them on first observation — the same trick `prototype`
+  plays, but `prototype` is safe because it is reached through one
+  materialization site, while `name`/`length` are ordinary own data properties
+  that the boilerplate fork and every property read assume are present. That is
+  a layout change, and the layout is a measured trap (§7's `JsObject` note):
+  not worth ~150 cycles of one row's closure path.
 - **A0d — `function_new`** (185): one object; at ~44 ns per empty object this is
   ~1.5 objects' worth, so there is not much here beyond avoiding the allocation
   entirely (`A0c`'s fold would do that).
@@ -487,9 +497,13 @@ body holds a heap value across an allocation; a targeted test that allocates
 under a live register-held reference with `--nursery-stress`.
 
 **D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
-call funnel per element (52.6 ns/call vs 5.0 ns for the same callee called from
-compiled code, 2026-11-13). With the splice landed, a certified callback is an
-inlined loop body. **Accept:** `array_for_each_js` and `map_for_each` fall,
+call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms
+against its hand-written twin `array_for_each_js` at 3.55 ms — **6.3×**, i.e.
+~19 ms of that row, and the same shape in `map_for_each`/`typed_array_for_each`,
+so ~50 ms corpus-wide. Real but not the corpus lever. With the splice landed, a
+certified callback is an inlined loop body; `E` then has a body big enough to
+contain the allocator and the consumer, which is the only route to the two
+fixtures (node eliminates their per-iteration closures outright). **Accept:** `array_for_each_js` and `map_for_each` fall,
 differential exact, `JIT_MAX_COMPILE_STEPS` body sizes recorded.
 
 **E (residue) — escape analysis beyond literals.** `pass/scalar.rs` already
