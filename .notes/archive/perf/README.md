@@ -7,7 +7,7 @@ history behind it.
 
 Read it for provenance, for the failed-experiment register, and for the
 measurement behind a decision that is still load-bearing. Do not take current
-numbers from here — every ratio in these files is a dated observation, and the
+numbers from here, every ratio in these files is a dated observation, and the
 corpus total drifts 15-25% between windows for both engines.
 
 References from `crates/`, `.agents/skills/`, and the live `.notes/` docs name
@@ -68,7 +68,7 @@ the directory moved.
 The register and materialization work reached parity: the lifts that admit more
 bodies measured 1.002–1.020x against `SLAG_OPT=0` (coverage, not speed), and
 the three alternatives that would have paid were each measured worse or
-blocked — the hoist-guard lift 1.36–3.62x slower without region-scoped type
+blocked, the hoist-guard lift 1.36–3.62x slower without region-scoped type
 facts, the boxed `ecma_function` record 195 → 326 cycles per closure, and a
 lazily-built `SourceInfo` blocked because the FNV hash is the site-cache key.
 What is left is allocation and inlining, which is

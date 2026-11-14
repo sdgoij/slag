@@ -60,7 +60,7 @@ passes of the same protocol in this session gave `2775.6 / 905.6` (3.06×),
 `2171.2 / 743.8` (2.92×, the 5-round table above), `1875.8 / 699.7` (2.68×) and
 `2028.0 / 792.6` (2.56×). Both engines move together, and the same-binary
 `jitless/jit` ratio moved with them (2.10–2.44×), so neither an absolute total
-nor a ratio is an instrument across windows — only a same-session, interleaved,
+nor a ratio is an instrument across windows, only a same-session, interleaved,
 min-of-N comparison is. Quote the protocol, the round count and the ratio, and
 compare like with like.
 
@@ -98,8 +98,8 @@ The morning revision listed these as future work. They are in the tree:
 ### 1.3 The B0 census: what the rest of Phase B is worth
 
 `crates/jit/src/opt/census.rs` (new) counts, per body and per iteration, every
-place a value leaves a register representation — `Type::Int` (an i32 register)
-or `Type::Float` (a raw f64) — for a `Value` word, and charges each one to §2's
+place a value leaves a register representation, `Type::Int` (an i32 register)
+or `Type::Float` (a raw f64), for a `Value` word, and charges each one to §2's
 materialization points. It prints after the `JIT_DUMP_IR` dump, so the number
 and the IR that produced it are in one place.
 
@@ -110,13 +110,13 @@ non-int-native op** is an i32 leaving; the int-native set is
 `IntAdd/IntSub/IntMul/BitAnd/BitOr/BitXor/Shl/Shr/UShr`. A conversion's cause is
 `frame` (a slot access), `guard` (a deopt mirror), `alloc` (a literal build),
 `call` (a call step, or an op whose helper *is* the operation, e.g. a member
-read), `compute` (a plain arithmetic/comparison/conversion op — **the Phase B
+read), `compute` (a plain arithmetic/comparison/conversion op, **the Phase B
 budget**), or `other`. The counts are exact for the two mechanisms (`Canon`
 sites, `Int` widens); the five-way split is a heuristic documented in the module.
 
 One scope caveat: "per iteration" means "the cycle-resident instructions", so a
 body with several cycles (`loops N` in the report) counts each cycle's traffic,
-including cycles that are **mutually exclusive at run time** — a hoist guard's
+including cycles that are **mutually exclusive at run time**, a hoist guard's
 guarded and general copies, for instance. Read the number as an upper bound for
 such a body, and compare it with `loops` before quoting it.
 
@@ -146,8 +146,8 @@ three take `--slag PATH`, default to `target/release/slag{,exe}`, and live in
 **This is the decision the morning revision said must come before Phase B, and
 it comes out against the phase as scoped.** That revision expected "20–40
 avoidable round trips per body at 2–4 ns… 40–160 ns of a 428 ns body". The
-measured budget is **1–2 conversions per iteration on the median row** — 2–8 ns
-— and 10 at most. At `method_call`'s 32 ns/iteration, its one avoidable
+measured budget is **1–2 conversions per iteration on the median row**, 2–8 ns,
+and 10 at most. At `method_call`'s 32 ns/iteration, its one avoidable
 conversion is ~10% of the row; on most rows it is below the noise floor of the
 measurement protocol. B cannot be the lever for a 3.06× gap. What the census
 does say is that the two mechanisms that *produced* the level-3 lanes
@@ -192,10 +192,10 @@ A0 rather than a lift:
 - **The gap in these rows is creation and call machinery, not register traffic.**
   B0 (§1.3) measured 1–2 avoidable conversions per iteration; the closure path
   is 340 ns *per closure*. Lifting `is()` (a 30-step body every assert calls)
-  was worth ~2% on both fixtures by same-binary A/B — real, but not the lever.
+  was worth ~2% on both fixtures by same-binary A/B, real, but not the lever.
 - **The biggest row's hot body is still outside the tier**: `__t262Body` is 101
   steps and bails on `EnterPerIteration`/`PerIteration`/`LoadPerIteration`/
-  `StorePerIteration`/`LeaveBlock`/`TypeofTop` — the `for (let x in obj)`
+  `StorePerIteration`/`LeaveBlock`/`TypeofTop`, the `for (let x in obj)`
   per-iteration environment family. Lifting it is *necessary* for the row, but
   by the ablation it cannot be *sufficient*: the closures it creates cost 340 ns
   each and the tier does not change that.
@@ -229,7 +229,7 @@ these events. Every one of them must be *enumerated by the pass*, not assumed:
 
 The invariant from `optimizing-tier-plan.md` §2 still holds and is what keeps
 this affordable: **the compiled frame never diverges from the interpreter
-frame.** Level 2 is a *caching* layer over level 0/1, never a replacement — so a
+frame.** Level 2 is a *caching* layer over level 0/1, never a replacement, so a
 flush is always a store to a slot the interpreter would have written anyway, and
 no snapshot/`Recover_*` machinery is owed.
 
@@ -285,12 +285,12 @@ from `opt-blockers`:
 
 | reason (`opt bail`) | rows | blockers the probe names | what it is |
 |---|---|---|---|
-| `Step("HoistGuard")` | 6 (`declarative_read`, `nested_read`, `object_read`, `own_read`, `proto_read`, `obj_prop`) | — (a terminator refusal) | the LICM hoist guard, refused **by design** (an always-miss opt body is a measured pessimization; `emit_fused_test`) |
-| `Step("RunRegBody")` | 6 (`json_roundtrip`, `many_objects_read`, `array_slice`, `array_to_sorted`, `prim_prop`, `split_join`) | — (a leaf-table refusal) | a `LeafOp` outside the lifted subset: `GetMemberNameLocal`/`GetMemberComputedLocal`, `BinStoreReg`/`StoreReg`, `PushAcc`, sometimes `CallFast` |
+| `Step("HoistGuard")` | 6 (`declarative_read`, `nested_read`, `object_read`, `own_read`, `proto_read`, `obj_prop`) |, (a terminator refusal) | the LICM hoist guard, refused **by design** (an always-miss opt body is a measured pessimization; `emit_fused_test`) |
+| `Step("RunRegBody")` | 6 (`json_roundtrip`, `many_objects_read`, `array_slice`, `array_to_sorted`, `prim_prop`, `split_join`) |, (a leaf-table refusal) | a `LeafOp` outside the lifted subset: `GetMemberNameLocal`/`GetMemberComputedLocal`, `BinStoreReg`/`StoreReg`, `PushAcc`, sometimes `CallFast` |
 | `Step("Switch")` | 1 (`switch_dispatch`) | `Break`, `SwitchDisc`, `SwitchTest` | the switch step family has no lift |
 | `Step("Try")` | 1 (`try_catch_loop`) | `CatchBind`, `EnterTry`, `Exit`, `LeaveBlock` | the try/catch step family has no lift |
 | `Step("Generator")` + `Step("UpdateContextSlot")` | 1 (`generator_loop`) | `UpdateContextSlot`, `Yield` | generator suspension, and the captured-slot update |
-| `Step("FusedLoop")` | 1 (`search_slice`) | — (a shape refusal) | `BuilderBind { slot: Some(0) }`: the string-builder form, not the acc-path |
+| `Step("FusedLoop")` | 1 (`search_slice`) |, (a shape refusal) | `BuilderBind { slot: Some(0) }`: the string-builder form, not the acc-path |
 | `Step("ObjectLiteral")` | 1 (`object_spread_fresh`) | `ObjectSpread` | object spread |
 | `Step("RegExpLiteral")` | 1 (`regexp_test`) | `RegExpLiteral` | a regexp literal has no lift |
 
@@ -325,7 +325,7 @@ its own); **C** makes a register-held heap value sound; **D5** is the one call
 lane left; **F1** is the oracle the read/arith work needs. The B0 probe (§1.3)
 retires most of Phases B and E *as scoped*.
 
-**A0 — function-object creation (~340 ns each).** The measured dominant term in
+**A0, function-object creation (~340 ns each).** The measured dominant term in
 the corpus's two largest rows (§1.4): three closures per body cost ~1 µs of
 head-let's 3.3 µs, against node's 570 ns for the *whole* body.
 
@@ -347,39 +347,39 @@ instrument's own per-phase cost (~31 cycles, subtracted below):
 the cost sat in the by-value `outer_chain`/`per_iteration_chain`/`named` clones
 at the caller. Measuring both sides says otherwise: the caller's own work is
 `source_info` plus three cached lookups plus ~70 cycles of call overhead, and the
-remaining ~40% is *inside* `register_function` between its phase boundaries —
+remaining ~40% is *inside* `register_function` between its phase boundaries:
 prologue/epilogue on a twelve-argument function, the record move, and the
 instrument's own ±50-cycle noise, which is where this method stops resolving.
 So the cuts are the four named items, not the plumbing:
 
-- **A0a — the site key is the text's identity (landed 2026-11-14).** The 230
+- **A0a, the site key is the text's identity (landed 2026-11-14).** The 230
   cycles were dominated by the FNV hash of the function's source slice, and the
   hash could not be dropped on its own: node addresses are reused after a parse
   is dropped, and two parses of same-length sources collide on
   `(address, realm, span)` alone, so something content-derived had to
   disambiguate them. The cut replaces the hash with the *address* of the
-  enclosing text — `JsString::Flat` is an `Arc`, shared by every clone — and
+  enclosing text, `JsString::Flat` is an `Arc`, shared by every clone, and
   makes the address sound by having every cache that keys on it also store the
   text, pinning the `Arc` so its address cannot be recycled (`source_site_identity`
   and `SiteSource` in `function.rs`). The forms with no stable base (`Small`,
   and a rope until it is materialized) keep the hash. All four site caches take
-  the identity — `SOURCE_INFO_CACHE`, `FUNCTION_BODY_CACHE`,
-  `ARROW_BODY_CACHE`, `ACCESSOR_BODY_CACHE` — and `SourceInfo::key` carries it.
+  the identity, `SOURCE_INFO_CACHE`, `FUNCTION_BODY_CACHE`,
+  `ARROW_BODY_CACHE`, `ACCESSOR_BODY_CACHE`, and `SourceInfo::key` carries it.
 
   Measured on the head-let fixture with `SLAG_CLOSURE_PHASES`: `source_info`
   **273.0 → 183.9** cycles per closure and `total` **1890.8 → 1783.9**
   (-5.7%); `body`, `props` and `patterns` moved inside the instrument's
   ±50-cycle band. The wall clock does not resolve it in this window (that row
   spans 337-602 ms within one binary), so this is an isolated win, not a row
-  claim. What is left in the phase is `enclosing_source` — a walk of the
-  execution-context stack plus a `JsString` clone per closure — and the frame
+  claim. What is left in the phase is `enclosing_source`, a walk of the
+  execution-context stack plus a `JsString` clone per closure, and the frame
   already carries its source, so it can carry the site key with it: that is
   the next item.
-- **A0c — `props` and the record insert** (120–200 + 195): property adoption
+- **A0c, `props` and the record insert** (120–200 + 195): property adoption
   behind a pending flag like `prototype`'s is the remaining safe item. The
   record insert was attempted the obvious way and **measured worse**:
   `ecma_functions` is an `IdMap<EcmaFunction>`, so boxing the value
-  (`IdMap<Box<…>>`, pointer-sized inserts and rehashes) was the hypothesis —
+  (`IdMap<Box<…>>`, pointer-sized inserts and rehashes) was the hypothesis;
   it took `register` from 195 to **326 cycles**, because the box is one more
   allocation per closure and the saved move is cheaper than the malloc. So the
   insert's 195 is not the move; a dense `Vec` indexed by the (sequential) id is
@@ -389,21 +389,21 @@ So the cuts are the four named items, not the plumbing:
   adopts a pre-forked shape with a vector-free field write (Cut 67), so the
   120–200 is a boilerplate-map lookup plus one adoption, not a sequence of
   defines. Deferring `name`/`length` would mean the shape *lacks* those keys at
-  creation and gains them on first observation — the same trick `prototype`
+  creation and gains them on first observation, the same trick `prototype`
   plays, but `prototype` is safe because it is reached through one
   materialization site, while `name`/`length` are ordinary own data properties
   that the boilerplate fork and every property read assume are present. That is
   a layout change, and the layout is a measured trap (§7's `JsObject` note):
   not worth ~150 cycles of one row's closure path.
-- **A0d — `function_new`** (185): one object; at ~44 ns per empty object this is
+- **A0d, `function_new`** (185): one object; at ~44 ns per empty object this is
   ~1.5 objects' worth, so there is not much here beyond avoiding the allocation
   entirely (`A0c`'s fold would do that).
 
 **Accept:** the closure micro (§1.4) falls; both fixtures fall with it; the
 corpus differential and `--gc-stress` stay exact (a closure is a heap object with
-an environment edge — the rooting traps in §7 apply).
+an environment edge, the rooting traps in §7 apply).
 
-**A1 — the corpus's biggest body cannot enter the tier (landed 2026-11-14).**
+**A1, the corpus's biggest body cannot enter the tier (landed 2026-11-14).**
 `__t262Body` in the `head-let` fixture was 101 steps and bailed on the
 `for (let x in obj)` per-iteration environment family (`EnterPerIteration`,
 `PerIteration`, `LoadPerIteration`, `StorePerIteration`, `LeaveBlock`) plus
@@ -412,7 +412,7 @@ an environment edge — the rooting traps in §7 apply).
 real modelling bug: `TemplateSub` is a pop *and* a push, but `stack_delta`
 charged it −1, so every substitution drifted the block depth down and any body
 with a template before a conditional was refused as `Malformed("stack
-underflow")` — that is what kept the template fixture's 40-step body out.
+underflow")`, that is what kept the template fixture's 40-step body out.
 
 Measured outcome: **parity, not speed** (1.002–1.020× against `SLAG_OPT=0` over
 three five-round runs on both fixtures; corpus 2.62–2.70× node, differential
@@ -421,24 +421,24 @@ are gone; the two fixtures are still allocation- and call-bound, which is A0
 and D5/E, not coverage. The one refusal left in either fixture is
 `UpdateContextSlot`, the deliberate one the notes' test pins.
 
-**A1b — the register body's member leaf ops (S3) and stores (S4).** Lift
+**A1b, the register body's member leaf ops (S3) and stores (S4).** Lift
 `GetMemberNameLocal`/`GetMemberComputedLocal` to `MemberLoad`/`MemberCellLoad` +
 `MemberGuard` (read-only first, as S3 was scoped), then `BinAccPop`, `UpdateAcc`
 and the member stores. Probe: `JIT_DUMP_STEPS` bodies per row, before/after, and
 for each newly lifted body its helper census against the per-step body's.
 **Accept:** every newly lifted row ≤ its per-step time; corpus differential
 exact; the `installed_jit_*_inlines` tests pass without forcing.
-**Stop rule:** a newly lifted row >2% slower means a missing parity port — port
+**Stop rule:** a newly lifted row >2% slower means a missing parity port, port
 it before proceeding, never carry a regression into the next cut.
 
-**A2 — the hoist probe: blocked on the type prover (attempted and measured
+**A2, the hoist probe: blocked on the type prover (attempted and measured
 2026-11-14).** The largest coverage bucket (§3, six rows) is not a missing step
 but a deliberately refused terminator: `emit_fused_test` models
 `HoistMemberGuard`/`HoistGlobalGuard` as "always miss", which measured
 `objects/own_read` **+571%** and the `globals/*` rows ~**+60%** each against
 `SLAG_OPT=0`, so it refuses instead.
 
-The probe itself is easy to model and was implemented and measured twice. Attempt one: an `Op::HoistGuard` lowered to one helper call (`hoist_guard`, running the interpreter's own probe through a shared `Vm::hoist_member_guard` / `Vm::hoist_global_guard`), branching to the guarded copy on a hit and the general copy on a miss. Every one of the six rows lifted, and every one got **slower**: opt / per-step, min-of-5, same binary, `own_read` 3.52, `nested_read` 1.54, `object_read` 1.44, `declarative_read` 1.44, `proto_read` 1.08, `obj_prop` 1.00 (the last also returned a wrong value). Attempt two added slot-precise promotion — the probe's slots carried in `Imm::Hoist` and flushed before it, so the loop accumulator stays an SSA candidate instead of forbidding promotion of the whole frame: 1.36–3.62× still, `obj_prop` at parity only because its int path now refuses. Both attempts are reverted.
+The probe itself is easy to model and was implemented and measured twice. Attempt one: an `Op::HoistGuard` lowered to one helper call (`hoist_guard`, running the interpreter's own probe through a shared `Vm::hoist_member_guard` / `Vm::hoist_global_guard`), branching to the guarded copy on a hit and the general copy on a miss. Every one of the six rows lifted, and every one got **slower**: opt / per-step, min-of-5, same binary, `own_read` 3.52, `nested_read` 1.54, `object_read` 1.44, `declarative_read` 1.44, `proto_read` 1.08, `obj_prop` 1.00 (the last also returned a wrong value). Attempt two added slot-precise promotion, the probe's slots carried in `Imm::Hoist` and flushed before it, so the loop accumulator stays an SSA candidate instead of forbidding promotion of the whole frame: 1.36–3.62× still, `obj_prop` at parity only because its int path now refuses. Both attempts are reverted.
 
 The blocker is the body's shape, not the probe, and it is now precise:
 
@@ -446,7 +446,7 @@ The blocker is the body's shape, not the probe, and it is now precise:
   writing the same frame slots, and `narrow`'s slot prover is whole-body and
   flow-insensitive. The general copy's imprecise store is evidence against the
   guarded copy, so the guarded copy's `+` lowers to the branchy checked path
-  (or worse, `binary_slow`) while the per-step tier gets a bare f64 add — the
+  (or worse, `binary_slow`) while the per-step tier gets a bare f64 add, the
   guarded copy measured 0.72 ns/iteration per-step against 2.55 ns in the opt
   tier. The guard's own facts (`prim_slots`, `numbers`, `int_slots`, `reads`
   with `strict`) are exactly the missing proof.
@@ -460,11 +460,11 @@ The blocker is the body's shape, not the probe, and it is now precise:
   (`opt:int-operand`, tested), so the class is a per-step fallback rather than a
   miscompile.
 
-So A2 is two cuts, in this order: **(a)** make the type facts region-scoped — the
+So A2 is two cuts, in this order: **(a)** make the type facts region-scoped, the
 guard's payload applied to the blocks its hit edge dominates (a forward
 must-analysis: intersect the facts over each block's predecessors, with the
 hit edge adding the guard's own), which also fixes the lift discarding
-`BinStoreNum`'s proof — then **(b)** re-land the probe model: an
+`BinStoreNum`'s proof, then **(b)** re-land the probe model: an
 `Op::HoistGuard` (`Imm` = the step index and the slots it addresses,
 `Type::Bool`, `Effects::call()`) lowered to one `hoist_guard(ctx, step)` helper
 call that returns the hit and has already written the hidden slots, the lift
@@ -473,7 +473,7 @@ miss branches to `jump_target`, and `mem2reg` flushing a promoted slot before
 the probe that names it. **Accept:** every one of the six rows ≤ its per-step
 time; `HoistGuard` drops out of the refusal census.
 
-**A3 — name the emit refusal (landed 2026-11-14).** `step_name` now names every
+**A3, name the emit refusal (landed 2026-11-14).** `step_name` now names every
 family that has appeared as a corpus first blocker (`HoistGuard`, `Switch`,
 `Try`, `Generator`, `UpdateContextSlot`), and the second-pass terminator refusal
 (`emit_fused_test`) reports through `report_refusal` like the per-step path, so
@@ -482,41 +482,41 @@ anonymous `Step("step")` bucket is gone from the corpus; the probe's own
 history is the reason it existed (`report_refusal` had one call site, and
 `step_name`'s catch-all was the only name for a try/switch/generator step).
 
-**A4 — `SwitchDisc` and the register-body leaf ops come next**, in whichever
+**A4, `SwitchDisc` and the register-body leaf ops come next**, in whichever
 order the refusal census shows the most rows behind. Neither has a measured
 pessimization attached yet, so both are parity cuts, not re-enablers.
 
 **B (residue).** The census says the median row has 1 avoidable conversion per
 iteration, so the phase as written is not worth its risk. What survives:
-- **B1 — the `compute`-caused `Int` widens** (`int` median 1, max 7): each is an
+- **B1, the `compute`-caused `Int` widens** (`int` median 1, max 7): each is an
   op with no int lane. Only worth doing per-op, with the census row as the
   before/after, and only on the six rows with ≥5.
-- **B2 — the `Float` boundary.** Already correct (`canon_double` at the
+- **B2, the `Float` boundary.** Already correct (`canon_double` at the
   materialization, one funnel); keep the census's `raw f64 without Canon`
   invariant at zero. It is the cheapest check that a later pass did not break
   the funnel.
-- **B3 — a `Bool` lane** (i1/i8) is the one representation change with a
+- **B3, a `Bool` lane** (i1/i8) is the one representation change with a
   plausible payoff (`Lt → Branch` and every `JumpIfTrueKeep` chain), but the
   census charges those to `compute` at ≤2/iteration on the median row: measure
   before building it.
 
-**C1 — keep the refusal, and make it explicit.** Today `non_heap_slots` is the
+**C1, keep the refusal, and make it explicit.** Today `non_heap_slots` is the
 policy but nothing states it as one: a heap-typed slot is never promoted, so a
 heap value lives at level 1 and is rooted. Document it at `promote_frame_slots`
 and add the test that a promoted slot's *load* after a call re-reads the frame
 (the slot-observing-call trap, §7).
 
-**C2 — the stack map.** Cranelift user stack maps per safepoint; the collector
+**C2, the stack map.** Cranelift user stack maps per safepoint; the collector
 walks them for the PC's code range. Prerequisite for any cut that keeps a heap
-reference at level 2 (a generalized E, an inlined callee's context) — and now
+reference at level 2 (a generalized E, an inlined callee's context), and now
 for D5 (§4). **Accept:** `--gc-stress` and `--gc-verify` exact on every row whose
 body holds a heap value across an allocation; a targeted test that allocates
 under a live register-held reference with `--nursery-stress`.
 
 **Slice 1 landed 2026-11-14: the mechanism.** `cranelift-codegen 0.134.3` has
-user stack maps — `DataFlowGraph::append_user_stack_map_entry` attaches entries
+user stack maps, `DataFlowGraph::append_user_stack_map_entry` attaches entries
 to a safepoint instruction and `MachBufferFinalized::user_stack_maps` returns
-them finalized — so `assemble` now extracts every map into `Compiled::maps`
+them finalized, so `assemble` now extracts every map into `Compiled::maps`
 (`StackMap { offset, entries: [StackEntry { sp_offset, width }] }`), keyed by the
 safepoint's code offset with the SP-relative offsets already resolved by
 regalloc, and `JIT_DUMP_STACKMAP` prints them. A test compiles a hand-built CLIF
@@ -529,7 +529,7 @@ a collection is the collector registry plus the PC lookup (slice 3). A body with
 no maps compiles to exactly the code it did before.
 
 **Slice 2 landed 2026-11-14: liveness.** `opt::live` answers the producer's
-question — `safepoint_roots` runs a backward data-flow fixpoint over the SSA CFG
+question, `safepoint_roots` runs a backward data-flow fixpoint over the SSA CFG
 (a successor's `live_in` flows into this block's exit; loops need the fixpoint)
 and reports, per call, the values live *after* it, excluding the call's own
 result and filtered to the types that may be a GC reference (`Unknown`, `Object`,
@@ -547,9 +547,9 @@ naming `Op::Call | Op::Intrinsic` is a claim about `emit_leaf_call` that must be
 re-checked whenever a new call-emitting op lands.
 
 **Slice 3 (landed 2026-11-14): spill and declare, gated.** `SLAG_STACKMAPS`
-spills the whole root set into sized stack slots — each initialized to
+spills the whole root set into sized stack slots, each initialized to
 `undefined` in the prologue and rewritten at every definition and block
-parameter, so a slot always holds a valid `Value` — and names every slot in a
+parameter, so a slot always holds a valid `Value`, and names every slot in a
 stack map at **every** safepoint in the body. Threading a root set through the
 lowering's call funnels (`call_helper`, the four leaf-lane `call_indirect`s,
 `call_slow`) was the alternative; naming the full set at each call instead
@@ -559,20 +559,20 @@ walking the CLIF layout for `opcode().is_safepoint()`, so a new call-emitting op
 needs no change here.
 
 Measured on the probe bodies: 71 safepoint maps, 10 entries each, and the rows
-do not move — `d4` 2.07-2.09 → 2.09-2.16 ms, `e4` 20.5 → 20.7-21.5 ms — because
+do not move, `d4` 2.07-2.09 → 2.09-2.16 ms, `e4` 20.5 → 20.7-21.5 ms, because
 those ten candidates are defined *outside* the loop, so the spill stores run
 once per body rather than per iteration. A body that redefines them inside the
 loop would pay per iteration and is not measured; that is the case to check
 before the set is narrowed. Results are identical with the gate on and off over
 `opcost` in both `jit` and `jitless`.
 
-Still off by default, and the maps are still not **walked** — and that is where
+Still off by default, and the maps are still not **walked**, and that is where
 the arc stops, for a reason outside this crate.
 
 **Slice 4 is blocked on a native-code convention** (found 2026-11-14 reading
 Cranelift). A map's offsets are SP-relative: `sp_to_sized_stack_slots()` is the
 frame's `outgoing_args_size`, added to each sized slot's frame offset, so the
-base is `rsp` at the safepoint. CLIF cannot produce that value — `stack_addr`
+base is `rsp` at the safepoint. CLIF cannot produce that value, `stack_addr`
 addresses a sized slot, and there is no `get_sp`/`get_fp` instruction in
 0.134.3. So a helper called from compiled code cannot be handed the base its
 callee `rsp` is offset from by the return address and its own prologue, and no
@@ -582,8 +582,8 @@ captures `rsp` at the call and passes it as an extra argument to every helper
 convention with the same shim to read it. Both are an ABI change, and neither
 belongs inside this cut.
 
-**Consequence: D5 does not need any of this.** The fused loop's roots — the
-array and the callback — can live in traced `vm.stack` storage (the
+**Consequence: D5 does not need any of this.** The fused loop's roots, the
+array and the callback, can live in traced `vm.stack` storage (the
 scratch-slot variant this note rejected earlier as the fallback), which the
 collector already walks: no map, no SP, no shim. C2's *register* case is the
 only thing the shim buys, so the order returns to **D5 via traced slots first**,
@@ -591,9 +591,9 @@ with the shim only if a later cut genuinely needs a heap value in a register
 across a safepoint. Slices 1-3 stay as the producer half, gated off, and are
 the thing to finish if that cut appears.
 
-**D5 — the callback lane.** `array.forEach(cb)` and friends re-enter the generic
+**D5, the callback lane.** `array.forEach(cb)` and friends re-enter the generic
 call funnel per element. Sized 2026-11-14: `opcost/array_for_each` 22.4 ms
-against its hand-written twin `array_for_each_js` at 3.55 ms — **6.3×** — and the
+against its hand-written twin `array_for_each_js` at 3.55 ms, **6.3×**, and the
 same shape in `map_for_each`/`typed_array_for_each`, so ~50 ms corpus-wide.
 
 **Split 2026-11-14** with a four-file probe (100k outer iterations each, min of
@@ -601,7 +601,7 @@ three):
 
 | probe | jit | jitless | per unit |
 |---|---:|---:|---|
-| the outer loop plus `a.length` (base) | 0.585 | 2.77 | — |
+| the outer loop plus `a.length` (base) | 0.585 | 2.77 |, |
 | four compiled direct calls `cb(a[0..3])` (the twin) | 2.15 | 14.0 | **3.9 ns/call** |
 | `[1].forEach(cb)` | 8.8 | 9.65 | **~41 ns fixed** per call |
 | `[1,2,3,4].forEach(cb)` | 21.0 | 18.1 | 41 ns + **40.7 ns/element** |
@@ -611,7 +611,7 @@ is ~90% lane (21.0 against the twin's 2.15) and splits ~20/80 between a fixed
 per-`forEach` cost and a per-element one; the per-element 40.7 ns against a
 compiled call's 3.9 ns is **10.4×**. Second, **the callback is already compiled
 and compiling it is not what the row is paying for**: `CallbackVm::call` →
-`run_leaf_entry` → `try_jit_leaf`, so the machine code runs — and `forEach` is
+`run_leaf_entry` → `try_jit_leaf`, so the machine code runs, and `forEach` is
 *slower* with the JIT than without it (21.0 against 18.1), because `run_jit_leaf`
 costs the code-cache `lookup_info`, the `leaf_gen` bump G15 requires at
 `jit_depth == 0`, the `LeafEntry` clone, `running_context`, `rebind`, `retarget`
@@ -630,9 +630,9 @@ two fixtures (node eliminates their per-iteration closures outright). **Accept:*
 
 **Landed 2026-11-14: the lane stops choosing the slower lane.** The premise
 correction above has a direct use. If a small leaf body runs faster through the
-interpreter than through the compiled lane — because from a Rust caller the JIT
+interpreter than through the compiled lane, because from a Rust caller the JIT
 entry point pays `lookup_info`, the `leaf_gen` bump and the whole `run_jit_leaf`
-prologue per element — then the callback lane should not enter it.
+prologue per element, then the callback lane should not enter it.
 `CallbackVm::call` now runs a leaf of at most 8 steps through
 `run_leaf_entry_interpreted`, which skips `try_jit_leaf` entirely. Measured,
 three interleaved pairs, same session:
@@ -649,7 +649,7 @@ and after in both modes. It lands *below* the jitless column (18.1) because the
 caller's loop is still compiled and only the callback changed lanes. What is
 left is the 4.1× to the twin (14.7 against 3.56), which is the fused loop's job.
 
-This corrects a claim made earlier in this note — "there is nothing to win by
+This corrects a claim made earlier in this note, "there is nothing to win by
 shaving the Rust dispatch either". That was true *of the compiled lane*; the win
 was in not entering it at all.
 
@@ -659,7 +659,7 @@ already gives the three things the loop needs: the *recognition* (`try_compile_i
 matches a member call by property name, so `.forEach(` reaches it with no lift
 pattern and no bytecode change), the *identity guard* (`do_call_intrinsic`
 compares the resolved callee against `realm.intrinsics.intrinsic(kind)` and
-returns `false` to fall back to `do_call_fast` — a shadowed `forEach` therefore
+returns `false` to fall back to `do_call_fast`, a shadowed `forEach` therefore
 cannot take the fast path), and the *fallback*. `intrinsic_bits` publishes a
 kind's identity generically (`for (slot, kind) in bits.iter_mut().zip(INTRINSICS)`),
 so the JIT's `emit_intrinsic` guard needs no change either.
@@ -667,20 +667,20 @@ so the JIT's `emit_intrinsic` guard needs no change either.
 Two things to watch. The compiler must restrict the shape (`argc == 1`, as
 `ArrayPush` restricts its single-element form), and **`emit_intrinsic`'s inner
 `match` returns `Unsupported` for an unhandled kind, which drops the whole body
-out of the optimizing tier** — so a new kind needs a JIT arm in the same change
+out of the optimizing tier**, so a new kind needs a JIT arm in the same change
 as the interpreter arm, even if that arm only routes to the shared slow path.
 Otherwise every body containing a `.forEach(` loses the tier, which on this
 corpus row is exactly the hot caller.
 
 The loop body itself is `for_each`'s element walk (`dense_own_element`, else the
 chain via `JsObject::has_property` + `get_property`) with the callback run on
-*this* Vm instead of a pooled one — the leaf lane `CallbackVm` uses, minus the
+*this* Vm instead of a pooled one, the leaf lane `CallbackVm` uses, minus the
 builtin dispatch, `to_object`, `length_of_array_like` and the pool round trip.
 
 **D5 is blocked on C2, which §5 did not price** (found 2026-11-14 reading
 `opt_lower.rs`). A fused loop must hold the array and the callback across every
 `emit_leaf_call` in its body, and that is a heap reference live at a safepoint
-inside compiled code — exactly what C1's policy forbids. The tier's answer today
+inside compiled code, exactly what C1's policy forbids. The tier's answer today
 is the refusal: a heap value is never promoted, so it lives at level 1 in a
 frame slot. `Op::Call` can hold `callee`/`this` in SSA only because it needs
 them *up to* the call, never after it, and the helper roots its own arguments
@@ -690,18 +690,18 @@ for the duration of the loop, and there is nothing to use: the opt tier has no
 scratch-slot allocator (the frame layout is the body's own slots), the calling
 convention places the callee's frame above `args_ptr + argc*8` so the working
 region cannot be borrowed, and reloading the operands' *own* locals per
-iteration is wrong — the spec captures the callback value once, and the body
+iteration is wrong, the spec captures the callback value once, and the body
 may reassign the local.
 
 So §5's "C2 before any level-2 heap value ... nothing above requires it,
 because the tree's policy is refusal" is false for D5 as written: **D5 is the
 first cut that requires it**, and so is E, whose scalar replacement keeps a
 field that holds a heap value. The order becomes C2 → D5 → E, and D5 is not
-the next cut. The alternative to C2 — two scratch frame slots per fused loop —
+the next cut. The alternative to C2, two scratch frame slots per fused loop,
 is a frame-layout change (the layout is a measured trap, §7), so it is the
 fallback, not the plan.
 
-**E (residue) — escape analysis beyond literals.** `pass/scalar.rs` already
+**E (residue), escape analysis beyond literals.** `pass/scalar.rs` already
 scalar-replaces a whole `ObjectFast`/`ArrayFast` whose reads are all
 constant-keyed. Generalizing it needs a body big enough to contain both the
 allocator and the consumer (i.e. D5-scale inlining) and C2 for a field that
@@ -710,14 +710,14 @@ if the surviving allocation count barely moves, go back to A, not deeper into E.
 Do not re-open the `JsObject` layout for allocation speed: shrinking it is a
 measured non-win (`{}` −1.4%, `[]` +32%, corpus +2…5%).
 
-**F1 — `clobberize`.** Effects are over-approximated (`default_effects` gives
+**F1, `clobberize`.** Effects are over-approximated (`default_effects` gives
 bit ops and comparisons `Effects::call()`). This is now the *next* thing with a
 measured consumer, unlike on 2026-10-09: `mem2reg`'s slot promotion, `licm` and
 `cse` all run, and the census reports the conversions an over-approximation
 forces. Order it after A1/A2 (coverage) and D5 (body size), and measure the
 census before and after the narrowing.
 
-**F2 — GVN/load elimination.** LICM and CSE have landed; the remaining read rows
+**F2, GVN/load elimination.** LICM and CSE have landed; the remaining read rows
 (`proto_read`, `many_objects_read`, `compound_assign`, `element_*`) are
 coverage-blocked (§3), not pass-blocked, which is why they come after A1.
 
@@ -744,7 +744,7 @@ name is a bucket you cannot size.
   for A0 on those rows, but the allocation cost is what has to move.
 - **D5 before E**: escape analysis has nothing to work on until a call boundary
   disappears, and the callback row is where the call traffic is.
-- **C2 before any level-2 heap value — which now means before D5 and E.**
+- **C2 before any level-2 heap value, which now means before D5 and E.**
   Nothing in A requires it, because the tree's policy is refusal; but D5's fused
   loop holds the array and the callback across the calls in its body (§4 D5 has
   the argument) and E's scalar replacement holds a field, so both pay for the
@@ -785,10 +785,10 @@ Non-negotiable, from the accumulated lessons (`.agents/skills/slag-perf-measurem
 
 ## 7. Traps (consolidated)
 
-Still live from the earlier notes: **`JIT_MAX_COMPILE_STEPS`** (128/1024 —
+Still live from the earlier notes: **`JIT_MAX_COMPILE_STEPS`** (128/1024:
 inlining grows bodies and an oversized one silently returns to the interpreter);
 **GC roots in optimized frames** (level 2 is invisible to the conservative scan,
-and a promoted *heap* slot unroots it — the barrier-UAF class); **resume
+and a promoted *heap* slot unroots it, the barrier-UAF class); **resume
 fidelity** (`e.stack`, `using` disposal, inlined-frame naming have each broken
 once; retirement makes resumption the common path); **the leaf lane** (no deopt
 path); **the helper ABI is a four-file mirror**; **sealed-block discipline**;
@@ -831,8 +831,8 @@ Added 2026-11-14 by the B0 census:
   fail `stack_delta` when `JIT_DUMP_STEPS` is on, and `opt-refuse` the single
   step an emit actually failed on. A shape refusal (a `LeafOp` outside the
   register-body table, the string-builder `BuilderBind { slot: Some(..) }`) has
-  no blockers at all. Read all three before calling a bucket a coverage gap —
-  the first version of this session's census called nine rows "shape refusals"
+  no blockers at all. Read all three before calling a bucket a coverage gap.
+  The first version of this session's census called nine rows "shape refusals"
   when three of them were plainly step-level (`Yield`, `SwitchDisc`, `EnterTry`)
   and only the coarse name hid it.
 - **A guarded body has two loop copies, and the slot prover is flow-insensitive.**
@@ -848,7 +848,7 @@ Added 2026-11-14 by the B0 census:
   `emit_leaf_op` emits through `binary_type(Op::Add)`, which is `Unknown`, so
   the IR starts unproven and depends on `narrow` re-deriving a fact it was
   handed. Typing the numeric leaf's result `Number` is sound and independent of
-  the hoist work — a separate, cheap cut.
+  the hoist work, a separate, cheap cut.
 - **`IntAdd`/`IntSub`/`IntMul` require `Int` operands, and the lowering now
   checks.** A pass that demotes a producer to a `Value` word leaves the `Int` op
   adjacent to tag bits; `iadd` on those is a wrong value, not a slow path
@@ -872,7 +872,7 @@ Added 2026-11-14 by the B0 census:
   the row.
 - **A refusal that moves later can expose a genuine underflow.** Widening the
   lift moved the template fixture's 40-step body from `Step("Binary")` to
-  `Malformed("stack underflow")` — a latent lift bug previously masked by the
+  `Malformed("stack underflow")`, a latent lift bug previously masked by the
   earlier bail. Both are refusals (the body still runs per-step), but the second
   means the lift's stack model is wrong somewhere in that body's shapes; treat a
   reason change after a widening as a new work item, not as "still refused".
@@ -887,16 +887,16 @@ Added 2026-11-14 by the B0 census:
   written: it drifts every later join by one per occurrence and refuses the
   body as `Malformed("stack underflow")` at the first conditional after it. The
   drift is uniform along a path, so joins stay consistent and nothing
-  miscompiles — the symptom is always a refusal, and the reason names a step
+  miscompiles, the symptom is always a refusal, and the reason names a step
   that is not the culprit.
 - **A hypothesis that names a chunk is not a measurement that locates it.** The
   missing quarter of the closure path looked like caller-side `Rc` clones;
   instrumenting both sides showed ~70 cycles of call overhead and put the rest
   *inside* the callee, between phase boundaries. Instrument the other side
-  before designing the cut — this guess was simply wrong.
+  before designing the cut, this guess was simply wrong.
 - **Boxing an id-keyed record map does not pay.** The `register` phase read 195
   cycles and the record is ~30 fields, so `IdMap<Box<EcmaFunction>>` looked like
-  the fix; measured, it is **326** — the box is a malloc per closure and the
+  the fix; measured, it is **326**, the box is a malloc per closure and the
   move it removes is cheaper than that. The insert's cost is the table, not the
   value's size; removing it means a dense `Vec` keyed by the id, not a box.
 - **A corpus total is only comparable within a session and a corpus size.** The
@@ -915,7 +915,7 @@ Added 2026-11-14 by the B0 census:
    implemented. A `Bool` representation would be the same place.
 2. **Stack map vs refusal** (§2). C1 first regardless; C2's timing depends on
    whether a level-2 heap value is attempted in this arc.
-3. **Whether `Op::Call` keeps a general lowering.** Yes — the splice falls back
+3. **Whether `Op::Call` keeps a general lowering.** Yes, the splice falls back
    to it on a `CalleeEq` mismatch (`276979d4`), so the non-inlined lowering must
    stay identical in meaning (single-sourced).
 4. **The inlining budget.** I5a says 128 steps captures 95/97 sites and the

@@ -3,8 +3,8 @@
 The standing record for speed work: where the engine is now, what it holds every
 change to, and the one plan that carries the rest. This file was restarted
 2026-11-14 when the register/materialization arc closed at parity; the history
-before it — the dated journal, the failed-experiment register, and the per-arc
-records — is at `.notes/archive/perf/` (indexed in its `README.md`).
+before it, the dated journal, the failed-experiment register, and the per-arc
+records, is at `.notes/archive/perf/` (indexed in its `README.md`).
 
 ## Where we are (2026-11-14)
 
@@ -38,28 +38,28 @@ roughly a quarter of it. Quote one or the other, never a mix.
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at
-parity: the lifts that admit more bodies to the optimizing tier — the
-per-iteration environment family, `is()`, `!==` — measured 1.002–1.020x against
+parity: the lifts that admit more bodies to the optimizing tier, the
+per-iteration environment family, `is()`, `!==`, measured 1.002–1.020x against
 `SLAG_OPT=0`. That is coverage, not speed, and it is worth having, but it is not
 a lever.
 
 The remaining gap is structural. Function-object creation costs ~340 ns per
 closure where node eliminates a non-escaping closure outright (0.6 ns per
-iteration), and the two `language` fixtures — which create closures per
-iteration inside a `for (let x in obj)` head — are ~45% of the corpus's total
+iteration), and the two `language` fixtures, which create closures per
+iteration inside a `for (let x in obj)` head, are ~45% of the corpus's total
 gap. No amount of register traffic reaches that.
 
 ## What is next
 
 `.notes/register-tier-plan.md` is the plan of record, and its §5 ordering is
-not the phase list read top to bottom: **A0** — function-object creation itself,
-the ~340 ns term — gates the corpus total, because the two `language` fixtures
+not the phase list read top to bottom: **A0**, function-object creation itself,
+the ~340 ns term, gates the corpus total, because the two `language` fixtures
 are ~45% of the gap and the closure path is two thirds of the larger one. A1/A1b
 (coverage) is a precondition on those rows but is not what has to move, **D5**
 (the callback lane) must precede **E** (generalized escape analysis) because
 escape analysis has nothing to work on until a call boundary disappears,
 **F1/F2** (the effect oracle, then GVN/loads) follow, and **B** (the typed value)
-is off the critical path — the §1.3 census says the materialization residue is
+is off the critical path, the §1.3 census says the materialization residue is
 small. C2 (a stack map) is owed by the first cut that keeps a heap reference in
 a register. §1 has the census and the ablation, §7 the traps.
 
@@ -68,7 +68,7 @@ a register. §1 has the census and the ablation, §7 the traps.
 Every performance change carries its own documentation in the same commit, and
 holds all of:
 
-- the corpus differential exact — `mismatches=0` across `jit`, `jitless`, node,
+- the corpus differential exact, `mismatches=0` across `jit`, `jitless`, node,
   and node `--jitless`, with identical results under `--gc-stress` and
   `--nursery-stress`;
 - test262 `language`, `built-ins`, and `annexB` at 0 fail in both modes;
