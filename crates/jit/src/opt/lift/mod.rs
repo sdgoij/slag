@@ -430,7 +430,8 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                     ));
                 }
                 let (cond, jump_when_true) =
-                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz, *counter)?;
+                    emit_fused_test(&mut builder, bi as BlockId, &steps[ti], tdz, *counter)
+                        .inspect_err(|e| report_refusal(&steps[ti], e))?;
                 let target = jump_target(&steps[ti]).ok_or(Unsupported::Invalid)?;
                 let sb = block_of[target] as BlockId;
                 let fb = block_of[end] as BlockId;
@@ -2514,13 +2515,22 @@ fn emit_fused_test(
         // A LICM hoist guard: the compiler's pre-loop probe that hoists the
         // loop's invariant member/global reads into hidden slots. On a hit the
         // GUARDED copy (the fall-through) runs with the reads done once; on a
-        // miss the general copy. The lift models "always miss", which is a
-        // PESSIMIZATION, not a neutral choice: the per-step tier takes the hit
-        // and reads once, so an always-miss opt body runs every read per
-        // iteration. Measured (min-of-3, opt vs `SLAG_OPT=0`): `objects/own_read`
-        // +571%, and the `globals/declarative_read`/`nested_read`/`object_read`
-        // rows ~+60% each. Absent a modelled probe, refuse so those bodies run
-        // the per-step tier, which implements the guard (the parity contract).
+        // miss the general copy.
+        //
+        // The probe IS modelled (`Op::HoistGuard` → the interpreter's own
+        // `Vm::hoist_*_guard`, by the shared `hoist_guard` helper), and lifting
+        // it is refused anyway, on a measurement: the guarded and general
+        // copies are two loops writing the same slots, and `narrow`'s
+        // whole-body, flow-insensitive slot prover then takes the general
+        // copy's imprecise store as evidence against the guarded copy. Every
+        // accumulator read loses its Number proof, so each `+` lowers to the
+        // `binary_slow` helper while the per-step tier still inlines it. Opt /
+        // per-step for the six rows this unblocks, min-of-5, same binary:
+        // `own_read` 3.52, `nested_read` 1.54, `object_read` 1.44,
+        // `declarative_read` 1.44, `proto_read` 1.08, `obj_prop` 1.00 (the
+        // last also miscompiled until the raising ops started validating their
+        // operands: see `opt:int-operand`). So refuse — the parity contract —
+        // until the prover can consume the guard's own type facts.
         Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => {
             return Err(Unsupported::Step(step_name(step)));
         }
@@ -2663,6 +2673,23 @@ fn step_name(step: &Step) -> &'static str {
         // I4a: name the intrinsic call (the `Math.*`/array/collection sweep),
         // so the coverage probe can count bodies gated on it.
         Step::CallIntrinsic { .. } => "CallIntrinsic",
+        // The LICM hoist guards are refused *by design* (an always-miss opt
+        // body is a measured pessimization — see `emit_fused_test`), so the
+        // bail names the reason rather than falling into the anonymous `step`
+        // bucket: these bodies are outside the tier until the probe is
+        // modelled.
+        Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => "HoistGuard",
+        // The try/catch, switch, generator and context-update families: each
+        // needs machinery this lift does not model, and each has appeared as a
+        // first blocker in the corpus, so name it for the coverage probe.
+        Step::LeaveBlock | Step::Exit { .. } | Step::EnterTry { .. } | Step::CatchBind { .. } => {
+            "Try"
+        }
+        Step::SwitchDisc | Step::SwitchTest { .. } => "Switch",
+        Step::Break { .. } => "Break",
+        Step::Continue { .. } => "Continue",
+        Step::Yield { .. } => "Generator",
+        Step::UpdateContextSlot { .. } => "UpdateContextSlot",
         // The fused canonical `for` loop family (the lift's remaining I2 part);
         // named so the probe can tell a body blocked solely on it + the
         // intrinsic apart from one with other blockers.
@@ -3018,6 +3045,32 @@ mod tests {
             lift(&b).is_err(),
             "the captured-slot update stays on the per-step path"
         );
+    }
+
+    #[test]
+    fn names_the_hoist_guard_refusal() {
+        // The LICM hoist guards are refused by design (an always-miss opt body
+        // is a measured pessimization — `emit_fused_test`), so a body blocked
+        // on one must report `Step("HoistGuard")`, not the anonymous
+        // `Step("step")` bucket the coverage probe cannot attribute.
+        let member = Step::HoistMemberGuard {
+            reads: Vec::new(),
+            prim_slots: Vec::new(),
+            numbers: false,
+            int_slots: Vec::new(),
+            target: 0,
+        };
+        let global = Step::HoistGlobalGuard {
+            reads: Vec::new(),
+            env: false,
+            target: 0,
+        };
+        assert_eq!(step_name(&member), "HoistGuard");
+        assert_eq!(step_name(&global), "HoistGuard");
+        // The step-level refusals name their family too, so `opt bail` and the
+        // precise `opt-blockers` list agree in kind.
+        assert_eq!(step_name(&Step::SwitchDisc), "Switch");
+        assert_eq!(step_name(&Step::LeaveBlock), "Try");
     }
 
     #[test]
