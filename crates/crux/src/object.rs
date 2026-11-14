@@ -1601,12 +1601,28 @@ impl JsObject {
     /// addresses the property vector at the descriptor ordinal, so the key
     /// must be appended at exactly that position (see the define paths).
     pub fn map_add_property_cell(&self, key: PropertyKey, attrs: MapAttrs) -> Option<Handle<Map>> {
+        self.map_add_property_cell_at(key, attrs)
+            .map(|(child, _)| child)
+    }
+
+    /// [`Self::map_add_property_cell`] plus the field offset the child
+    /// assigns the key: `add_descriptor` places a fresh key at the parent's
+    /// descriptor count, which is exactly the child's descriptor ordinal for
+    /// it. A define that already knows the key is absent can therefore write
+    /// the in-object field directly instead of re-finding the descriptor it
+    /// just created.
+    pub fn map_add_property_cell_at(
+        &self,
+        key: PropertyKey,
+        attrs: MapAttrs,
+    ) -> Option<(Handle<Map>, usize)> {
         let mut map = self.map.get()?;
+        let ordinal = map.descriptor_count();
         let child = map.get_or_create_child(key, attrs)?;
         crate::heap::write_barrier_handle(self, child);
         self.map.set(Some(child));
         self.bump_generation();
-        self.map.get()
+        Some((child, ordinal))
     }
 
     /// Whether a fresh key may transition this object's map: a transition
@@ -4163,6 +4179,19 @@ impl JsObject {
     /// machinery. Returns false when the receiver is not extensible (the
     /// caller then falls back to the full [[Set]]).
     pub fn fresh_data_define(&self, key: &PropertyKey, value: Value) -> bool {
+        self.define_fresh(key, value, true, true, true).is_some()
+    }
+
+    /// [`Self::fresh_data_define`] reporting where the key landed and whether
+    /// its descriptor is writable, so the caller's (map id, name) → slot cell
+    /// needs no descriptor re-scan. `None` when the define was refused; the
+    /// pair's first element is `None` when the key stayed vector-only (the
+    /// map does not describe it, so no shape-keyed cell may be recorded).
+    pub fn fresh_data_define_at(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+    ) -> Option<(Option<usize>, bool)> {
         self.define_fresh(key, value, true, true, true)
     }
 
@@ -4184,6 +4213,7 @@ impl JsObject {
         configurable: bool,
     ) -> bool {
         self.define_fresh(key, value, writable, enumerable, configurable)
+            .is_some()
     }
 
     /// Cut 67 batch entry: adopt a pre-forked vector-free shape in one step.
@@ -4342,6 +4372,10 @@ impl JsObject {
     /// `descriptor_count() < INLINE_FIELDS`; a fresh key at a full map
     /// materializes first and appends through the standard path below (its
     /// storage is the vector).
+    ///
+    /// Returns `None` when the define is refused, else the descriptor ordinal
+    /// the key occupies and whether that descriptor is writable. The ordinal
+    /// is `None` for a vector-only key (one the map does not describe).
     fn define_fresh(
         &self,
         key: &PropertyKey,
@@ -4349,9 +4383,9 @@ impl JsObject {
         writable: bool,
         enumerable: bool,
         configurable: bool,
-    ) -> bool {
+    ) -> Option<(Option<usize>, bool)> {
         if !matches!(self.kind, ObjectKind::Ordinary) || !self.extensible.get() {
-            return false;
+            return None;
         }
         if matches!(key, PropertyKey::String(_)) {
             self.bump_named_version();
@@ -4385,16 +4419,21 @@ impl JsObject {
                     self.props_deferred.set(true);
                     let _ = self.map_set(key, value);
                     self.bump_generation();
-                    return true;
+                    let writable = map.attrs_at(ord).is_some_and(|attrs| attrs.writable());
+                    return Some((Some(ord), writable));
                 }
                 self.materialize_properties();
             } else if map.descriptor_count() < INLINE_FIELDS {
-                if self.map_add_property_cell(key.clone(), attrs).is_some() {
-                    // Transition to the fresh descriptor and write the field.
+                if let Some((_, ordinal)) = self.map_add_property_cell_at(key.clone(), attrs) {
+                    // The fork placed the new descriptor at the parent's
+                    // descriptor count, which is the in-object field the key
+                    // occupies — so write it here instead of `map_set`, whose
+                    // descriptor scan would redo the lookup the fork just did.
+                    // `map_add_property_cell_at` already bumped the generation.
+                    crate::heap::write_barrier(self, value);
+                    self.in_fields[ordinal].set(value);
                     self.props_deferred.set(true);
-                    let _ = self.map_set(key, value);
-                    self.bump_generation();
-                    return true;
+                    return Some((Some(ordinal), writable));
                 }
                 // The map could not fork (a shared-handle mutation limit):
                 // fall through to the standard append with the flag clear.
@@ -4409,21 +4448,32 @@ impl JsObject {
         // Part B, B5.3/B5.4: transition the map for the fresh data
         // property and write the value into the field it assigned, so the
         // map-based read path serves it without a property-vector borrow. A
-        // key the object's map ALREADY describes (a constructor-boilerplate
+        // A key the object's map ALREADY describes (a constructor-boilerplate
         // pre-sized object) writes the field in place — the shape is fixed,
-        // so there is no transition (the `||` short-circuits it). A fresh
-        // key transitions only when the append is aligned (the vector holds
-        // exactly the map's described prefix), so the new descriptor's
-        // ordinal equals the key's vector position; a misaligned append (a
-        // non-transitionable define or a skipped boilerplate field earlier)
-        // leaves the key vector-only — the map keeps describing only keys
-        // whose ordinal equals their vector slot.
-        if self.map.get().is_some_and(|m| m.find(key).is_some())
-            || (self.map_transition_aligned()
-                && self.map_add_property_cell(key.clone(), attrs).is_some())
-        {
-            let _ = self.map_set(key, value);
-        }
+        // so there is no transition. A fresh key transitions only when the
+        // append is aligned (the vector holds exactly the map's described
+        // prefix), so the new descriptor's ordinal equals the key's vector
+        // position; a misaligned append (a non-transitionable define or a
+        // skipped boilerplate field earlier) leaves the key vector-only — the
+        // map keeps describing only keys whose ordinal equals their vector
+        // slot.
+        let field = match self.map.get().and_then(|m| m.find(key)) {
+            Some(ord) => {
+                let _ = self.map_set(key, value);
+                Some(ord)
+            }
+            None => {
+                let ordinal = self.map.get().map(|m| m.descriptor_count());
+                if self.map_transition_aligned()
+                    && self.map_add_property_cell(key.clone(), attrs).is_some()
+                {
+                    let _ = self.map_set(key, value);
+                    ordinal
+                } else {
+                    None
+                }
+            }
+        };
         let mut props = self.properties.borrow_mut();
         let position = props.len();
         crate::heap::write_barrier(self, value);
@@ -4443,7 +4493,9 @@ impl JsObject {
             index.insert(key.clone(), position);
         }
         self.bump_generation();
-        true
+        // A vector-only append is not described by the map, so its position
+        // is not one a shape-keyed cell may pin — `field` is `None` then.
+        Some((field, writable))
     }
 
     /// PrivateFieldAdd/PrivateMethodOrAccessorAdd storage (spec 10.2.10,

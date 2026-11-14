@@ -92,6 +92,24 @@ pub struct Map {
     back_pointer: Option<Handle<Map>>,
     /// Generation counter: bumped when this map's shape changes.
     generation: Cell<u32>,
+    /// The most recent STRING-KEY transition, probed before `transitions`.
+    /// A define loop rebuilds one shape sequence per iteration, so each
+    /// parent map is asked for the same child on every iteration; the
+    /// HashMap probe (an FxHash of the whole key plus a control-byte match)
+    /// is pure overhead on that repeat, and a map forks exactly the children
+    /// its shape supports, so one entry covers the repeat. Symbol keys keep
+    /// the HashMap path (a symbol is a heap edge the cell would have to
+    /// trace for every map); the cell's child is already kept alive by
+    /// `transitions`, and it is traced below anyway.
+    last_transition: Cell<Option<TransitionChild>>,
+}
+
+/// A map's most recent string-key transition (see `Map::last_transition`).
+#[derive(Debug, Clone, Copy)]
+pub struct TransitionChild {
+    pub atom: AtomId,
+    pub attrs: MapAttrs,
+    pub child: Handle<Map>,
 }
 
 /// Global monotonic counter for map identities.
@@ -128,6 +146,9 @@ impl Trace for Map {
         for child in self.composite.values() {
             child.trace(visit);
         }
+        if let Some(last) = self.last_transition.get() {
+            last.child.trace(visit);
+        }
         if let Some(bp) = self.back_pointer {
             bp.trace(visit);
         }
@@ -153,6 +174,7 @@ impl Map {
             composite: HashMap::default(),
             back_pointer,
             generation: Cell::new(0),
+            last_transition: Cell::new(None),
         })
     }
 
@@ -171,6 +193,13 @@ impl Map {
     /// The number of properties described by this map.
     pub fn descriptor_count(&self) -> usize {
         self.descriptors.len()
+    }
+
+    /// The attributes of the descriptor at `ordinal`, without the key clone
+    /// `descriptor_at` pays (a caller that already has the key does not need
+    /// it back).
+    pub fn attrs_at(&self, ordinal: usize) -> Option<MapAttrs> {
+        self.descriptors.get(ordinal).map(|(_, _, attrs)| *attrs)
     }
 
     /// Whether this map describes a plain, empty object (no properties).
@@ -254,7 +283,27 @@ impl Map {
         key: PropertyKey,
         attrs: MapAttrs,
     ) -> Option<Handle<Map>> {
+        let atom = match &key {
+            PropertyKey::String(atom) => Some(*atom),
+            _ => None,
+        };
+        // The repeat-transition fast path: a define loop rebuilding one shape
+        // sequence asks each parent for the same child every iteration.
+        if let Some(atom) = atom
+            && let Some(last) = self.last_transition.get()
+            && last.atom == atom
+            && last.attrs == attrs
+        {
+            return Some(last.child);
+        }
         if let Some(child) = self.transitions.get(&(key.clone(), attrs)) {
+            if let Some(atom) = atom {
+                self.last_transition.set(Some(TransitionChild {
+                    atom,
+                    attrs,
+                    child: *child,
+                }));
+            }
             return Some(*child);
         }
         // The offset must come from the box layout, never a literal.
@@ -269,6 +318,10 @@ impl Map {
         // parent: an old->young edge the minor collector must know about.
         crate::heap::write_barrier_handle(self, child);
         self.transitions.insert((key, attrs), child);
+        if let Some(atom) = atom {
+            self.last_transition
+                .set(Some(TransitionChild { atom, attrs, child }));
+        }
         Some(child)
     }
 

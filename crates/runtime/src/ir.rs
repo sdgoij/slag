@@ -7251,32 +7251,29 @@ impl Vm {
         if existing {
             return Ok(false);
         }
-        let ok = if let Some(proto) = receiver.get_prototype_of()? {
+        let defined = if let Some(proto) = receiver.get_prototype_of()? {
             if !Self::member_store_cell_probe(agent, &proto, *atom)
                 && !Self::member_store_cell_resolve(agent, &receiver, &property_key, *atom)
             {
                 return Ok(false);
             }
-            receiver.fresh_data_define(&property_key, *value)
+            receiver.fresh_data_define_at(&property_key, *value)
         } else {
             // No chain: [[Set]] always defines on the receiver.
-            receiver.fresh_data_define(&property_key, *value)
+            receiver.fresh_data_define_at(&property_key, *value)
         };
-        // Part B, B5.2/B5.4: `fresh_data_define` wrote the value into the
-        // field the map assigned (a fresh transition or a boilerplate
-        // pre-sized field) — cache the (map_id, name) → offset entry for the
-        // read path. A dictionary-mode define (map full) has no field.
-        if ok
-            && let Some(map) = receiver.map.get()
-            && let Some(slot) = map.field_offset(&property_key)
-        {
+        let Some((slot, writable)) = defined else {
+            return Ok(false);
+        };
+        // Part B, B5.2/B5.4: `fresh_data_define_at` reported the descriptor
+        // the define left (a fresh transition or a boilerplate pre-sized
+        // field), so the (map_id, name) → offset cell is recorded without
+        // re-finding the descriptor the define just created. A vector-only
+        // key reports no ordinal — it has no field to pin.
+        if let (Some(slot), Some(map)) = (slot, receiver.map.get()) {
             let map_id = map.id();
             let index = Self::member_map_cell_index(map_id, *atom);
             let (proto_id, proto_gen) = Self::member_map_proto(&receiver);
-            let writable = map
-                .find(&property_key)
-                .and_then(|ord| map.descriptor_at(ord))
-                .is_some_and(|(_, _, attrs)| attrs.writable());
             // `clean` 1: this fill only succeeded because the chain-verified
             // verdict (the probe above) held, so the cell records the
             // receiver's direct prototype for the compiled vector-free fill
@@ -7292,21 +7289,19 @@ impl Vm {
                 count: map.descriptor_count() as u32,
             };
         }
-        if ok {
-            // Cut 35 slice 32: the store-then-read pattern (a constructor
-            // writing `this.x` and the caller reading `o.x` right after) —
-            // front the just-defined property in the read-side value cache
-            // so the next `member_cell_get` returns it with no
-            // property-vector borrow or proto-keyed fallback.
-            let index = Self::member_cell_index(receiver.id(), *atom);
-            agent.roots.member_value_cells[index].set(MemberValueCell {
-                id: receiver.id(),
-                name: *atom,
-                generation: receiver.generation(),
-                value: *value,
-            });
-        }
-        Ok(ok)
+        // Cut 35 slice 32: the store-then-read pattern (a constructor writing
+        // `this.x` and the caller reading `o.x` right after) — front the
+        // just-defined property in the read-side value cache so the next
+        // `member_cell_get` returns it with no property-vector borrow or
+        // proto-keyed fallback.
+        let index = Self::member_cell_index(receiver.id(), *atom);
+        agent.roots.member_value_cells[index].set(MemberValueCell {
+            id: receiver.id(),
+            name: *atom,
+            generation: receiver.generation(),
+            value: *value,
+        });
+        Ok(true)
     }
 
     /// Resolve and cache the slot of `object`'s own data property for
