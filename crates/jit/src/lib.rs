@@ -3023,6 +3023,55 @@ mod tests {
     }
 
     #[test]
+    fn opt_wrapping_int_ops_refuse_word_operands() {
+        // `Op::IntAdd`/`IntSub`/`IntMul` lower to bare `iadd`/`isub`/`imul` on
+        // the premise that both operands are i32 registers. `narrow` can demote
+        // a producer to a `Value` word (a bit op whose whole-body slot proof
+        // fails — a body carrying two copies of a loop, e.g. a hoist guard's
+        // guarded and general copies, does this). The lowering must refuse then,
+        // not compute i32 arithmetic over tag bits: an `Int` op over word
+        // registers is a malformed body, and a refusal is a per-step fallback.
+        use crate::opt::builder::Builder;
+        use crate::opt::ir::{Effects, Function, Imm, Op, Term, Type};
+
+        let mut func = Function::new();
+        let entry = func.entry();
+        {
+            let mut b = Builder::new(&mut func);
+            let lhs = b.emit(
+                entry,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(1.0),
+            );
+            let rhs = b.emit(
+                entry,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(2.0),
+            );
+            let sum = b.emit(
+                entry,
+                Op::IntAdd,
+                &[lhs, rhs],
+                Type::Int,
+                Effects::pure(),
+                Imm::None,
+            );
+            b.term(entry, Term::Return(Some(sum)));
+        }
+        let engine = JitEngine::with_opt(true).expect("native isa");
+        assert!(
+            engine.compile_ir(&func, &helpers_none(), 2).is_none(),
+            "an Int op over Value-word operands must refuse, not iadd tag bits"
+        );
+    }
+
+    #[test]
     fn opt_guard_callee_holds_or_deopts() {
         // I5c-2b (`.notes/optimizing-tier-impl.md`): `Op::GuardCallee` asserted
         // on a hand-built IR body. On a match the guard yields the callee

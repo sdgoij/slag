@@ -553,8 +553,20 @@ fn lower_inst(
         // Wrapping i32 arithmetic (`IntAdd`/`IntSub`/`IntMul`): both operands are
         // i32 registers (the lift's register-body plan proved them int32), and
         // the op is exactly the spec's `ToInt32` of the f64 arithmetic, so it
-        // stays in i32 with no conversion.
+        // stays in i32 with no conversion. That premise is the op's *contract*:
+        // a pass that demotes a producer to a `Value` word (`narrow` does this
+        // to a bit op whose slot the whole-body prover cannot pin, which a body
+        // holding two copies of a loop — a hoist guard's guarded and general
+        // copies — makes likely) leaves an `Int` op over word registers, where
+        // `iadd` would compute on tag bits. Refuse instead of miscompiling.
         Op::IntAdd | Op::IntSub | Op::IntMul => {
+            let int_operands = inst
+                .args
+                .iter()
+                .all(|a| types.get(*a as usize) == Some(&Type::Int));
+            if !int_operands {
+                return Err(Unsupported::Step("opt:int-operand"));
+            }
             let lhs = value_of(values, inst.args[0])?;
             let rhs = value_of(values, inst.args[1])?;
             match inst.op {
