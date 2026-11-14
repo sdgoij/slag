@@ -2517,20 +2517,24 @@ fn emit_fused_test(
         // GUARDED copy (the fall-through) runs with the reads done once; on a
         // miss the general copy.
         //
-        // The probe IS modelled (`Op::HoistGuard` → the interpreter's own
-        // `Vm::hoist_*_guard`, by the shared `hoist_guard` helper), and lifting
-        // it is refused anyway, on a measurement: the guarded and general
-        // copies are two loops writing the same slots, and `narrow`'s
-        // whole-body, flow-insensitive slot prover then takes the general
-        // copy's imprecise store as evidence against the guarded copy. Every
-        // accumulator read loses its Number proof, so each `+` lowers to the
-        // `binary_slow` helper while the per-step tier still inlines it. Opt /
-        // per-step for the six rows this unblocks, min-of-5, same binary:
-        // `own_read` 3.52, `nested_read` 1.54, `object_read` 1.44,
-        // `declarative_read` 1.44, `proto_read` 1.08, `obj_prop` 1.00 (the
-        // last also miscompiled until the raising ops started validating their
-        // operands: see `opt:int-operand`). So refuse — the parity contract —
-        // until the prover can consume the guard's own type facts.
+        // The probe is modelled and lifting it is still refused, on measurement.
+        // `Op::HoistGuard` (through the shared `Vm::hoist_*_guard` methods) plus
+        // slot-precise promotion (the probe's operand slots are flushed before
+        // it, so the accumulator stays an SSA candidate) leave five of the six
+        // rows this unblocks 1.36–3.62× *slower* than the per-step tier
+        // (`own_read` 3.62, `object_read` 1.43, `nested_read` 1.36,
+        // `declarative_read` 1.36, `proto_read` 1.08; `obj_prop` at parity only
+        // because its int path now refuses).
+        //
+        // The reason is the body's shape, not the probe: a guarded body carries
+        // two copies of the loop writing the same slots, and `narrow`'s slot
+        // prover is whole-body and flow-insensitive, so the general copy's
+        // imprecise store is evidence against the guarded copy. The compiler
+        // proved the guarded copy numeric (`BinStoreNum`), and the lift throws
+        // that proof away (`binary_type(Op::Add)` is `Unknown`), so the proof
+        // has to be re-derived and cannot be. Closing this needs region-scoped
+        // facts (the guard's own payload, applied to the blocks its hit edge
+        // dominates) — then the probe model above can come back unchanged.
         Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => {
             return Err(Unsupported::Step(step_name(step)));
         }

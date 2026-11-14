@@ -55,13 +55,14 @@ The tier is 2.13× the interpreter (4622.7 / 2171.2). Every row's completion
 value agrees across slag-jit, slag-jitless and node-jit.
 
 Two caveats on the totals, both from the protocol (§6). First, the corpus is now
-81 rows, not the 77 the morning revision counted. Second, and worse: three
+81 rows, not the 77 the morning revision counted. Second, and worse: four
 passes of the same protocol in this session gave `2775.6 / 905.6` (3.06×),
-`2171.2 / 743.8` (2.92×, the 5-round table above) and `1875.8 / 699.7` (2.68×,
-2 rounds). Both engines move together — the same-binary `jitless/jit` ratio held
-at 2.10–2.17× across all three — so the within-binary ratio is the stable
-instrument and the cross-engine ratio is the noisy one. Quote the protocol, the
-round count and the ratio; never compare an absolute total to another window's.
+`2171.2 / 743.8` (2.92×, the 5-round table above), `1875.8 / 699.7` (2.68×) and
+`2028.0 / 792.6` (2.56×). Both engines move together, and the same-binary
+`jitless/jit` ratio moved with them (2.10–2.44×), so neither an absolute total
+nor a ratio is an instrument across windows — only a same-session, interleaved,
+min-of-N comparison is. Quote the protocol, the round count and the ratio, and
+compare like with like.
 
 The row-level picture (unchanged in shape across both passes) is that the loss
 concentrates on a handful of rows: `head-let` 358.8 vs 50.1 (7.2×),
@@ -291,40 +292,40 @@ but a deliberately refused terminator: `emit_fused_test` models
 `objects/own_read` **+571%** and the `globals/*` rows ~**+60%** each against
 `SLAG_OPT=0`, so it refuses instead.
 
-The probe itself is easy to model and was implemented and measured: an
-`Op::HoistGuard` lowered to one helper call (`hoist_guard`, running the
-interpreter's own probe through a shared `Vm::hoist_member_guard` /
-`Vm::hoist_global_guard`), branching to the guarded copy on a hit and to the
-general copy on a miss. Every one of the six rows then lifted — and every one
-of them got **slower**: opt / per-step, min-of-5, same binary, `own_read` 3.52,
-`nested_read` 1.54, `object_read` 1.44, `declarative_read` 1.44, `proto_read`
-1.08, `obj_prop` 1.00 (the last one also returned a wrong value). So the lift is
-reverted; the measured blocker is not the probe:
+The probe itself is easy to model and was implemented and measured twice. Attempt one: an `Op::HoistGuard` lowered to one helper call (`hoist_guard`, running the interpreter's own probe through a shared `Vm::hoist_member_guard` / `Vm::hoist_global_guard`), branching to the guarded copy on a hit and the general copy on a miss. Every one of the six rows lifted, and every one got **slower**: opt / per-step, min-of-5, same binary, `own_read` 3.52, `nested_read` 1.54, `object_read` 1.44, `declarative_read` 1.44, `proto_read` 1.08, `obj_prop` 1.00 (the last also returned a wrong value). Attempt two added slot-precise promotion — the probe's slots carried in `Imm::Hoist` and flushed before it, so the loop accumulator stays an SSA candidate instead of forbidding promotion of the whole frame: 1.36–3.62× still, `obj_prop` at parity only because its int path now refuses. Both attempts are reverted.
+
+The blocker is the body's shape, not the probe, and it is now precise:
 
 - A guarded body contains **two copies of the loop** (guarded and general)
   writing the same frame slots, and `narrow`'s slot prover is whole-body and
-  flow-insensitive. The general copy's imprecise store is taken as evidence
-  against the guarded copy, so the accumulator loses its Number proof and each
-  `+` lowers to `binary_slow` — while the per-step tier's `RunRegBody` still
-  inlines it. The guard's own facts (`prim_slots`, `numbers`, `int_slots`,
-  `reads` with `strict`) are exactly the proof the prover is missing, and they
-  are in the step payload the IR op already indexes.
+  flow-insensitive. The general copy's imprecise store is evidence against the
+  guarded copy, so the guarded copy's `+` lowers to the branchy checked path
+  (or worse, `binary_slow`) while the per-step tier gets a bare f64 add — the
+  guarded copy measured 0.72 ns/iteration per-step against 2.55 ns in the opt
+  tier. The guard's own facts (`prim_slots`, `numbers`, `int_slots`, `reads`
+  with `strict`) are exactly the missing proof.
+- The lift discards the one proof it is handed: a numeric register-body leaf
+  (`BinStoreNum`, which the compiler emits only from a numeric plan) is lifted
+  through `binary_type(Op::Add)`, which is `Unknown`, so the guarded copy starts
+  unproven even before the general copy poisons the slot.
 - The two-copy shape also exposed a latent contract violation: `IntAdd` over
   operands `narrow` had demoted to `Value` words lowered to `iadd` on tag bits
   (`obj_prop` returned 4.6e18 instead of 700000). The lowering now refuses
   (`opt:int-operand`, tested), so the class is a per-step fallback rather than a
   miscompile.
 
-So A2 is two cuts, in this order: **(a)** make the prover consume the guard's
-facts — the guard's slots are typed for the region it dominates, or the guarded
-copy is promoted to SSA (mem2reg) with the guard's facts seeding the phi types —
-then **(b)** re-land the probe model: an `Op::HoistGuard` (`Imm::Int(step)`,
+So A2 is two cuts, in this order: **(a)** make the type facts region-scoped — the
+guard's payload applied to the blocks its hit edge dominates (a forward
+must-analysis: intersect the facts over each block's predecessors, with the
+hit edge adding the guard's own), which also fixes the lift discarding
+`BinStoreNum`'s proof — then **(b)** re-land the probe model: an
+`Op::HoistGuard` (`Imm` = the step index and the slots it addresses,
 `Type::Bool`, `Effects::call()`) lowered to one `hoist_guard(ctx, step)` helper
 call that returns the hit and has already written the hidden slots, the lift
 arm returning `(hit, false)` so a hit falls through to the guarded copy and a
-miss branches to `jump_target`, and `slots_unobserved` refusing promotion for
-the body. **Accept:** every one of the six rows ≤ its per-step time;
-`HoistGuard` drops out of the refusal census.
+miss branches to `jump_target`, and `mem2reg` flushing a promoted slot before
+the probe that names it. **Accept:** every one of the six rows ≤ its per-step
+time; `HoistGuard` drops out of the refusal census.
 
 **A3 — name the emit refusal (landed 2026-11-14).** `step_name` now names every
 family that has appeared as a corpus first blocker (`HoistGuard`, `Switch`,
@@ -508,11 +509,17 @@ Added 2026-11-14 by the B0 census:
 - **A guarded body has two loop copies, and the slot prover is flow-insensitive.**
   `narrow` proves a slot numeric/int from every store in the *whole* body, so a
   hoist guard's general copy (imprecise stores) poisons the guarded copy's
-  proofs: the accumulator drops to `Unknown` and every arithmetic op becomes a
-  `binary_slow` call. Measured at 1.4–3.5× the per-step tier across the six
-  rows. Any future two-copy shape (inlined callee plus fallback, for example)
-  will hit the same wall; the fix is to seed the prover with the guard's own
-  facts, not to lift the probe.
+  proofs. Measured twice: 1.44–3.52× the per-step tier with promotion refused,
+  and 1.36–3.62× with slot-precise promotion (the probe's own operand slots
+  flushed before it). Any future two-copy shape (an inlined callee plus
+  fallback, for example) will hit the same wall; the fix is region-scoped facts,
+  not a lifted probe.
+- **A numeric register-body leaf's proof is discarded by the lift.**
+  `BinStoreNum` exists only where the compiler proved the plan numeric, but
+  `emit_leaf_op` emits through `binary_type(Op::Add)`, which is `Unknown`, so
+  the IR starts unproven and depends on `narrow` re-deriving a fact it was
+  handed. Typing the numeric leaf's result `Number` is sound and independent of
+  the hoist work — a separate, cheap cut.
 - **`IntAdd`/`IntSub`/`IntMul` require `Int` operands, and the lowering now
   checks.** A pass that demotes a producer to a `Value` word leaves the `Int` op
   adjacent to tag bits; `iadd` on those is a wrong value, not a slow path
@@ -529,10 +536,10 @@ Added 2026-11-14 by the B0 census:
   structural numbers as facts and the split as evidence.
 - **A corpus total is only comparable within a session and a corpus size.** The
   morning revision's 2.70× and this session's 2.68–3.06× are not a regression:
-  81 rows vs 77, and a different load window. Three passes on one binary in one
-  session gave 3.06×, 2.92× and 2.68×, while `jitless/jit` held at 2.10–2.17×.
-  Prefer the within-binary ratio for a claim; treat an engine-only swing across
-  passes as the beginning of a measurement bug.
+  81 rows vs 77, and a different load window. Four passes on one binary in one
+  session gave 3.06×, 2.92×, 2.68× and 2.56×, and even `jitless/jit` moved
+  (2.10–2.44×). Compare like with like: same binary, same session, interleaved,
+  min-of-N; treat a single-engine swing as the beginning of a measurement bug.
 
 ---
 
