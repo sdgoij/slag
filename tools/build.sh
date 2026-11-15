@@ -4,8 +4,11 @@
 # here: bisects replace individual paths (`git checkout <rev> -- crates/`), so
 # the compiled tree often matches no commit at all.
 set -euo pipefail
-
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# The cache key includes this path, because a built binary embeds it. Canonicalise
+# the form as well: on MSYS a shell that passes `PWD` in Windows form (just does)
+# makes `pwd` print `C:/...` where a plain shell prints `/c/...`, which is the
+# same checkout and must not hash as a different build configuration.
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && { pwd -W 2>/dev/null || pwd; })
 cd "$root"
 
 known_packages=(cli test262 wasmtest)
