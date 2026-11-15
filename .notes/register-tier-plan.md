@@ -442,6 +442,42 @@ its own); **C** makes a register-held heap value sound; **D5** is the one call
 lane left; **F1** is the oracle the read/arith work needs. The B0 probe (§1.3)
 retires most of Phases B and E *as scoped*.
 
+**The map-keyed chain probe is a layout cut, not an emitter cut (scoped
+2026-11-15).** The identity-keyed prototype read is inlined now (`proto_read`
+1.75x), and the next three buckets it cannot serve are per-iteration-fresh
+receivers: `set_churn` 8.4M `GetMemberName` calls, `map_churn` 6.3M,
+`construct_churn` 3.5M. The interpreter already resolves them through the
+map-keyed chain cell (`member_chain_get`'s Cut 75 arm), so what is missing is
+the inline probe, and that needs one thing the emitter cannot supply: proof that
+the receiver owns no `name`. Two obstacles, both verified in the tree:
+
+- **A map id does not carry that proof.** A vector-only own property can exist on
+  an object whose map is the shared canonical empty map (`define_fresh`'s
+  Ordinary-only deferred service is the writer), which is exactly why the
+  interpreter's map-keyed arm still re-checks `has_own_property_atom` on every
+  hit. Independently, *every* exotic kind is built by `JsObject::with_kind`,
+  which sets `map: Some(canonical_empty_map(prototype))` — so a Proxy shares the
+  empty map with plain objects and would hit a cell a plain object recorded.
+  Excluding exotics inline needs a kind discriminator, and the two existing
+  mirrors (`array_dense`, `typed_array`) only cover Array and IntegerIndexed.
+- **The cheap ownership proof is not addressable.** `properties.is_empty()` is
+  the right test, but the length lives in `SmallProps::len` inside
+  `RefCell<SmallProps>`, and `RefCell`'s payload offset is not guaranteed, so
+  there is no `offset_of!` for it.
+
+So the cut is: add a `Cell<u8>` "kind is Ordinary" mirror and a
+"`SmallProps` length" mirror to `JsObject`, then the probe is the identity
+probe's code with `id` holding the map id and the extra two gates. That is a
+`JsObject` layout change on the hottest struct in the engine, so it owes the
+`slag-object-layout` measurement protocol (size class, then a same-binary seam)
+before anything is built on it — not an afternoon extension of the emitter.
+
+One negative result is already banked: extending the *identity* probe to
+function receivers (the `f.apply` shape, 7.0M calls) measured
+`calls/apply_call` **6.5% slower** with the probe on (`SLAG_CHAIN_PROBE`, one
+binary, min-of-9), and was reverted. That row's reads go through `Step::CallApply`
+rather than a named read, so the extension only added decline work.
+
 **A0, function-object creation (~340 ns each).** The measured dominant term in
 the corpus's two largest rows (§1.4): three closures per body cost ~1 µs of
 head-let's 3.3 µs, against node's 570 ns for the *whole* body.
