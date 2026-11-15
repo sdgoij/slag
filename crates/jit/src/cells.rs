@@ -11,7 +11,7 @@ use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, types};
 use cranelift_frontend::FunctionBuilder;
 
-use runtime::ir::{MEMBER_CELLS, MemberMapCell, MemberValueCell};
+use runtime::ir::{MEMBER_CELLS, MemberChainCell, MemberMapCell, MemberValueCell};
 
 /// The `JsObject` data pointer from a NaN-boxed Object `Value`: the payload
 /// shifted past the NaN tag plus the `GcBox` header offset. Only valid for an
@@ -70,6 +70,23 @@ pub(crate) fn member_map_cell_addr(
     let index_bytes = builder
         .ins()
         .imul_imm_s(slot, std::mem::size_of::<MemberMapCell>() as i64);
+    builder.ins().iadd(cells, index_bytes)
+}
+
+/// The identity-keyed prototype-chain cell for `(receiver id, name)` — the
+/// same slot arithmetic as `Vm::member_chain_index`, so the compiled probe and
+/// the runtime's fill agree (a divergence would silently never hit).
+pub(crate) fn member_chain_cell_addr(
+    builder: &mut FunctionBuilder,
+    cells: Value,
+    receiver_id: Value,
+    name_imm: Value,
+) -> Value {
+    let slot = builder.ins().bxor(receiver_id, name_imm);
+    let slot = builder.ins().band_imm_u(slot, (MEMBER_CELLS - 1) as i64);
+    let index_bytes = builder
+        .ins()
+        .imul_imm_s(slot, std::mem::size_of::<MemberChainCell>() as i64);
     builder.ins().iadd(cells, index_bytes)
 }
 

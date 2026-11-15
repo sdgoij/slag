@@ -96,6 +96,7 @@ The morning revision listed these as future work. They are in the tree:
 | register-body named read | `opt/lift/mod.rs` (`LeafOp::GetMemberName`) | an `x.name` read whose object is already in the accumulator (a chained read like `a[i].n`) now lifts to the same member-value cell probe the `Step` form uses; each refused leaf op is named through `leaf_op_name` instead of the opaque `RunRegBody` |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
+| inlined prototype-chain read | `compiler.rs` (`emit_chain_cell_probe`), `cells.rs` | a named read whose receiver has a warm identity-keyed chain cell (a one-link prototype data property) is served with no helper call; every lane routes through `emit_member_read_chained`, including both register-body `LeafOp` forms |
 | inline truthiness in the optimizing tier | `opt_lower.rs` (`emit_falsy`) | the per-step tier has had `emit_truthiness` since its first cut; the optimizing tier had no port, so every `if (x)` on a condition the typer did not prove `Bool` called `ToBooleanSlow` (`if (set.has(k))` is the shape). `ToBooleanSlow` traffic over the corpus goes 10.7M to 0 |
 | per-iteration chain on the record | `function.rs` (`register_function`) | the chain install moved inside registration, so a closure creation no longer pays a second `ecma_functions` probe (a random access into a table holding one record per live function) after the insert. It must stay AFTER `shared_compiled_body`: `compile_body` reads the chain into the compiler and the compiled body is shared per site, so setting it in the record literal bakes the first closure's chain into every later one (`installed_jit_per_iteration_head_inside_another_loop` returns the wrong bindings) |
 
@@ -127,6 +128,50 @@ register-body blocker left in the corpus is `leaf:BinRemConst`
 -4 to -13%. `strings/split_join`, `opcost/array_to_sorted` and
 `builtins/json_roundtrip` also lift now but are dominated by allocation and JSON
 work, so their deltas sit inside a 5-20% run-to-run band and are not claimed.
+
+A fifth cut is the largest single win of the arc: `objects/proto_read` 58.0 to
+30.6 ms in one binary (`SLAG_CHAIN_PROBE=0`/unset, min-of-9 interleaved —
+89% slower without the probe) and `builtins/set_churn` -6.4%, with the
+corpus-wide `GetMemberName` count dropping from 82.8M to 71.5M (28.0M of that
+from `proto_read` alone). The interpreter has cached prototype-chain
+resolutions since Cut 23 (identity-keyed) and Cut 75 (map-keyed), but the cache
+lives *inside* `get_member_name`, so compiled code paid the helper call on every
+prototype read. `emit_chain_cell_probe` re-validates the identity cell inline
+(receiver id/generation/name, `link_count == 1`, the first link's id/generation,
+then the found link's member value cell) and declines to the helper on any
+mismatch, so the failure mode is a helper call, never a wrong value.
+
+Three things this cost, all worth writing down:
+
+- **The register-body lane is a different arm.** `s += o.m` in a canonical `for`
+  compiles to `LeafOp::GetMemberNameLocal` / `LeafOp::GetMemberName`, not
+  `Step::GetMemberName`; the first version inlined only the step arm and its
+  probe was never reached (`proto_read` still 28M helper calls). All three lanes
+  now share `emit_member_read_chained`, for the same reason the leaf-call lane
+  had to be taught each new op.
+- **`JitCallContext::member_chain_cells` pointed at the MAP-keyed table**, and
+  the identity table was `[Option<MemberChainCell>; N]`. An `Option` wrapper has
+  no guaranteed payload offset (`offset_of!` cannot reach the fields) and a
+  different stride, so the identity table is now `[MemberChainCell; N]` of
+  `MemberChainCell::empty()` cells (id 0, which the map ids can never match) and
+  the ctx carries both tables under their own names. A probe reading the wrong
+  table just never hits, which is why this was silent.
+- **A cross-binary number lied in both directions here.** Two binaries apart, the
+  probe measured `proto_read` -44.6% and simultaneously `opcost/array_at` +73%,
+  `arrays/push_pop` +60%, `opcost/array_indexof` +34%. Same binary with
+  `SLAG_CHAIN_PROBE=0` as the control, those three are -2.9%, +0.9% and -1.5%:
+  the regressions were pure layout on 1-2 ms rows. `array_dense`/`typed_array`
+  decline the probe before its hash (their generation churns on every element
+  write, so the identity cell can never validate), which is what makes the
+  decline cost nothing measurable.
+- **What the remaining 71.5M are.** They are not one shape: `prim_prop` (6.4M)
+  is a *primitive* receiver (a separate cache), `push_pop` (3.4M) is an Array
+  whose generation bumps on every `push` (the interpreter's
+  `chain_shadow_free_without_generation` escape is not modelled in the probe),
+  and `set_churn`/`map_churn`/`apply_call`/`construct_churn` are per-iteration
+  fresh receivers (the identity cell can never serve them; the map-keyed cell
+  can, but its hit also requires proving the receiver owns no vector-only
+  `name`).
 
 A fourth cut is the first one this arc to move the dominant row. `opt_lower`'s
 `Term::Branch` called `Helper::ToBooleanSlow` for every condition the typer had

@@ -32,6 +32,7 @@ measurement and the knobs an embedder can experiment with; `SLAG_OPT` and
 | `SLAG_GUARD` | on | `=0` disables the read-guard **pruning pass** (`pass/guard.rs`). |
 | `SLAG_MEM2REG` | on | `=0` disables top-level **frame-slot promotion** (`pass/mem2reg.rs`). |
 | `SLAG_UNBOX` | on | `=0` disables the **raw-f64 chain pass** (`pass/unbox.rs`): arithmetic results are then NaN-box canonicalized per operation instead of where the value leaves the chain. |
+| `SLAG_CHAIN_PROBE` | on | `=0` disables the **inline prototype-chain read probe** (`compiler.rs::emit_chain_cell_probe`): a named read then always takes the `get_member_name` helper, as before the cache was inlined. A same-binary seam, since the probe's effect across two binaries mixes in native layout. |
 | `SLAG_WIDEN` | on | `=0` disables `narrow`'s **effect widening**. |
 
 ## JIT diagnostics

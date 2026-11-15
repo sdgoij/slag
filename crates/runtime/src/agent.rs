@@ -1994,8 +1994,7 @@ pub struct Agent {
     /// (the chain cell caches the resolution, never the value), so a value
     /// write to the found link's own property is always observed. All-
     /// scalar — no trace edges. Boxed per the Cut 27 lesson.
-    pub(crate) member_chain_cells:
-        Box<[Option<crate::ir::MemberChainCell>; crate::ir::MEMBER_CELLS]>,
+    pub(crate) member_chain_cells: Box<[crate::ir::MemberChainCell; crate::ir::MEMBER_CELLS]>,
     /// The shape-keyed prototype-chain read cache (Cut 75): like
     /// `member_chain_cells` but keyed by the RECEIVER'S MAP id instead of
     /// its object id, so a per-iteration-fresh object (every `new`, every
@@ -2840,7 +2839,9 @@ impl Agent {
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("sized exactly MEMBER_MAP_WRITE_CELLS"))
             },
-            member_chain_cells: Box::new(std::array::from_fn(|_| None)),
+            member_chain_cells: Box::new(
+                [crate::ir::MemberChainCell::empty(); crate::ir::MEMBER_CELLS],
+            ),
             member_chain_map_cells: Box::new(
                 [const { crate::ir::MemberChainCell::empty() }; crate::ir::MEMBER_CELLS],
             ),

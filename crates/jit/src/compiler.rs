@@ -39,8 +39,8 @@ use crux::Value;
 use runtime::ir::{
     ApplyKind, COMPUTED_READ_CELLS, COMPUTED_READ_INDEX_MUL, COMPUTED_READ_INDEX_SHIFT,
     CompiledBody, CompoundRhs, ComputedReadCell, FastLoopVar, GLOBAL_CELLS, IntRhs, Intrinsic,
-    LeafOp, MEMBER_CELLS, MemberMapCell, MemberValueCell, NumRhs, RegOperand, RelLimit, ScopeInfo,
-    Step, TryFrame, is_compound_assign,
+    LeafOp, MEMBER_CELLS, MemberChainCell, MemberMapCell, MemberValueCell, NumRhs, RegOperand,
+    RelLimit, ScopeInfo, Step, TryFrame, is_compound_assign,
 };
 use runtime::jit::{
     AGENT_REALM_COUNT_OFFSET, BUILDER_BUF_OFFSET, BUILDER_CAP_OFFSET, BUILDER_ENABLED_OFFSET,
@@ -352,6 +352,20 @@ pub(crate) fn helper_sig(params: &[Type], conv: CallConv) -> Signature {
 /// The byte offset of a `LeafInlineInfo` field inside a `LeafCallRecord`
 /// (Cranelift has no `offset_of!`, so the compiled code loads the fields at
 /// these fixed offsets).
+/// Whether the inline prototype-chain probe is emitted. On by default;
+/// `SLAG_CHAIN_PROBE=0` disables it. A same-binary seam, because the probe's
+/// effect measured across two binaries mixes in native layout — which on this
+/// corpus swings 30-40% on rows the change cannot reach.
+fn chain_probe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SLAG_CHAIN_PROBE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn leaf_inline_offset(field: usize) -> usize {
     std::mem::offset_of!(LeafCallRecord, leaf_inline) + field
 }
@@ -1494,6 +1508,48 @@ impl<'a> Lowerer<'a> {
         self.emit_member_cell_probe(object, name, None)
     }
 
+    /// A named member read: the own-data value cell, then the identity-keyed
+    /// prototype-chain cell (a warm one-link prototype resolution), then
+    /// `get_member_name` — which re-fills both cells, so the first read of a
+    /// site pays for the rest. Every lane (the `Step` and both register-body
+    /// `LeafOp` forms) goes through here: the register lane is where a hot
+    /// `s += o.m` lives, so leaving it on the old two-step path kept the
+    /// dominant prototype read on the helper.
+    fn emit_member_read_chained(
+        &mut self,
+        object: ClifValue,
+        name: crux::AtomId,
+    ) -> Result<ClifValue, Unsupported> {
+        if !chain_probe_enabled() {
+            return self.emit_member_cell_read(object, name);
+        }
+        let chain = self.builder.create_block();
+        let value = self.emit_member_cell_probe(object, name, Some(chain))?;
+        let result = self.builder.declare_var(types::I64);
+        self.builder.def_var(result, value);
+        let helper = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.ins().jump(join, &[]);
+        self.builder.switch_to_block(chain);
+        self.builder.seal_block(chain);
+        let chained = self.emit_chain_cell_probe(object, name, helper)?;
+        self.builder.def_var(result, chained);
+        self.builder.ins().jump(join, &[]);
+        self.builder.switch_to_block(helper);
+        self.builder.seal_block(helper);
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let res = self.call_slow(
+            self.sig_get_name,
+            Helper::GetMemberName,
+            &[object, name_imm],
+        )?;
+        self.builder.def_var(result, res);
+        self.builder.ins().jump(join, &[]);
+        self.builder.switch_to_block(join);
+        self.builder.seal_block(join);
+        Ok(self.builder.use_var(result))
+    }
+
     /// As `emit_member_cell_read`, but a probe miss branches to `miss`
     /// (caller-owned, left unsealed) instead of emitting the full
     /// `get_member_name` fallback — the LICM guard takes the general loop on a
@@ -1814,6 +1870,206 @@ impl<'a> Lowerer<'a> {
             self.builder.def_var(value_var, res);
             self.builder.ins().jump(merge, &[]);
         }
+        self.builder.seal_block(merge);
+        self.builder.switch_to_block(merge);
+        Ok(self.builder.use_var(value_var))
+    }
+
+    /// The identity-keyed prototype-chain probe: a `Step::GetMemberName` whose
+    /// receiver has a warm `MemberChainCell` for this name reads the found
+    /// prototype's value with no helper call. The interpreter's chain cache
+    /// records `(receiver id, generation, link count, the found link's
+    /// id/generation)`; the value itself is deliberately NOT cached — it is
+    /// re-read from the found link's member value cell, which every warm store
+    /// fronts and every structural change invalidates.
+    ///
+    /// Only the ONE-link shape is served here, which is what reading a
+    /// prototype data property (`o.m`) produces; a two-link resolution takes
+    /// the helper. Every check mirrors `Vm::chain_cell_read`, and any mismatch
+    /// branches to `miss` (caller-owned, left unsealed), so the helper is the
+    /// answer whenever this probe cannot prove the same one.
+    fn emit_chain_cell_probe(
+        &mut self,
+        object: ClifValue,
+        name: crux::AtomId,
+        miss: Block,
+    ) -> Result<ClifValue, Unsupported> {
+        let name_imm = self.builder.ins().iconst(types::I64, name as i64);
+        let ctx = self.vm();
+        let value_var = self.builder.declare_var(types::I64);
+        let merge = self.builder.create_block();
+
+        let plain = self.builder.create_block();
+        let obj_ok = crate::cells::is_plain_object(&mut self.builder, object);
+        self.builder.ins().brif(obj_ok, plain, &[], miss, &[]);
+        self.builder.switch_to_block(plain);
+        self.builder.seal_block(plain);
+        let ptr = crate::cells::object_data_ptr(&mut self.builder, object);
+        // A dense Array or a TypedArray bumps its generation on every element
+        // write, so the identity cell can never validate for it (its reads
+        // decline in the interpreter through the Array-specific escape this
+        // probe does not model). Decline BEFORE the cell probe: paying the
+        // hash and the cell touch only to fail on the generation measured
+        // `push_pop`/`array_at`/`array_indexof` 45-90% slower.
+        let dense = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+        );
+        let typed = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
+        );
+        let exotic = self.builder.ins().bor(dense, typed);
+        let plain_receiver = self.builder.ins().icmp_imm_u(IntCC::Equal, exotic, 0);
+        let indexed = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(plain_receiver, indexed, &[], miss, &[]);
+        self.builder.switch_to_block(indexed);
+        self.builder.seal_block(indexed);
+        let receiver_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let receiver_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let chains = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_chain_cells) as i32),
+        );
+        let cell =
+            crate::cells::member_chain_cell_addr(&mut self.builder, chains, receiver_id, name_imm);
+        let cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, id) as i32),
+        );
+        let cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, name) as i32),
+        );
+        let cell_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, generation) as i32),
+        );
+        let cell_link_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, links) as i32),
+        );
+        let cell_link_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, links) as i32 + 8),
+        );
+        let cell_count = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, link_count) as i32),
+        );
+        let cell_name = self.builder.ins().uextend(types::I64, cell_name);
+        let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, receiver_id);
+        let name_ok = self.builder.ins().icmp(IntCC::Equal, cell_name, name_imm);
+        let gen_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, cell_gen, receiver_gen);
+        let count_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, cell_count, 1);
+        let ok = self.builder.ins().band(id_ok, name_ok);
+        let ok = self.builder.ins().band(ok, gen_ok);
+        let ok = self.builder.ins().band(ok, count_ok);
+        let walk = self.builder.create_block();
+        self.builder.ins().brif(ok, walk, &[], miss, &[]);
+        self.builder.switch_to_block(walk);
+        self.builder.seal_block(walk);
+        // The first (and only) link: the receiver's [[Prototype]] must still be
+        // the object whose own property the cell recorded.
+        let proto = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, prototype) as i32),
+        );
+        let has_proto = self.builder.ins().icmp_imm_u(IntCC::NotEqual, proto, 0);
+        let link = self.builder.create_block();
+        self.builder.ins().brif(has_proto, link, &[], miss, &[]);
+        self.builder.switch_to_block(link);
+        self.builder.seal_block(link);
+        let proto_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(proto, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let proto_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            proto_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+        );
+        let proto_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            proto_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let link_id_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, proto_id, cell_link_id);
+        let link_gen_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, proto_gen, cell_link_gen);
+        let link_ok = self.builder.ins().band(link_id_ok, link_gen_ok);
+        let value = self.builder.create_block();
+        self.builder.ins().brif(link_ok, value, &[], miss, &[]);
+        self.builder.switch_to_block(value);
+        self.builder.seal_block(value);
+        // The found link's own data value: its member value cell (kept current
+        // by every warm store and by every structural bump), else the helper —
+        // which re-warms the cell, so a cold cell costs one helper call, not
+        // one per read.
+        let values = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_value_cells) as i32),
+        );
+        let vcell =
+            crate::cells::member_value_cell_addr(&mut self.builder, values, proto_id, name_imm);
+        let v_ok = crate::cells::member_value_cell_valid(
+            &mut self.builder,
+            vcell,
+            proto_id,
+            name,
+            proto_gen,
+        );
+        let hit = self.builder.create_block();
+        self.builder.ins().brif(v_ok, hit, &[], miss, &[]);
+        self.builder.switch_to_block(hit);
+        self.builder.seal_block(hit);
+        let bits = crate::cells::member_value_cell_value(&mut self.builder, vcell);
+        self.builder.def_var(value_var, bits);
+        self.builder.ins().jump(merge, &[]);
         self.builder.seal_block(merge);
         self.builder.switch_to_block(merge);
         Ok(self.builder.use_var(value_var))
@@ -6994,12 +7250,8 @@ impl<'a> Lowerer<'a> {
                 self.fall_through(index);
             }
             Step::GetMemberName { name } => {
-                // Cut 38: inline the member-value fast cell (see
-                // `emit_member_cell_read`). Function receivers, primitives
-                // (boxing), proxies, accessors, and prototype-chain reads
-                // miss to the helper.
                 let object = self.pop();
-                let value = self.emit_member_cell_read(object, *name)?;
+                let value = self.emit_member_read_chained(object, *name)?;
                 self.push(value);
                 self.fall_through(index);
             }
@@ -11122,7 +11374,7 @@ impl<'a> Lowerer<'a> {
             }
             LeafOp::GetMemberName { name } => {
                 let object = self.acc_bits();
-                let value = self.emit_member_cell_read(object, *name)?;
+                let value = self.emit_member_read_chained(object, *name)?;
                 self.set_acc_bits(value);
             }
             LeafOp::GetMemberComputed { key } => {
@@ -11140,7 +11392,7 @@ impl<'a> Lowerer<'a> {
                 if *tdz {
                     self.emit_tdz_check(object)?;
                 }
-                let value = self.emit_member_cell_read(object, *name)?;
+                let value = self.emit_member_read_chained(object, *name)?;
                 self.set_acc_bits(value);
             }
             LeafOp::GetMemberComputedLocal {

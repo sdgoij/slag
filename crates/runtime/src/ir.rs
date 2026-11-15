@@ -6837,8 +6837,8 @@ impl Vm {
         let object = Self::chain_object(object)?;
         // (a) Identity-keyed: the receiver itself re-reads its resolution.
         let index = Self::member_chain_index(object.id(), name);
-        if let Some(cell) = agent.member_chain_cells[index].as_ref()
-            && cell.id == object.id()
+        let cell = agent.member_chain_cells[index];
+        if cell.id == object.id()
             && cell.name == name
             // The receiver generation is the cheap proof that no own `name`
             // appeared since the resolution was recorded — but dense element
@@ -7039,14 +7039,14 @@ impl Vm {
                     {
                         let value = *value;
                         let index = Self::member_chain_index(object.id(), name);
-                        agent.member_chain_cells[index] = Some(MemberChainCell {
+                        agent.member_chain_cells[index] = MemberChainCell {
                             id: object.id(),
                             name,
                             generation: object.generation(),
                             slot,
                             link_count: count as u8,
                             links,
-                        });
+                        };
                         // Cut 75: also record the MAP-keyed chain cell so
                         // every OTHER fresh object on the same map shares
                         // this resolution (the identity cell above is
@@ -14946,7 +14946,8 @@ impl Vm {
             member_value_cells: agent.roots.member_value_cell_base(),
             computed_read_cells: agent.roots.computed_read_cell_base(),
             member_map_cells: agent.member_map_cells.as_ptr() as *mut std::os::raw::c_void,
-            member_chain_cells: agent.member_chain_map_cells.as_mut_ptr()
+            member_chain_cells: agent.member_chain_cells.as_mut_ptr() as *mut std::os::raw::c_void,
+            member_chain_map_cells: agent.member_chain_map_cells.as_mut_ptr()
                 as *mut std::os::raw::c_void,
             globals_unshadowed,
             buf_end: (region_ptr as usize + buf_len * std::mem::size_of::<Value>())
