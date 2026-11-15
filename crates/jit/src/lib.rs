@@ -132,6 +132,7 @@ pub(crate) mod cells;
 pub mod code_buffer;
 pub mod compiler;
 pub mod helpers;
+pub(crate) mod index_gate;
 pub mod opt;
 pub mod opt_lower;
 

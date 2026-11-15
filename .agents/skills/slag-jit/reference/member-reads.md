@@ -203,3 +203,32 @@ than it looks:
   `g.apply = function () { return 9; }` (an own property on that same part) bumps
   it and the read returns the own function —
   `installed_jit_function_receiver_chain_read_honors_a_shadowing_apply`.
+
+## 36. The primitive receiver's read: measured, and not a lever
+
+The primitive-receiver reads look like the obvious next cut — a compiled
+`s.length` and `n.valueOf()` decline the probe's tag gate and take the
+`GetMemberName` helper every time (`opcost/prim_prop` 7.2 M calls,
+`opcost/num_valueof` 1.6 M). Both are worth ~12% of their own row, because the
+helper is already short and the *cell-served* alternative is not much shorter:
+
+- `s.length` is a virtual own property of the string, so the
+  `%String.prototype%` cell can never serve it (the lane excludes the atom) and
+  a box-keyed length cell is not maintainable (the store paths know the atom,
+  not the box — §19). `JsString` is an enum with no fixed-offset length, so the
+  only cheap forms left are a dedicated helper or a header word.
+- `get_member_name` short-circuits `length` on a string at its first check, so
+  what remains behind the call is ~2 atom compares plus `JsString::len()`.
+- `%Number.prototype%` *is* `ObjectKind::Ordinary` (created by
+  `ordinary_object_create` with `boxed = Number(0.0)`), so
+  `primitive_proto_data_get` does warm `(number_proto_id, valueOf)` — a compiled
+  number-prototype arm would need a `number_prototype_bits` field on
+  `JitCallContext` and a second lane in both probes.
+
+Measured probe shapes, identical but for the read (`scratch/probe/`, 100k
+iterations, min-of-11): own data field from `member_value_cells` **1.05 ms**,
+primitive-string `.length` through the helper **1.20 ms**, `%String.prototype%`
+method read through the cell **1.41 ms**. So the whole primitive-read lane is a
+0.15 ms question on a 1.2 ms row. Do not re-derive it; the row's cost is the
+element read and the loop, not the read (`slag-perf-measurement` has the
+node-folds-`opcost` trap that made it look like an 18x gap).

@@ -2238,18 +2238,10 @@ fn emit_dense_element_read(
     let load_blk = builder.create_block();
     let hit = builder.create_block();
 
-    // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips exactly
-    // when `num` is an integral double below 2^32-1, rejecting fractional,
-    // negative, huge and non-double keys (a NaN-boxed heap value bitcasts to a
-    // NaN, whose compare fails).
+    // The canonical-index gate (see `index_gate::canonical_index`).
     builder.switch_to_block(entry);
     let num = value_as_f64(builder, key);
-    let max = builder.ins().f64const(4294967295.0);
-    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
-    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
-    let back = builder.ins().fcvt_from_uint(types::F64, idx);
-    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
-    let key_ok = builder.ins().band(integral, lt_max);
+    let (idx, key_ok) = crate::index_gate::canonical_index(builder, num);
     builder.ins().brif(key_ok, in_len, &[], slow, &[]);
     builder.seal_block(in_len);
 
@@ -2345,7 +2337,7 @@ fn emit_array_at_inline(
     // `length` can exceed the materialized prefix when the tail is holes;
     // `at_dense` misses those in `elements`, so the chain must answer.
     builder.switch_to_block(in_range);
-    let k = builder.ins().fcvt_to_uint_sat(types::I64, k);
+    let k = crate::index_gate::index_from_number(builder, k);
     let elem_len = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -2529,13 +2521,8 @@ fn emit_typed_element_read(
     // The key gate + bounds (the dense arm's gate, plus the element-count bound).
     builder.switch_to_block(key_gate);
     let num = value_as_f64(builder, key);
-    let max = builder.ins().f64const(4294967295.0);
-    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
-    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
-    let back = builder.ins().fcvt_from_uint(types::F64, idx);
-    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+    let (idx, key_ok) = crate::index_gate::canonical_index(builder, num);
     let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, arr_len);
-    let key_ok = builder.ins().band(integral, lt_max);
     let read_ok = builder.ins().band(key_ok, in_bounds);
     let base = builder.ins().iadd(data, byte_offset);
     builder.ins().brif(read_ok, tests[0], &[], slow, &[]);
@@ -2770,13 +2757,8 @@ fn emit_typed_element_store(
     // element-count bound).
     builder.switch_to_block(key_gate);
     let num = value_as_f64(builder, key);
-    let max = builder.ins().f64const(4294967295.0);
-    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
-    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
-    let back = builder.ins().fcvt_from_uint(types::F64, idx);
-    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
+    let (idx, key_ok) = crate::index_gate::canonical_index(builder, num);
     let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, arr_len);
-    let key_ok = builder.ins().band(integral, lt_max);
     let write_ok = builder.ins().band(key_ok, in_bounds);
     let base = builder.ins().iadd(data, byte_offset);
     builder.ins().brif(write_ok, tests[0], &[], slow, &[]);
@@ -2839,14 +2821,17 @@ fn emit_typed_element_store(
         let ge = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, vnum, lo);
         let le = builder.ins().fcmp(FloatCC::LessThanOrEqual, vnum, hi);
         // The saturating conversions never trap on the NaN bits of a heap
-        // value; the round trip below then rejects them.
+        // value; the round trip below then rejects them. The signed pair is
+        // single-instruction on x86-64 and exact inside each kind's range
+        // (`vmin`/`vmax`), so the unsigned forms' software sequences buy
+        // nothing.
         let (conv, vback) = if signed {
             let conv = builder.ins().fcvt_to_sint_sat(types::I64, vnum);
             let back = builder.ins().fcvt_from_sint(types::F64, conv);
             (conv, back)
         } else {
-            let conv = builder.ins().fcvt_to_uint_sat(types::I64, vnum);
-            let back = builder.ins().fcvt_from_uint(types::F64, conv);
+            let conv = crate::index_gate::index_from_number(builder, vnum);
+            let back = crate::index_gate::number_from_index(builder, conv);
             (conv, back)
         };
         // The round trip rejects a fractional or out-of-range Number (and
@@ -2921,7 +2906,7 @@ fn emit_typed_element_number(
     let num = if signed {
         builder.ins().fcvt_from_sint(types::F64, wide)
     } else {
-        builder.ins().fcvt_from_uint(types::F64, wide)
+        crate::index_gate::number_from_index(builder, wide)
     };
     builder.ins().bitcast(types::I64, MemFlagsData::new(), num)
 }
@@ -3378,7 +3363,7 @@ fn emit_array_push_inline(
         slots_ptr,
         Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_cap) as i32),
     );
-    let len_u = builder.ins().fcvt_to_uint_sat(types::I64, length);
+    let len_u = crate::index_gate::index_from_number(builder, length);
     let at_end = builder.ins().icmp(IntCC::Equal, elem_len, len_u);
     let has_room = builder
         .ins()
@@ -3808,12 +3793,7 @@ fn emit_dense_element_store_inline(
     let fast_write = builder.create_block();
     builder.switch_to_block(entry);
     let num = value_as_f64(builder, key);
-    let max = builder.ins().f64const(4294967295.0);
-    let lt_max = builder.ins().fcmp(FloatCC::LessThan, num, max);
-    let idx = builder.ins().fcvt_to_uint_sat(types::I64, num);
-    let back = builder.ins().fcvt_from_uint(types::F64, idx);
-    let integral = builder.ins().fcmp(FloatCC::Equal, back, num);
-    let key_ok = builder.ins().band(integral, lt_max);
+    let (idx, key_ok) = crate::index_gate::canonical_index(builder, num);
     builder.ins().brif(key_ok, bounds, &[], slow, &[]);
     builder.seal_block(key_ok_check);
     builder.switch_to_block(bounds);
@@ -6234,7 +6214,7 @@ fn call_int_binary(
         // `>>>` answers a `ToUint32`; the others a signed i32.
         let res_f = if unsigned {
             let wide = builder.ins().uextend(types::I64, res);
-            builder.ins().fcvt_from_uint(types::F64, wide)
+            crate::index_gate::number_from_index(builder, wide)
         } else {
             let wide = builder.ins().sextend(types::I64, res);
             builder.ins().fcvt_from_sint(types::F64, wide)

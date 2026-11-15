@@ -30,7 +30,7 @@ split** — an older note that cites `slag-jit` §18 means §18, wherever it liv
 §26-§29  reference/opt-tier.md
 §30      reference/member-reads.md
 §31-§34  reference/opt-tier.md
-§35      reference/member-reads.md
+§35-§36  reference/member-reads.md
 ```
 
 | file | what is in it | open it when |
@@ -61,18 +61,29 @@ Each of these has a section in the file named; none is guessable from the code.
 - **The store paths keep the read cells current, and they do not always bump the
   generation** (`member-reads.md` §19) — a value cache keyed by anything but the
   atom cannot be refreshed.
+- **An unsigned 64-bit float conversion is a software sequence, not an
+  instruction** (`slag-dense-arrays` §8): `fcvt_to_uint_sat`/`fcvt_from_uint` on
+  `i64` expand to `cvt_float64_to_uint64_sat_seq`/`u64_to_f64_seq` in the address
+  chain; the signed pair is one instruction each. The canonical-index gate lives
+  in `crates/jit/src/index_gate.rs` — use it, and grep a CLIF dump for `_seq`
+  before blaming a probe.
+- **The primitive-receiver read is a measured non-lever** (`member-reads.md`
+  §36): a string's `.length` and a number's `.valueOf` are ~12% of their own
+  row, and `opcost/*`'s node column is a folded loop.
 
 ## 15. Validation
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean, then
 `cargo test --workspace` green — then REBUILD the sweep
 (`cargo build --release -p test262`) and run the full areas (see the
-`slag-conformance` skill). The JIT (default) baselines: `language` 23721/0/0/0,
-`annexB` 1086/0/0/0, `built-ins` ~23210 pass / 0 fail with 440–450
-pre-existing hang wobble on the slow RegExp property-escape /
-CharacterClassEscapes / decodeURI / TypedArray / Temporal clusters (load
-wobble, not a regression — diff the fail+crash union against a parent
-worktree). A JIT e2e test lives in `crates/jit/src/lib.rs`
+`slag-conformance` skill). The JIT (default) baselines as measured
+2026-11-15: `language` 23726 pass / 0 fail (the same in `--jitless`),
+`annexB` 1086/0 (both modes), `built-ins` 23821 fixtures — 23802 pass / 0 fail
+/ 19 hang in JIT and 23805/0/16 in `--jitless`, every hang in
+`RegExp/property-escapes/generated` (host-load wobble, not a regression: a
+control tree from before the change hung 10, 191 and 9 times across three
+interleaved runs). Diagnose a `built-ins` hang by dumping the `HANG` lines'
+top-level directories, not by reading the count. A JIT e2e test lives in `crates/jit/src/lib.rs`
 (`with_jit_agent` runs a script with the real runtime helpers and reports
 the compiled-body count); the `installed_jit_*` tests are the behavioral
 suite — new steps need one, including the iterator-close shapes

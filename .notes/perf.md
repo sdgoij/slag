@@ -150,6 +150,34 @@ Both chain probes now dispatch on the tag and read the **object part**: a Functi
 
 Corpus `GetMemberName`: 83.3 M at the start of the session, **20.5 M** now. The remainder is `opcost/prim_prop` 7.2 M (a primitive string's `.length`, whose native length is not a fixed-offset field), the string-concat pairs ~3.5 M, `opcost/num_valueof` 1.6 M, and the per-row single digits.
 
+### The canonical-index gate, and why the primitive-read lever was not one (2026-11-15, later)
+
+The handoff said the next member-read cut was a primitive receiver's read: `opcost/prim_prop` 7.2 M and `opcost/num_valueof` 1.6 M `GetMemberName` calls, a string's `.length` (a virtual own property, so the `%String.prototype%` cell can never serve it) and a number's `.valueOf` (no number-prototype arm in either probe). Both are real. Neither is worth a cut, and the measurement is what says so:
+
+- **The interpreter already short-circuits `s.length`** (`get_member_name` step 1), so the helper costs ~2 atom compares and `JsString::len()` past the call. Substituting a dedicated `StringLength` helper would save the generic dispatch, not a chain walk.
+- **Sized against a cell-served read, the helper is worth ~12% of the row.** Probe shapes identical except for the read (`scratch/probe/`): own data field served from `member_value_cells` 1.05 ms/100k, primitive-string `.length` via the helper 1.20 ms, prototype-method read via the `%String.prototype%` cell 1.41 ms. A cell or inline-length cut would move `prim_prop` by ~0.15 ms of a 1.2 ms row.
+- **The `opcost/*` node column cannot be compared at all.** Those rows are one op over a literal array, so node folds the loop: `array_at` 0.0255 ms for 100k iterations (`s = 300000`), `prim_prop` 0.065, `num_valueof` 0.239 — 18-45x "gaps" that no per-op change reaches and that say nothing about the op. The real rows that node cannot fold are `arrays/index_loop` 4.4x, `for_of_dense` 4.2x, `push_pop` 14x, with identical values.
+
+What the same CLIF read did find is the canonical-index gate, duplicated verbatim at eight sites across both tiers, using the UNSIGNED conversion pair:
+
+```
+idx  = fcvt_to_uint_sat.i64 num   ; cvt_float64_to_uint64_sat_seq (multi-branch)
+back = fcvt_from_uint.f64 idx     ; u64_to_f64_seq                (multi-branch)
+```
+
+x86-64 has no unsigned conversion, so Cranelift expands each into a software sequence — inside the element read's address chain, on every `a[i]`. The signed pair (`cvttsd2si`/`cvtsi2sd`) is one instruction each and exact inside `[0, 2^63)`, and the accepted key set is unchanged (the added `>= 0` bound rejects what `ToUint64Sat` saturated to 0; the round trip still rejects `1.5`, `NaN`, heap bits, and still accepts `-0.0` as 0). The gate and the post-gate conversions are now single-sourced in `crates/jit/src/index_gate.rs` (`canonical_index`, `index_from_number`, `number_from_index`) and every remaining `fcvt_*_uint` on an `i64` is gone from both tiers.
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `arrays/typed_array` | 19.8 | 17.3 | **-12.6%** |
+| `arrays/index_loop` | 15.0 | 14.5 | -3.0% |
+| `arrays/push_pop` | 2.10 | 2.07 | -1.8% |
+| `arrays/for_of_dense` | 9.60 | 9.69 | +0.9% (noise) |
+| `objects/many_objects_read` | 19.44 | 19.35 | -0.5% |
+| `objects/warm_store` | 25.27 | 25.34 | +0.3% (noise; +5.8% on a 9-round draw) |
+
+**The next lever, with its evidence.** `arrays/index_loop` (3M iterations of `s += a[i & 199999]`) is 14.5 ms = 4.8 ns/iteration against node's 1.1 ns (4 cycles = one `fadd` latency). The CLIF shows the loop-carried locals in frame slots — `load v0+16; fadd; store v0+16` for `s`, the same for `i` — so the chain is store-to-load forwarding (~5-6 cycles) plus the arithmetic, not anything an opcode change reaches. That is the register tier's question (`register-tier-plan.md`), not another probe's, and `index_loop` is its benchmark: getting `s` and `i` into registers (stored to the frame only where a safepoint needs them) is the whole distance to node on this row.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

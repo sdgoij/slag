@@ -39,6 +39,23 @@ was 211 ms, five fresh control runs were 166-175 ms, and the variant was 171 ms.
   `echo END` sentinel so a missing line is visible.
 - **The first sample after linking.** It is frequently the fastest. Take min-of-N
   with N >= 3 and confirm with a repeat before writing the number down.
+- **An `opcost/*` row's node column can be a folded constant loop.** Those rows
+  are one operation in a bare loop over a literal array, so V8's optimizing tier
+  proves the operands and closes the loop: `opcost/array_at`
+  (`s = (s + small.at(2)) | 0`) runs 100k iterations in **0.0255 ms** on node —
+  0.25 ns/iter, i.e. `s = 300000` — against slag's 1.16 ms, a 45x "gap" that no
+  per-op change can close and that says nothing about the op. Same for
+  `opcost/prim_prop` (18x) and `opcost/num_valueof` (19x). Judge per-op cost
+  against ourselves (same-binary seam, or the helper census) and take the node
+  comparison from a row node cannot fold — `arrays/index_loop` 4.4x,
+  `arrays/for_of_dense` 4.2x, `arrays/push_pop` 14x all reproduce with the row's
+  value matching. A row whose ratio looks wildly unlike the corpus total (2.6x)
+  is usually node folding it, not an engine defect.
+- **A probe you wrote yourself folds the same way.** `scratch/probe/elem_num.js`
+  (`strs = [8,8,8,8]`) measured 0.071 ms on node for 100k iterations of a
+  load-plus-add — 2 cycles on a 4-cycle dependency chain, which is loop
+  elimination. Keep the probe's operands opaque (a parameter, a global read, an
+  accumulating index) before drawing a per-iteration conclusion from it.
 
 ## Build provenance and native layout
 
@@ -164,3 +181,27 @@ from 31.5 to 17.7 ns/iter but left the JIT 16% over its baseline, because
 generated code: deleting the *producer* moves no emitted code. Measure both rows,
 and read an unchanged `SLAG_OPT=0` row as the signal that the cost sits in the
 lowering both tiers share, not in the optimizing tier's lift.
+
+## Reading a per-iteration gap in the generated code
+
+Before designing a cut, convert the row to cycles per iteration and compare it
+with the dependency chain it must have. `JIT_DUMP_CLIF=1` prints the CLIF and
+the disassembly (`function %jit_opt_body` = the optimizing tier); find the loop
+by its back edge and read the hot block, not the entry.
+
+- **A software sequence masquerading as one instruction.** `fcvt_to_uint_sat`
+  and `fcvt_from_uint` on `i64` are `cvt_float64_to_uint64_sat_seq` /
+  `u64_to_f64_seq`: multi-branch expansions because x86-64 has no unsigned
+  conversion. The SIGNED pair (`cvttsd2si`/`cvtsi2sd`) is one instruction each and
+  is exact inside `[0, 2^63)`, so a bounded index/count wants the signed form.
+  Grep the dump for `_seq` before blaming anything else — the canonical-index
+  gate had two of them in every element read's address chain, and switching cost
+  `arrays/typed_array` -12.6%, `arrays/index_loop` -3.0%.
+- **Loop-carried locals in frame slots, not registers.** `arrays/index_loop` runs
+  3M iterations at ~4.8 ns (~17 cycles) against node's ~1.1 ns (~4 cycles = one
+  `fadd` latency). The CLIF shows why: `i` and `s` are reloaded from and stored
+  to the body's frame (`load v0+16` … `fadd` … `store v0+16`) every iteration, so
+  the chain is store-to-load forwarding plus the arithmetic, not the arithmetic.
+  A row whose cost is ~4-5 cycles above the arithmetic it performs is a
+  frame-slot/lowering question (the register tier), not a missing fast path — do
+  not go looking for another op to inline.

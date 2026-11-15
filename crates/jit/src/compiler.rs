@@ -3141,7 +3141,7 @@ impl<'a> Lowerer<'a> {
         // The value: `array_length` as a Number (a small non-negative f64,
         // whose bits are the raw NaN-boxed Number — no reserved-tag form).
         self.builder.switch_to_block(hit);
-        let len_f = self.builder.ins().fcvt_from_uint(types::F64, arr_len);
+        let len_f = crate::index_gate::number_from_index(&mut self.builder, arr_len);
         let len_bits = self
             .builder
             .ins()
@@ -3371,22 +3371,10 @@ impl<'a> Lowerer<'a> {
         let bounds = self.builder.create_block();
         let load_blk = self.builder.create_block();
         let hit = self.builder.create_block();
-        // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips exactly
-        // when `num` is an integral double in range, so one f64 -> u64 -> f64
-        // round trip plus the `< 2^32-1` bound rejects fractional, negative,
-        // huge, and non-double keys (a NaN-boxed heap/undefined value bitcasts
-        // to a NaN, whose compare fails). The saturating conversion never traps,
-        // so no separate is-double block is needed; a `-0.0` key — which
-        // `ToPropertyKey` normalizes to `"0"` before it ever reaches a
-        // computed read — round-trips to index 0.
+        // The canonical-index gate (see `index_gate::canonical_index`).
         self.builder.switch_to_block(entry);
         let num = self.value_as_f64(key);
-        let max = self.builder.ins().f64const(4294967295.0);
-        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
-        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
-        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
-        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
-        let key_ok = self.builder.ins().band(integral, lt_max);
+        let (idx, key_ok) = crate::index_gate::canonical_index(&mut self.builder, num);
         self.builder.ins().brif(key_ok, bounds, &[], miss, &[]);
         self.builder.seal_block(bounds);
         // The bounds gate: `elem_len` is the authoritative materialized length.
@@ -3488,7 +3476,7 @@ impl<'a> Lowerer<'a> {
         // `length` can exceed the materialized prefix when the tail is holes;
         // those elements miss in `at_dense` and must reach the chain.
         self.builder.switch_to_block(in_range);
-        let k = self.builder.ins().fcvt_to_uint_sat(types::I64, k);
+        let k = crate::index_gate::index_from_number(&mut self.builder, k);
         let elem_len = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
@@ -3658,7 +3646,7 @@ impl<'a> Lowerer<'a> {
             slots_ptr,
             Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_cap) as i32),
         );
-        let len_u = self.builder.ins().fcvt_to_uint_sat(types::I64, length);
+        let len_u = crate::index_gate::index_from_number(&mut self.builder, length);
         let at_end = self.builder.ins().icmp(IntCC::Equal, elem_len, len_u);
         let has_room = self
             .builder
@@ -3800,12 +3788,7 @@ impl<'a> Lowerer<'a> {
         // The canonical-index gate (mirrors the read arm's).
         self.builder.switch_to_block(key_ok_check);
         let num = self.value_as_f64(key);
-        let max = self.builder.ins().f64const(4294967295.0);
-        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
-        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
-        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
-        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
-        let key_ok = self.builder.ins().band(integral, lt_max);
+        let (idx, key_ok) = crate::index_gate::canonical_index(&mut self.builder, num);
         self.builder.ins().brif(key_ok, bounds, &[], slow, &[]);
         self.builder.seal_block(key_ok_check);
         // The bounds gate: `elem_len` is the authoritative materialized length.
@@ -4193,16 +4176,11 @@ impl<'a> Lowerer<'a> {
         // element-count bound).
         self.builder.switch_to_block(key_gate);
         let num = self.value_as_f64(key);
-        let max = self.builder.ins().f64const(4294967295.0);
-        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
-        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
-        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
-        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
+        let (idx, key_ok) = crate::index_gate::canonical_index(&mut self.builder, num);
         let in_bounds = self
             .builder
             .ins()
             .icmp(IntCC::UnsignedLessThan, idx, arr_len);
-        let key_ok = self.builder.ins().band(integral, lt_max);
         let read_ok = self.builder.ins().band(key_ok, in_bounds);
         let base = self.builder.ins().iadd(data, byte_offset);
         self.builder.ins().brif(read_ok, tests[0], &[], legacy, &[]);
@@ -4279,7 +4257,7 @@ impl<'a> Lowerer<'a> {
         let num = if signed {
             self.builder.ins().fcvt_from_sint(types::F64, wide)
         } else {
-            self.builder.ins().fcvt_from_uint(types::F64, wide)
+            crate::index_gate::number_from_index(&mut self.builder, wide)
         };
         self.builder
             .ins()
@@ -4380,22 +4358,10 @@ impl<'a> Lowerer<'a> {
             .ins()
             .brif(slots_ok, key_ok_check, &[], legacy, &[]);
         self.builder.seal_block(probe);
-        // The canonical-index gate: `idx = ToUint64Sat(num)` round-trips
-        // exactly when `num` is an integral double in range, so one
-        // f64 -> u64 -> f64 round trip plus the `< 2^32-1` bound rejects
-        // fractional, negative, huge, and non-double keys (a NaN-boxed
-        // heap/undefined value bitcasts to a NaN, whose compare fails). The
-        // saturating conversion never traps, so no separate is-double block
-        // is needed; `-0.0` round-trips to index 0, which is the correct
-        // canonicalization.
+        // The canonical-index gate (see `index_gate::canonical_index`).
         self.builder.switch_to_block(key_ok_check);
         let num = self.value_as_f64(key);
-        let max = self.builder.ins().f64const(4294967295.0);
-        let lt_max = self.builder.ins().fcmp(FloatCC::LessThan, num, max);
-        let idx = self.builder.ins().fcvt_to_uint_sat(types::I64, num);
-        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
-        let integral = self.builder.ins().fcmp(FloatCC::Equal, back, num);
-        let key_ok = self.builder.ins().band(integral, lt_max);
+        let (idx, key_ok) = crate::index_gate::canonical_index(&mut self.builder, num);
         self.builder.def_var(idx_var, idx);
         self.builder.ins().brif(key_ok, len_check, &[], legacy, &[]);
         self.builder.seal_block(key_ok_check);
@@ -4414,8 +4380,9 @@ impl<'a> Lowerer<'a> {
             Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
         );
         let idx = self.builder.use_var(idx_var);
-        // `back` is `fcvt_from_uint(idx)` from the gate — reuse it instead of
-        // re-converting the same index.
+        // `idx` round-trips back to the key exactly (the gate proved it), so
+        // the append-position test compares against the key's own f64.
+        let back = crate::index_gate::number_from_index(&mut self.builder, idx);
         let append_ok = self.builder.ins().fcmp(FloatCC::Equal, back, length);
         // A2/A6: this store writes without the write barrier, which is sound
         // exactly when the edge it could create cannot exist — only a *heap*
@@ -4796,11 +4763,11 @@ impl<'a> Lowerer<'a> {
         // here, the range gates already passed) and the index-vs-fixed-
         // length bound.
         self.builder.switch_to_block(ints);
-        let idx = self.builder.ins().fcvt_to_uint(types::I64, num);
-        let back = self.builder.ins().fcvt_from_uint(types::F64, idx);
+        let idx = crate::index_gate::index_from_number(&mut self.builder, num);
+        let back = crate::index_gate::number_from_index(&mut self.builder, idx);
         let key_int = self.builder.ins().fcmp(FloatCC::Equal, back, num);
-        let vbyte = self.builder.ins().fcvt_to_uint(types::I64, vnum);
-        let vback = self.builder.ins().fcvt_from_uint(types::F64, vbyte);
+        let vbyte = crate::index_gate::index_from_number(&mut self.builder, vnum);
+        let vback = crate::index_gate::number_from_index(&mut self.builder, vbyte);
         let val_int = self.builder.ins().fcmp(FloatCC::Equal, vback, vnum);
         let len_ok = self
             .builder
@@ -10680,7 +10647,7 @@ impl<'a> Lowerer<'a> {
         // `>>>` answers a `ToUint32` (`0..2^32-1`); the others a signed `i32`.
         let res = if unsigned {
             let wide = self.builder.ins().uextend(types::I64, res);
-            self.builder.ins().fcvt_from_uint(types::F64, wide)
+            crate::index_gate::number_from_index(&mut self.builder, wide)
         } else {
             self.builder.ins().fcvt_from_sint(types::F64, res)
         };

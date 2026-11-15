@@ -16,7 +16,8 @@ Locations: `crates/crux/src/object.rs` (`ArraySlots`, the cursor,
 hole sentinel), `crates/jit/src/compiler.rs`
 (`emit_dense_array_append_inline`, `emit_element_read`,
 `emit_dense_element_read_into`, `emit_typed_array_read_into`,
-`emit_computed_store`, `emit_member_cell_probe`'s length path),
+`emit_computed_store`, `emit_member_cell_probe`'s length path`,
+`crates/jit/src/index_gate.rs` (the canonical-index gate),
 `crates/runtime/src/ir.rs` (`member_cell_get`, `array_length`,
 `array_element_get`).
 
@@ -224,6 +225,26 @@ accessor wins); returning the sentinel bits would be a wrong value, not a
 wrong-looking one. A stored `undefined` is a real value and IS served. Also
 declining: a spilled array, a string/out-of-range key, and a non-Array
 receiver.
+
+**The index gate lives in `crates/jit/src/index_gate.rs`**, shared by every arm
+in both tiers (dense read/store, append, typed read/store — eight sites that
+were byte-identical copies). Use `canonical_index(builder, num)` for the gate and
+`index_from_number`/`number_from_index` for a post-gate conversion of a bounded
+count or index. Do not reintroduce `fcvt_to_uint_sat`/`fcvt_from_uint` on
+`i64`: those are `cvt_float64_to_uint64_sat_seq`/`u64_to_f64_seq` software
+sequences in the address chain, where the signed pair is one instruction each
+and exact inside `[0, 2^63)` — `arrays/typed_array` -12.6%, `arrays/index_loop`
+-3.0% (min-of-9..13, interleaved, both sides from the same xtask cache). The
+accepted key set is unchanged: the added `>= 0` bound rejects what
+`ToUint64Sat` saturated to 0, and both forms reject a value whose round trip
+differs (so `-0.0` still serves index 0 and `1.5`/`NaN`/a heap value still
+decline). Keep the conversions *saturating* — a non-saturating `fcvt_to_uint` is
+only sound where an earlier gate proved the range, and it costs the same.
+
+What the gate does NOT explain is the rest of the read's cost. `arrays/index_loop`
+still runs ~17 cycles/iteration against node's ~4, because the loop-carried locals
+sit in frame slots (`load s; fadd; store s`), which is the register tier's
+question, not another probe's.
 
 While dense every element is a writable data property (a non-w/e/c element
 descriptor spills the array), so an own buffer element shadows the whole chain

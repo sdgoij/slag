@@ -317,6 +317,18 @@ A0 rather than a lift:
   by the ablation it cannot be *sufficient*: the closures it creates cost 340 ns
   each and the tier does not change that.
 
+One correction to "not register traffic", because it is row-dependent and the
+frame-slot term does bind on tight arithmetic/array loops. `arrays/index_loop`
+(3M iterations of `s += a[i & 199999]`) runs 14.4 ms = 4.8 ns/iteration
+(~17 cycles) against node's 1.1 ns (~4 cycles, i.e. one `fadd` latency), and the
+CLIF shows a lifted body carrying its two loop-carried locals in frame slots —
+`load v0+16; fadd; store v0+16` for `s`, the same round trip for `i` — so the
+chain is store-to-load forwarding (~5-6 cycles) plus the arithmetic. That row is
+the benchmark for whatever keeps locals out of memory (C2's stack map is the
+precondition), and it is worth its own measurement: it does not move for helper,
+cell, or opcode work (the canonical-index gate's software sequences went away
+and bought 3%).
+
 ---
 
 ## 2. The value model: what "out of the `Value` stack" means
