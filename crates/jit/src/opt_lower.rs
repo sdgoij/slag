@@ -4404,7 +4404,6 @@ fn emit_chain_probe(
     miss: Block,
     value: Variable,
 ) {
-    let gated = builder.create_block();
     let map_gate = builder.create_block();
     let map_cell = builder.create_block();
     let map_keyed = builder.create_block();
@@ -4429,7 +4428,32 @@ fn emit_chain_probe(
     // cell) is observed.
     builder.switch_to_block(entry);
     let name_imm = builder.ins().iconst(types::I64, name as i64);
-    let obj_ptr = crate::cells::object_data_ptr(builder, object);
+    // The receiver's `JsObject` pointer: an Object's own box, or a Function's
+    // OBJECT PART (a separate box — `f.apply`/`f.call` is the shape, and
+    // `Vm::chain_object` keys those resolutions by the object part). Branched,
+    // not `select`ed: a speculative load of the function's field costs an extra
+    // dependent cache line on every ordinary-object read (measured 30% on
+    // `proto_read`).
+    let ptr_fn_gate = builder.create_block();
+    let ptr_fn = builder.create_block();
+    let ptr_join = builder.create_block();
+    builder.append_block_param(ptr_join, types::I64);
+    let obj_direct = crate::cells::object_data_ptr(builder, object);
+    let obj_ok = crate::cells::is_plain_object(builder, object);
+    builder
+        .ins()
+        .brif(obj_ok, ptr_join, &[obj_direct.into()], ptr_fn_gate, &[]);
+    builder.seal_block(ptr_fn_gate);
+    builder.switch_to_block(ptr_fn_gate);
+    let fn_ok = crate::cells::is_function(builder, object);
+    builder.ins().brif(fn_ok, ptr_fn, &[], miss, &[]);
+    builder.seal_block(ptr_fn);
+    builder.switch_to_block(ptr_fn);
+    let fn_ptr = crate::cells::chain_object_ptr(builder, object);
+    builder.ins().jump(ptr_join, &[fn_ptr.into()]);
+    builder.seal_block(ptr_join);
+    builder.switch_to_block(ptr_join);
+    let obj_ptr = builder.block_params(ptr_join)[0];
     let dense = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -4456,9 +4480,10 @@ fn emit_chain_probe(
     );
     let exotic = builder.ins().bor(dense, typed);
     let plain = builder.ins().icmp_imm_u(IntCC::Equal, exotic, 0);
-    builder.ins().brif(plain, gated, &[], map_gate, &[]);
-    builder.seal_block(gated);
-    builder.switch_to_block(gated);
+    let plain_body = builder.create_block();
+    builder.ins().brif(plain, plain_body, &[], map_gate, &[]);
+    builder.seal_block(plain_body);
+    builder.switch_to_block(plain_body);
     let receiver_id = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -4771,7 +4796,7 @@ fn emit_member_chain_read(
         builder.seal_block(obj_entry);
         builder.switch_to_block(obj_entry);
     }
-    let obj_ok = crate::cells::is_plain_object(builder, object);
+    let obj_ok = crate::cells::is_chain_receiver(builder, object);
     builder.ins().brif(obj_ok, entry, &[], slow, &[]);
     builder.seal_block(entry);
     emit_chain_probe(builder, abi, object, name, entry, merge, slow, value);

@@ -460,20 +460,19 @@ cell) whose `borrow_mut` guard refreshes it on drop, so the maintenance is
 structural. The payload is 432 B inside the 448-byte arena class — the last byte
 of headroom (`.notes/perf.md` has the table and the gates).
 
-**What is left** is `calls/apply_call` 7.0 M (the `Step::CallApply` shape: the
-banked negative was extending the *identity* probe to function receivers; a
-fused intrinsic-style callee check in the step's own lowering is the untried
-shape), `opcost/prim_prop` 4.4 M (a primitive string's `length`, whose native
-length is not a fixed-offset field), the string-concat pairs ~3.5 M
-(`BinarySlow` more than the read), and `construct_churn`'s 875 k (each new
-instance's cold first read — inherent, since a receiver read once can never use
-a per-receiver cell).
+**What is left** is `opcost/prim_prop` 7.2 M (a primitive string's `length`, whose
+native length is not a fixed-offset field), the string-concat pairs ~3.5 M
+(`BinarySlow` more than the read), `opcost/num_valueof` 1.6 M, and single digits
+elsewhere. `calls/apply_call`'s 7.0 M went away by serving **function receivers**
+in both probes (`f.apply`'s read is keyed by the function's object part;
+`Function::object` is a second box, so the pointer dispatch must be a branch
+through a block parameter — a `select` over both pointers cost `proto_read` 30%).
 
-One negative result stays banked: extending the *identity* probe to function
-receivers (the `f.apply` shape) measured `calls/apply_call` **6.5% slower**
-(`SLAG_CHAIN_PROBE`, one binary, min-of-9) and was reverted — that row's reads go
-through `Step::CallApply`, not a named read, so the extension only added decline
-work.
+One negative result stays banked, in corrected form: extending the *identity*
+probe to function receivers measured `calls/apply_call` **6.5% slower** in an
+earlier session because `is_plain_object` still rejected the receiver before the
+probe looked at a cell, so the extension only added decline work. The row needs
+the read *served* (the object-part dispatch), not merely admitted.
 
 **A0, function-object creation (~340 ns each).** The measured dominant term in
 the corpus's two largest rows (§1.4): three closures per body cost ~1 µs of

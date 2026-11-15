@@ -6675,6 +6675,44 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_function_receiver_chain_read_honors_a_shadowing_apply() {
+        // `f.apply` is served by the chain cell through the function's OBJECT
+        // PART (`Vm::chain_object` keys it there). Assigning `g.apply` puts an
+        // own property on that same object part, which bumps the generation the
+        // cell is validated against — so the read must return the own function.
+        // Expected: 50 * 1 + 50 * 9 = 500.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function g() { return 1; }\n\
+                     function f(n) { var s = 0; for (var i = 0; i < n; i++) { if (i === 50) { g.apply = function () { return 9; }; } s += i < 50 ? g.apply(null, []) : g.apply(); } return s; }\n\
+                     f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(500.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_functions_apply_matches_the_interpreter() {
+        // The plain ``f.apply(null, args)`` shape, twice: the second call's
+        // receiver has a warm chain cell, and the arguments must still be the
+        // array's elements (not the array).
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function add(a, b, c) { return a + b + c; }\n\
+                     function f(n) { var args = [1, 2, 3]; var s = 0; for (var i = 0; i < n; i++) { s += add.apply(null, args); } return s; }\n\
+                     f(10) + f(10);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(120.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_member_probe_misses_on_mid_run_mutation() {
         // The compiled `GetMemberName` probe validates the value cell
         // against the receiver's LIVE generation: the `o.f = 2` store at

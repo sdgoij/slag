@@ -39,6 +39,51 @@ pub(crate) fn is_plain_object(builder: &mut FunctionBuilder, value: Value) -> Va
     builder.ins().band(is_heap, tag_obj)
 }
 
+/// Whether `value` is a Function (`TAG_FUNCTION`).
+pub(crate) fn is_function(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let masked = builder.ins().band_imm_u(value, crux::TAG_MASK as i64);
+    let is_heap = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, masked, crux::TAG_PREFIX as i64);
+    let tag = builder.ins().ushr_imm_u(value, 44);
+    let tag = builder.ins().band_imm_u(tag, 0xF);
+    let tag_fn = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag, crux::TAG_FUNCTION as i64);
+    builder.ins().band(is_heap, tag_fn)
+}
+
+/// The machine twin of `Vm::chain_object`: the tag test for a receiver the
+/// prototype-chain cache serves (an Object or a Function — a function's own
+/// properties and [[Prototype]] live on its *object part*).
+pub(crate) fn is_chain_receiver(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let plain = is_plain_object(builder, value);
+    let function = is_function(builder, value);
+    builder.ins().bor(plain, function)
+}
+
+/// The `JsObject` data pointer behind a chain receiver: an Object value's own
+/// box, or a Function value's object part (a separate box reached through
+/// `Function::object`). Valid only where [`is_chain_receiver`] holds — a
+/// non-receiver's payload is not a box at all.
+pub(crate) fn chain_object_ptr(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let direct = object_data_ptr(builder, value);
+    // For a Function, `direct` addresses the `Function` payload. The load is
+    // speculative (an Object's box is far larger than this offset, so it stays
+    // in-bounds) and `select` picks the right pointer.
+    let object_part = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        direct,
+        Offset32::new(std::mem::offset_of!(crux::function::Function, object) as i32),
+    );
+    let via_function = builder
+        .ins()
+        .iadd_imm_s(object_part, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let function = is_function(builder, value);
+    builder.ins().select(function, via_function, direct)
+}
+
 /// The address of the member-value cell for `(object_id, name_imm)`, mirroring
 /// `Vm::member_cell_index` (`(id ^ atom) & (MEMBER_CELLS - 1)`).
 pub(crate) fn member_value_cell_addr(

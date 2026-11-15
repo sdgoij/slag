@@ -135,6 +135,21 @@ Corpus `GetMemberName` traffic: 83.3 M at the start of the session, 52.2 M after
 
 **A gate trap.** The first version of the array gate used `named_version == 1` ("only `length` was ever defined"). Arrays measure `named_version == 0`: the creation's `length` define does not advance it, and an array-length write is in place. The `1` declined every array, so the arm looked inert until the census said so.
 
+### Function receivers: `f.apply` in the machine tier (2026-11-15, last)
+
+`calls/apply_call` was the last big `GetMemberName` bucket (7.0 M) and a banked negative: an earlier attempt extended the *identity* probe to function receivers and measured the row 6.5% slower. The reason it did nothing is that the read has to be served at all: `is_plain_object` rejects `TAG_FUNCTION` before the probe looks at a cell, so the read went to the helper both times.
+
+Both chain probes now dispatch on the tag and read the **object part**: a Function value's payload is a `Function` box, and its own properties and `[[Prototype]]` live on `Function::object` — a separate box, which is the identity the interpreter records (`Vm::chain_object` keys function receivers there). The dispatch is a branch that passes the pointer through as a block parameter, *not* a `select` over both pointers: the `select` version cost `proto_read` **30%**, because its speculative load touches another cache line on every ordinary-object read. With the branch, an object receiver's code is unchanged and measures +1.0% (noise).
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `calls/apply_call` | 41.9 | 26.5 | **-37%** |
+| `calls/method_call` | 68.4 | 65.1 | -5% |
+| `arrays/hof_methods` | 17.9 | 17.8 | -0.2% |
+| `objects/proto_read`, `objects/own_read`, `control/nested_loops` | | | +1.0 / -0.3 / +0.1% |
+
+Corpus `GetMemberName`: 83.3 M at the start of the session, **20.5 M** now. The remainder is `opcost/prim_prop` 7.2 M (a primitive string's `.length`, whose native length is not a fixed-offset field), the string-concat pairs ~3.5 M, `opcost/num_valueof` 1.6 M, and the per-row single digits.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

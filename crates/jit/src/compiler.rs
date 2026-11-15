@@ -1899,12 +1899,32 @@ impl<'a> Lowerer<'a> {
         let value_var = self.builder.declare_var(types::I64);
         let merge = self.builder.create_block();
 
-        let plain = self.builder.create_block();
+        let fn_gate = self.builder.create_block();
+        let fn_entry = self.builder.create_block();
+        // A FUNCTION receiver is served too: `f.apply`/`f.call` is the shape
+        // (`Vm::chain_object` keys those resolutions by the function's OBJECT
+        // PART), and that call form's loop lives in this tier. The pointer is a
+        // block parameter so the object edge passes its own through the branch;
+        // a `select` over both pointers instead cost `proto_read` 30%, because
+        // the speculative load touches another cache line on every object read.
+        let gated = self.builder.create_block();
+        self.builder.append_block_param(gated, types::I64);
+        let obj_ptr_direct = crate::cells::object_data_ptr(&mut self.builder, object);
         let obj_ok = crate::cells::is_plain_object(&mut self.builder, object);
-        self.builder.ins().brif(obj_ok, plain, &[], miss, &[]);
-        self.builder.switch_to_block(plain);
-        self.builder.seal_block(plain);
-        let ptr = crate::cells::object_data_ptr(&mut self.builder, object);
+        self.builder
+            .ins()
+            .brif(obj_ok, gated, &[obj_ptr_direct.into()], fn_gate, &[]);
+        self.builder.switch_to_block(fn_gate);
+        self.builder.seal_block(fn_gate);
+        let fn_ok = crate::cells::is_function(&mut self.builder, object);
+        self.builder.ins().brif(fn_ok, fn_entry, &[], miss, &[]);
+        self.builder.switch_to_block(fn_entry);
+        self.builder.seal_block(fn_entry);
+        let fn_ptr = crate::cells::chain_object_ptr(&mut self.builder, object);
+        self.builder.ins().jump(gated, &[fn_ptr.into()]);
+        self.builder.switch_to_block(gated);
+        self.builder.seal_block(gated);
+        let ptr = self.builder.block_params(gated)[0];
         // A dense Array or a TypedArray bumps its generation on every element
         // write, so the identity cell can never validate for it (its reads
         // decline in the interpreter through the Array-specific escape this

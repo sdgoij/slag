@@ -1484,3 +1484,42 @@ Two measurement notes: the array rows are 1-3 ms, so judge them isolated and
 interleaved (min-of-9) or not at all; and an `opt bail`-free body means the opt
 lane is in play — `SLAG_OPT=0` is how you tell whether the per-step lane has the
 same arm.
+
+### 35.2 Function receivers: the object part, and why the dispatch must branch
+
+`f.apply`/`f.call` and every "read a property off a function" site is a chain read
+whose receiver is not an `Object` value: `is_plain_object` rejects `TAG_FUNCTION`,
+so the probe used to decline before touching a cell and the read went to the
+helper (7.0 M calls on `calls/apply_call` alone).
+
+A Function value's payload is a `Function` box, and its own properties and
+`[[Prototype]]` live on `Function::object` — a SEPARATE box. That object part is
+the identity the interpreter records (`Vm::chain_object` maps a function value to
+`&function.object`), so the probe must key on it:
+
+```text
+ptr_of(obj)  = (value & PAYLOAD_MASK) << 4 + GCBOX_DATA_OFFSET
+ptr_of(fn)   = load(ptr_of(obj) + offset_of!(Function, object)) + GCBOX_DATA_OFFSET
+```
+
+Both probes gate on the tag and dispatch. The shape of that dispatch matters more
+than it looks:
+
+- **Do not `select` the two pointers.** Computing both and selecting cost
+  `objects/proto_read` **30%**: the function-side load is speculative on every
+  ordinary-object read and touches another cache line. Branch instead, and pass
+  the pointer through the branch as a Cranelift block parameter
+  (`brif(plain, body, &[obj_ptr.into()], fn_gate, &[])`), so the object path's
+  instructions are unchanged — re-measured at +1.0% (noise).
+- **The block holding the join must not reuse the body's own block names.** The
+  body already has a block called `gated` (the dense/typed gate); a second
+  `gated` for the pointer join shadowed it and Cranelift panicked with
+  `assertion failed: !self.is_sealed(block)` from
+  `ssa::declare_block_predecessor` — a jump into an already-sealed block.
+- **Both tiers need it.** `calls/apply_call`'s loop lives in the *per-step* lane
+  (its `bench` body bails while the callee lifts), and `method_call`/`hof_methods`
+  move with it; an opt-only widening measured apply_call -3.5% instead of -37%.
+- **Correctness net:** the cell is validated by the object part's generation, so
+  `g.apply = function () { return 9; }` (an own property on that same part) bumps
+  it and the read returns the own function —
+  `installed_jit_function_receiver_chain_read_honors_a_shadowing_apply`.
