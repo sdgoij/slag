@@ -1175,8 +1175,8 @@ fn keys_of_answer(answer: &crux::value::Value) -> Vec<crux::property::PropertyKe
     let Some(array) = answer.as_object() else {
         return Vec::new();
     };
-    let length = api::Array::length(&crate::realm_current(), &api::Local::from(*answer))
-        .unwrap_or(0.0);
+    let length =
+        api::Array::length(&crate::realm_current(), &api::Local::from(*answer)).unwrap_or(0.0);
     let mut keys = Vec::new();
     for position in 0..length as u64 {
         let slot = crux::property::PropertyKey::from_index(position);

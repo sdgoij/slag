@@ -191,8 +191,11 @@ fn lower(
             values_to_map.extend(site.roots);
         }
         for value in values_to_map {
-            let slot = builder
-                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
             map_slots.push((value, slot));
         }
         for &(_, slot) in &map_slots {

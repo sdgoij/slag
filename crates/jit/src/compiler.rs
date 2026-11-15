@@ -11488,8 +11488,8 @@ mod stack_map_tests {
             // The value a stack map would name: held in a sized slot, so its
             // frame offset is known after regalloc.
             let held = b.ins().iconst(types::I64, 0x4142_4143);
-            let slot = b
-                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            let slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
             b.ins().stack_store(types::I64, held, slot, 0);
             // A safepoint: any non-tail call. The callee is never run, so a
             // null entry is enough to compile.

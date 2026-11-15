@@ -314,7 +314,11 @@ fn try_inline(
         let term = match src.term.as_ref().expect("spliceable has a terminator") {
             Term::Return(Some(v)) => Term::Jump {
                 target: cont,
-                args: if result.is_some() { vec![map(*v)] } else { Vec::new() },
+                args: if result.is_some() {
+                    vec![map(*v)]
+                } else {
+                    Vec::new()
+                },
             },
             Term::Return(None) if result.is_none() => Term::Jump {
                 target: cont,

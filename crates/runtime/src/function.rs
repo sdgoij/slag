@@ -1406,8 +1406,7 @@ fn fnv1a_units(units: &[u16]) -> usize {
 
 type FunctionBodyKey = (usize, usize, usize, usize, usize);
 
-type FunctionBodyCache =
-    SiteHashMap<FunctionBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
+type FunctionBodyCache = SiteHashMap<FunctionBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
 
 thread_local! {
     static FUNCTION_BODY_CACHE: std::cell::RefCell<FunctionBodyCache> =
@@ -1497,8 +1496,7 @@ pub fn shared_arrow_body(agent: &Agent, body: &syntax::ast::ArrowBody) -> std::r
 
 type ArrowBodyKey = (usize, usize, usize, usize, usize);
 
-type ArrowBodyCache =
-    SiteHashMap<ArrowBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
+type ArrowBodyCache = SiteHashMap<ArrowBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
 
 thread_local! {
     static ARROW_BODY_CACHE: std::cell::RefCell<ArrowBodyCache> =
@@ -1539,8 +1537,7 @@ pub fn shared_accessor_body(agent: &Agent, body: &Block) -> std::rc::Rc<Block> {
 
 type AccessorBodyKey = (usize, usize, usize, usize, usize);
 
-type AccessorBodyCache =
-    SiteHashMap<AccessorBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
+type AccessorBodyCache = SiteHashMap<AccessorBodyKey, (std::rc::Rc<Block>, Option<JsString>)>;
 
 thread_local! {
     static ACCESSOR_BODY_CACHE: std::cell::RefCell<AccessorBodyCache> =
