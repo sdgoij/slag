@@ -6210,6 +6210,52 @@ mod tests {
     }
 
     #[test]
+    fn a_named_own_property_always_advances_the_named_version() {
+        // The compiled member probes read `named_version == 0` as a
+        // generation-free proof that the receiver owns no string-keyed property
+        // (so an internal-slot mutation that bumps the generation cannot have
+        // shadowed a chain read). Every path that gains or loses one has to
+        // advance it, or a probe accepts a stale resolution.
+        let key = JsString::from_utf8("x");
+        let object = JsObject::ordinary_object_create(None);
+        assert_eq!(object.named_version.get(), 0, "fresh: no names ever");
+
+        let desc = PropertyDescriptor {
+            value: Some(Value::Number(1.0)),
+            writable: Some(true),
+            get: None,
+            set: None,
+            enumerable: Some(true),
+            configurable: Some(true),
+        };
+        assert!(object.define_property(&key, &desc).expect("defines"));
+        let after_define = object.named_version.get();
+        assert_ne!(after_define, 0, "a define advances it");
+
+        assert!(
+            object
+                .delete_key(&PropertyKey::from_js_string(&key))
+                .expect("deletes")
+        );
+        assert_ne!(
+            object.named_version.get(),
+            after_define,
+            "a delete advances it"
+        );
+
+        // A symbol key can never shadow an atom (string) read, so it is not
+        // counted.
+        let before_symbol = object.named_version.get();
+        let symbol = PropertyKey::Symbol(crate::symbol::well_known("iterator"));
+        assert!(object.define_property_key(&symbol, &desc).expect("defines"));
+        assert_eq!(
+            object.named_version.get(),
+            before_symbol,
+            "a symbol key leaves it alone"
+        );
+    }
+
+    #[test]
     #[cfg(target_pointer_width = "64")]
     fn the_internal_field_slot_costs_no_arena_bytes() {
         // The realm field is the payload's last addition; on the audit

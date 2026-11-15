@@ -4378,15 +4378,21 @@ fn emit_deferred_update_store(
     builder.seal_block(fill);
 }
 
-/// The compiled prototype-chain probe: a dense Array receiver that has never
-/// gained a string-keyed own property resolves its method from the shared
-/// map-keyed chain cell. `entry` is already known to be a plain object. A
-/// validated hit writes the value to `value` and jumps to `hit`; every
-/// decline jumps to `miss` (the caller's shape probe or exact helper). The
-/// cell caches the RESOLUTION (map id, link count, each link's (id,
-/// generation)), not the value: the found link's `member_value_cells` entry
-/// is re-read under its live generation, so a prototype method's value write
-/// (a no-bump warm store refreshes that cell) is observed.
+/// The compiled prototype-chain probe: an ordinary object receiver whose
+/// `(id, generation)` still match a recorded resolution reads the found
+/// link's value from the shared identity-keyed chain cell. `entry` is already
+/// known to be a plain object (the caller ran `is_plain_object`). A validated
+/// hit writes the value to `value` and jumps to `hit`; every decline jumps to
+/// `miss` (the caller's shape probe or exact helper). The cell caches the
+/// RESOLUTION (receiver id + generation, link count, each link's (id,
+/// generation)), not the value: the found link's `member_value_cells` entry is
+/// re-read under its live generation, so a prototype method's value write (a
+/// no-bump warm store refreshes that cell) is observed.
+///
+/// This mirrors `compiler.rs::emit_chain_cell_probe` — one table
+/// (`JitCallContext::member_chain_cells`), one slot arithmetic
+/// (`Vm::member_chain_index`). A map-keyed key against this table never
+/// matches, which is what silently disabled this probe for every lifted body.
 #[allow(clippy::too_many_arguments)]
 fn emit_chain_probe(
     builder: &mut FunctionBuilder,
@@ -4399,7 +4405,6 @@ fn emit_chain_probe(
     value: Variable,
 ) {
     let gated = builder.create_block();
-    let map_id_blk = builder.create_block();
     let links1 = builder.create_block();
     let link1_live = builder.create_block();
     let after1 = builder.create_block();
@@ -4408,51 +4413,47 @@ fn emit_chain_probe(
     let value1 = builder.create_block();
     let value2 = builder.create_block();
 
-    // The fast-path receiver: a dense Array that has never had a
-    // string-keyed own property installed. `array_dense` non-null pins the
-    // dense Array representation; `named_version == 0` is the layout-safe
-    // proof that no own name can shadow the chain (dense element churn never
-    // advances it).
+    // The identity-keyed chain cell the interpreter records
+    // (`Vm::member_chain_index`): the receiver's own id and generation, the
+    // name, and the links the resolution walked. This is the same cell shape
+    // the per-step lane probes (`compiler.rs::emit_chain_cell_probe`), so the
+    // two tiers answer from one table — the runtime fills it once and both
+    // read it.
     builder.switch_to_block(entry);
     let name_imm = builder.ins().iconst(types::I64, name as i64);
     let obj_ptr = crate::cells::object_data_ptr(builder, object);
+    // Decline a dense Array or a TypedArray BEFORE the cell touch: both bump
+    // their generation on every element write, so the identity cell can never
+    // validate for them (their method reads stay on the helper, exactly as in
+    // the per-step lane).
     let dense = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
         obj_ptr,
         Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
     );
-    let dense_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, dense, 0);
-    let named_version = builder.ins().load(
+    let typed = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
+    );
+    let exotic = builder.ins().bor(dense, typed);
+    let plain = builder.ins().icmp_imm_u(IntCC::Equal, exotic, 0);
+    builder.ins().brif(plain, gated, &[], miss, &[]);
+    builder.seal_block(gated);
+    builder.switch_to_block(gated);
+    let receiver_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, id) as i32),
+    );
+    let receiver_gen = builder.ins().load(
         types::I32,
         MemFlagsData::new(),
         obj_ptr,
-        Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
-    );
-    let clean = builder.ins().icmp_imm_u(IntCC::Equal, named_version, 0);
-    let gate = builder.ins().band(dense_ok, clean);
-    builder.ins().brif(gate, gated, &[], miss, &[]);
-    builder.seal_block(gated);
-    builder.switch_to_block(gated);
-    let map_handle = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        obj_ptr,
-        Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
-    );
-    let has_map = builder.ins().icmp_imm_u(IntCC::NotEqual, map_handle, 0);
-    builder.ins().brif(has_map, map_id_blk, &[], miss, &[]);
-    builder.seal_block(map_id_blk);
-    // The map-keyed chain cell: `(map_id ^ name) & (MEMBER_CELLS - 1)`.
-    builder.switch_to_block(map_id_blk);
-    let map_data = builder
-        .ins()
-        .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
-    let map_id = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        map_data,
-        Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
     );
     let chain_cells = builder.ins().load(
         types::I64,
@@ -4460,7 +4461,7 @@ fn emit_chain_probe(
         abi.vm,
         Offset32::new(std::mem::offset_of!(JitCallContext, member_chain_cells) as i32),
     );
-    let slot = builder.ins().bxor(map_id, name_imm);
+    let slot = builder.ins().bxor(receiver_id, name_imm);
     let slot = builder.ins().band_imm_u(slot, (MEMBER_CELLS - 1) as i64);
     let bytes = builder
         .ins()
@@ -4478,10 +4479,32 @@ fn emit_chain_probe(
         cell,
         Offset32::new(std::mem::offset_of!(MemberChainCell, name) as i32),
     );
+    let cell_gen = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        cell,
+        Offset32::new(std::mem::offset_of!(MemberChainCell, generation) as i32),
+    );
     let cell_name = builder.ins().uextend(types::I64, cell_name);
-    let id_ok = builder.ins().icmp(IntCC::Equal, cell_id, map_id);
+    let id_ok = builder.ins().icmp(IntCC::Equal, cell_id, receiver_id);
     let name_ok = builder.ins().icmp(IntCC::Equal, cell_name, name_imm);
+    // A mutation anywhere on the receiver bumps its generation, so a match is
+    // the proof that no own `name` appeared since the resolution was recorded.
+    // A receiver that has never gained or lost a string-keyed own property
+    // (`named_version == 0`) needs no generation check: an internal-slot
+    // mutation (Set.add, Map.set) bumps the generation without touching a
+    // named property, which is exactly the shape this probe kept declining.
+    let gen_ok = builder.ins().icmp(IntCC::Equal, cell_gen, receiver_gen);
+    let named_version = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
+    );
+    let shadow_free = builder.ins().icmp_imm_u(IntCC::Equal, named_version, 0);
+    let gen_ok = builder.ins().bor(gen_ok, shadow_free);
     let cell_ok = builder.ins().band(id_ok, name_ok);
+    let cell_ok = builder.ins().band(cell_ok, gen_ok);
     builder.ins().brif(cell_ok, links1, &[], miss, &[]);
     builder.seal_block(links1);
     // The links: each cached (id, generation) is re-checked walking from the

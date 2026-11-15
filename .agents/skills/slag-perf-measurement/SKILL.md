@@ -110,6 +110,17 @@ the three cuts after it. A helper-count drop is NOT a win by itself — inlining
 `ToBooleanSlow` to zero moved the rows only once the inline sequence was as short
 as the call it replaced.
 
+**Counts are not comparable across binaries for a row that changed speed.**
+`run_corpus` sizes `reps` from a timing floor, so a faster row runs MORE
+`bench()` calls in the same process and its helper total can RISE while the
+per-read traffic fell (`array_at` +9%, `array_includes` +17% for that reason
+alone). Also note the first `bench()` call in a process runs cold and the
+warm-up is 2 calls: a per-iteration figure is `total / (bench calls × iterations
+per call)`, and the `bench` line does not print the call count. Read a census
+for rows whose speed did not move, or normalise per iteration, and never quote
+"the total went down" as the mechanism when it went down by a whole multiple of
+the row's per-call traffic.
+
 ## The step census
 
 For claims about *why* a row is slow (dispatch count, which step families), use the

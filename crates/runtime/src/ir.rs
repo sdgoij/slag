@@ -6880,6 +6880,56 @@ impl Vm {
             && let Some(value) =
                 Self::chain_cell_read(agent, &object, name, cell.slot, cell.link_count, cell.links)
         {
+            // Warm the IDENTITY cell for this receiver as well. A compiled read
+            // only probes the identity table, and this arm is the only thing
+            // that resolves a receiver whose own identity cell is cold (a fresh
+            // instance, or a later run whose map cell is already warm) — so
+            // without this record every subsequent read of this receiver pays
+            // the full [[Get]] again: the arm serves it, `resolve_chain_cell`
+            // is never reached, and the machine probe declines forever. The
+            // record is exact: `chain_cell_read` just validated the links
+            // against THIS receiver's live chain and re-read the value, and the
+            // own-`name` absence was just re-checked.
+            //
+            // Only written when a compiled tier can use it, and only for a
+            // receiver the machine probe will accept:
+            //
+            // - no JIT hook means no machine reader at all (a `--jitless`
+            //   run), where the write is pure cost: the interpreter's own
+            //   identity arm saves only a `has_own_property_atom` scan, less
+            //   than the 64-byte store (measured: `set_churn` +10%, `push_pop`
+            //   +9% in `--jitless` with an unconditional write);
+            // - `named_version == 0` is the compiled probe's layout-safe escape
+            //   from its generation check, so the record validates even when an
+            //   internal-slot mutation bumps the generation between reads (a
+            //   Set/Map receiver). A receiver that owns names would need an
+            //   unchanged generation, which a receiver this arm had to resolve
+            //   — one whose identity cell is cold — has not demonstrated.
+            //
+            // An Array / TypedArray receiver is skipped for the same reason
+            // every compiled probe declines it up front (`array_dense`/
+            // `typed_array` set, so an identity record could never validate).
+            if agent.jit_hook.is_some()
+                && object.named_version.get() == 0
+                && !matches!(
+                    object.kind,
+                    crux::object::ObjectKind::Array(_)
+                        | crux::object::ObjectKind::IntegerIndexed(_)
+                )
+            {
+                // Re-read the cell: the hit's own borrow of the map table is
+                // dead, and `MemberChainCell` is `Copy`.
+                let recorded = agent.member_chain_map_cells[map_index];
+                agent.member_chain_cells[Self::member_chain_index(object.id(), name)] =
+                    MemberChainCell {
+                        id: object.id(),
+                        name,
+                        generation: object.generation(),
+                        slot: recorded.slot,
+                        link_count: recorded.link_count,
+                        links: recorded.links,
+                    };
+            }
             return Some(value);
         }
         None

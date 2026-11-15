@@ -1990,10 +1990,28 @@ impl<'a> Lowerer<'a> {
         let cell_name = self.builder.ins().uextend(types::I64, cell_name);
         let id_ok = self.builder.ins().icmp(IntCC::Equal, cell_id, receiver_id);
         let name_ok = self.builder.ins().icmp(IntCC::Equal, cell_name, name_imm);
+        // The generation match is the cheap proof that no own `name` appeared
+        // since the resolution was recorded — but an internal-slot mutation
+        // (Set.add, Map.set) bumps it without touching any named property, so
+        // a receiver that has NEVER gained or lost a string-keyed own property
+        // (`named_version == 0`) needs no generation check at all. This is the
+        // Array escape (`chain_shadow_free_without_generation`) in the form the
+        // machine can read.
         let gen_ok = self
             .builder
             .ins()
             .icmp(IntCC::Equal, cell_gen, receiver_gen);
+        let named_version = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
+        );
+        let shadow_free = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, named_version, 0);
+        let gen_ok = self.builder.ins().bor(gen_ok, shadow_free);
         let count_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, cell_count, 1);
         let ok = self.builder.ins().band(id_ok, name_ok);
         let ok = self.builder.ins().band(ok, gen_ok);

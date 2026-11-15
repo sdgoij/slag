@@ -1392,3 +1392,57 @@ Goats reproduced it in `terrainMesh = rl.makeModel(...)`.
 - **The store sites are defensive now.** An empty reference stack falls back to
   `store_ident_value(..., true)` (the global binding the pre-resolve targeted)
   instead of throwing, in both the interpreter and `store_ident`.
+
+## 35. The prototype-chain cell: one table, one key, and who warms it
+
+The chain cache (`MemberChainCell`, `Agent::member_chain_cells`) has TWO tables
+and the compiled probes read only one of them:
+`JitCallContext::member_chain_cells` points at the IDENTITY array
+(`Vm::member_chain_index` = `(receiver id ^ atom) & (MEMBER_CELLS - 1)`) and
+`member_chain_map_cells` at the map-keyed array
+(`Vm::member_map_cell_index` = `(map id ^ atom) & …`). Every compiled chain
+probe must use the identity array with the identity arithmetic — the objective
+is the per-step `compiler.rs::emit_chain_cell_probe`.
+
+- **A map-keyed key against the identity table never hits.** `opt_lower.rs`'s
+  `emit_chain_probe` did exactly that (plus an entry gate that admitted only
+  dense Arrays, the one receiver the per-step probe declines), so every LIFTED
+  body's prototype-method read paid the helper: the same loop ran 15.4 ms with
+  `SLAG_OPT=0` and 23.0 ms with the tier on. Nothing warns you — the code is
+  well-formed, the cell loads are in the right order, and only the slot
+  arithmetic and the table pointer disagree. When a probe "never hits", check
+  the two against `runtime::ir`'s index function before touching the gates.
+- **The probe is only as warm as the interpreter's recording.** The identity
+  cell is written by `resolve_chain_cell`, which runs only on the FULL-Get slow
+  path. `member_chain_get`'s map-keyed arm serves a receiver whose identity cell
+  is cold and returns early, so `resolve_chain_cell` never runs — a receiver
+  created after the map cell warmed (the second `bench()` call, the second
+  iteration of `new Foo()` in a loop) never gets an identity cell and its reads
+  fall to the helper FOREVER. The repair is one record in the map arm: it has
+  just validated the links against this receiver's live chain (via
+  `chain_cell_read`) and re-checked own-name absence, so the identity cell it
+  writes is exact. Gate it — see the next bullet.
+- **An unread record is a pure cost.** The write is 64 bytes on a path that is
+  already the hot one, so gate it on (a) `agent.jit_hook.is_some()` — a
+  `--jitless` run has no machine reader (`set_churn` +10%, `push_pop` +9%
+  ungated), (b) `named_version == 0` (below), and (c) not
+  `Array`/`IntegerIndexed`, which every compiled probe declines up front
+  (`push_pop` +37%, `array_push` +43% ungated).
+- **`named_version == 0` is the machine-readable shadow proof.** The probes'
+  receiver-generation check exists to prove "no own `name` appeared since the
+  recorded resolution", but an internal-slot mutation (`Set.add`, `Map.set`)
+  bumps the generation without touching a named property. `named_version`
+  advances on every string-keyed own define/delete (a symbol key does not), so
+  `generation == cell.generation || named_version == 0` is the same proof with
+  no dependence on the generation — `chain_shadow_free_without_generation`
+  generalized. `crux`'s
+  `object::tests::a_named_own_property_always_advances_the_named_version` pins
+  the invariant it rests on; a new own-property path that forgets to bump it
+  silently makes the escape unsound, which is why the escape is written only
+  where a test can see the counter.
+- **The seam does not cover the opt tier.** `SLAG_CHAIN_PROBE` gates
+  `emit_member_read_chained` (per-step) only; `opt_lower`'s probe has no switch,
+  so a same-binary A/B of the two settings proves nothing for a lifted body. Use
+  the helper census (`JIT_HELPER_STATS`) or `SLAG_OPT=0` to separate the lanes,
+  and remember helper counts scale with the corpus runner's `reps` batching
+  (`slag-perf-measurement`).

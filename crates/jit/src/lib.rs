@@ -6596,6 +6596,48 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_chain_probe_declines_once_the_receiver_owns_the_name() {
+        // The identity chain probe is generation-validated, and the
+        // `named_version == 0` escape (a receiver that never gained or lost a
+        // string-keyed property) is what lets a churning internal-slot mutation
+        // keep the resolution. Neither may mask a shadowing own property: after
+        // `o.m = 7` the read must return 7, not the prototype's 1. Expected:
+        // 50 * 1 + 50 * 7 = 400.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(o, n) { var s = 0; for (var i = 0; i < n; i++) { if (i === 50) { o.m = 7; } s += o.m; } return s; }\n\
+                     f(Object.create({ m: 1 }), 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(400.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_chain_probe_serves_a_fresh_receiver_on_a_warm_map() {
+        // A per-call-fresh receiver reads a prototype method in a loop. The
+        // second call's first read is served by the MAP-keyed cell, which must
+        // hand the resolution to the identity cell the machine probe reads —
+        // otherwise every read of every later instance pays the full [[Get]]
+        // (the steady state `set_churn`/`map_churn`/`proto_method_call` were
+        // stuck in). Both calls must be correct, and the body must compile.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function mk(x) { var o = Object.create(proto); o.x = x; return o; }\n\
+                     var proto = { m: function () { return 2; } };\n\
+                     function f(n) { var s = 0; for (var i = 0; i < n; i++) { var o = mk(i); s += o.m(); } return s; }\n\
+                     f(100) + f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(400.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_member_probe_misses_on_mid_run_mutation() {
         // The compiled `GetMemberName` probe validates the value cell
         // against the receiver's LIVE generation: the `o.f = 2` store at

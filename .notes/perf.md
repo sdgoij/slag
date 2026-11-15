@@ -72,6 +72,38 @@ Three findings that size the next cuts:
 
 Two things this arc re-confirmed about measuring here. A whole-corpus single pass per side is not an instrument: rows whose generated IR was *identical* moved by 30-40% between the two binaries, so the per-row isolated, many-round protocol is what decides a row. And `JIT_DUMP_IR` diffs are the way to establish which rows a tier change can even touch: `python` diffing the dump over all 81 rows (heap addresses stripped) named exactly six rows for each cut, which is what made the layout swings on the other 75 identifiable as noise.
 
+## 2026-11-15 (later): the chain probe in both tiers, and the cell nothing warmed
+
+The three remaining `GetMemberName` buckets (`set_churn` 8.4 M, `map_churn` 6.3 M, `construct_churn` 3.5 M) turned out not to be a layout problem. Two bugs sat in front of the emitter:
+
+- **The optimizing tier's chain probe was keyed with a map id against the IDENTITY table.** `opt_lower::emit_chain_probe` computed `(map_id ^ name) & 15` and read `JitCallContext::member_chain_cells`, which the runtime fills at `(receiver id ^ name) & 15` — so it could only hit by accident, and its entry gate (`array_dense != 0 && named_version == 0`) admitted *only* dense Arrays, i.e. the one receiver the per-step probe declines. Every lifted body's prototype-method read therefore paid the helper: `SLAG_OPT=0` read `literal_proto` at 15.4 ms and the default build at 23.0 ms for the same loop. Porting the per-step probe's identity key into the opt tier (`opcost/proto_method_call` 3.6 M to 112 calls) is the first cut; the two tiers now read one table with one slot arithmetic.
+- **Nothing ever warmed the identity cell for a second receiver.** `member_chain_get`'s map-keyed arm (Cut 75) serves a receiver whose own identity cell is cold, and it returned early — so `resolve_chain_cell` never ran, so the identity cell stayed empty, so the machine probe declined forever. Steady state: one helper call per read, for every instance created after the first one. This is why `set_churn`/`map_churn` (a fresh `Set`/`Map` per `bench()` call) and every `function f(){ var o = new Foo(); for(...) o.m(); }` shape never warmed up. The map arm now records the identity cell for the receiver it just validated (the record is exact — `chain_cell_read` validated the links against *this* receiver's live chain and re-checked own-name absence).
+
+Three gates on that record, each measured rather than assumed:
+
+| gate | why |
+|---|---|
+| `agent.jit_hook.is_some()` | a `--jitless` run has no machine reader; the unconditional record measured `set_churn` +10% and `push_pop` +9% there |
+| `named_version == 0` | the compiled probes' generation escape (below); a receiver that owns names needs an unchanged generation, which a receiver with a cold identity cell has not demonstrated |
+| not `Array`/`IntegerIndexed` | every compiled probe declines those up front (`array_dense`/`typed_array`), so the record could never be read — `arrays/push_pop` +37%, `opcost/array_push` +43% without this skip |
+
+- **`named_version == 0` is the generation-free shadow proof, in machine form.** The identity probe's receiver-generation check exists to prove no own `name` appeared since the resolution was recorded, but `Set.add`/`Map.set` bump the generation through the internal slot without touching a named property. `named_version` advances on every string-keyed own-property define or delete (a symbol key does not), so `named_version == 0` is the same proof with no dependence on the generation — the Array escape `chain_shadow_free_without_generation` generalized to every ordinary receiver. Both tiers now accept `generation == cell.generation || named_version == 0`.
+
+Same-session, isolated, interleaved, min-of-9..15, against a HEAD binary built the same way:
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `builtins/set_churn` | 70.5 | 46.4 | -34% |
+| `opcost/proto_method_call` | 3.7 | 2.2 | -42% |
+| `opcost/map_get` | 4.1 | 3.6 | -14% |
+| `builtins/map_churn` | 43.4 | 36.3 | -16% |
+| `opcost/map_set` / `set_has` | 3.07 / 3.09 | 2.23 / 2.41 | -27% / -22% |
+| `calls/construct_churn` | 68.5 | 72.4 | +6% |
+
+Corpus `GetMemberName` traffic 83.3 M to 52.2 M. `construct_churn` is the one row that pays instead of gaining: its receiver is fresh every iteration, so the opt-tier probe runs and declines without ever hitting — 3.5 M declines, ~1 ns each. Serving it needs the map-keyed compiled probe, which needs the `kind_is_ordinary` mirror the plan's §4 scopes (a Proxy shares the canonical empty map with a plain object, so a map-keyed hit without a kind gate can run a plain object's resolution for a trap). That layout cut stays open, now for one row rather than three.
+
+A measurement trap this arc paid for: **helper counts are not comparable across binaries when the row got faster.** `run_corpus` sizes `reps` from a timing floor, so a faster row runs *more* `bench()` calls and can show a *higher* helper total (`array_at` +9%, `array_includes` +17% while its per-read traffic fell). Read the counts per iteration (divide by the row's `bench` calls) or only for rows whose speed did not move.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at
