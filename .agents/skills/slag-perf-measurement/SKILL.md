@@ -105,7 +105,12 @@ A tier change can only move a row whose generated IR differs. Diff it first
 because every other row's delta is layout. This named exactly 6 of 81 rows for
 two of the cuts in the 2026-11-15 arc; the other 75 swung 30-40% in the same
 whole-corpus passes. A change that is lowering-only (same IR, different emitted
-code) has no such filter — use the seam.
+code — e.g. splicing a helper call into an inline sequence) has no such filter
+and reports `0 of 81 rows`, so fall back to the helper census: the row whose
+helper traffic changed is the one the cut reaches. The inline `Array.prototype.pop`
+named itself that way (`arrays/push_pop`'s `ArrayPop` 1.44 M -> 0) while
+`index_loop` and `hof_methods`, which contain no `pop`, read +5.5% and +5.3%
+purely as layout.
 
 ## Do not judge on the corpus total
 

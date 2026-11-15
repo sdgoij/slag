@@ -3716,6 +3716,169 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// The `%Array.prototype.pop%` inline (the per-step mirror of
+    /// `opt_lower::emit_array_pop_inline`). A dense Array whose tail element is
+    /// materialized and not a hole pops it in place: the cursor shrinks, the
+    /// length cell and the generation follow, and the popped element is the
+    /// answer. Everything else jumps to `helper` (the narrow `array_pop`
+    /// helper, whose hole sentinel then takes the general call) — an empty
+    /// array, a hole (spec-absent, so the prototype chain would be consulted),
+    /// a spilled buffer, a tail that is holes rather than elements, and a
+    /// prototype receiver.
+    ///
+    /// A prototype receiver must reach the helper because the compiled path
+    /// writes `generation` directly while `bump_generation` also advances
+    /// `PROTOTYPE_EPOCH` for a registered prototype — the same reason the
+    /// compiled append declines one.
+    ///
+    /// Unlike the append, the popping store needs no write barrier (it only
+    /// removes an element) and no [[Extensible]] check (`length` is an existing
+    /// own data property). The vacated slot is NOT holed: the buffer's geometry
+    /// is the cursor, so `[elem_len, cap)` is neither traced nor readable.
+    fn emit_array_pop_inline(
+        &mut self,
+        object: ClifValue,
+        slow: Block,
+        merge: Block,
+        this_ptr: ClifValue,
+    ) -> Result<(), Unsupported> {
+        let kind = self.builder.create_block();
+        let dense_blk = self.builder.create_block();
+        let probe = self.builder.create_block();
+        let write = self.builder.create_block();
+        let helper = self.builder.create_block();
+
+        let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+        let tag_bits = self.builder.ins().ushr_imm_u(object, 44);
+        let obj_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+        self.builder.ins().brif(obj_ok, kind, &[], helper, &[]);
+        self.builder.seal_block(kind);
+        self.builder.switch_to_block(kind);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .band_imm_u(object, crux::PAYLOAD_MASK as i64);
+        let obj_ptr = self.builder.ins().ishl_imm_u(obj_ptr, 4);
+        let obj_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let slots_base = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+        );
+        let dense = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+        self.builder.ins().brif(dense, dense_blk, &[], helper, &[]);
+        self.builder.seal_block(dense_blk);
+        self.builder.switch_to_block(dense_blk);
+        let is_prototype = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, is_prototype) as i32),
+        );
+        let not_prototype = self.builder.ins().icmp_imm_u(IntCC::Equal, is_prototype, 0);
+        self.builder
+            .ins()
+            .brif(not_prototype, probe, &[], helper, &[]);
+        self.builder.seal_block(probe);
+        self.builder.switch_to_block(probe);
+        let slots_ptr = self
+            .builder
+            .ins()
+            .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let length = self.builder.ins().load(
+            types::F64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+        );
+        let elem_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        // The tail element must be the last materialized one: `length ==
+        // elem_len` rules out a tail of holes (whose last index would be
+        // spec-absent), and `elem_len != 0` rules out the empty array (which
+        // the helper answers with `undefined`).
+        let len_u = crate::index_gate::index_from_number(&mut self.builder, length);
+        let at_end = self.builder.ins().icmp(IntCC::Equal, elem_len, len_u);
+        let non_empty = self.builder.ins().icmp_imm_u(IntCC::NotEqual, elem_len, 0);
+        let tail_ok = self.builder.ins().band(at_end, non_empty);
+        self.builder.ins().brif(tail_ok, write, &[], helper, &[]);
+        self.builder.seal_block(write);
+        self.builder.switch_to_block(write);
+        let idx = self.builder.ins().iadd_imm_s(elem_len, -1);
+        let elem_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+        );
+        let offset = self.builder.ins().ishl_imm_u(idx, 3);
+        let addr = self.builder.ins().iadd(elem_ptr, offset);
+        let popped =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+        // A hole is spec-absent: its read consults the prototype chain, which
+        // only the general machinery can do.
+        let hole =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::Equal, popped, crux::value::HOLE_BITS as i64);
+        let loaded = self.builder.create_block();
+        let miss = self.builder.create_block();
+        self.builder.ins().brif(hole, miss, &[], loaded, &[]);
+        self.builder.seal_block(loaded);
+        self.builder.seal_block(miss);
+        self.builder.switch_to_block(loaded);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            idx,
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+        );
+        let new_length = crate::index_gate::number_from_index(&mut self.builder, idx);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            new_length,
+            slots_ptr,
+            Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+        );
+        let generation = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        let new_generation = self.builder.ins().iadd_imm_u(generation, 1);
+        self.builder.ins().store(
+            MemFlagsData::new(),
+            new_generation,
+            obj_ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+        );
+        self.emit_intrinsic_value(popped, merge, this_ptr);
+        self.builder.switch_to_block(miss);
+        self.builder.ins().jump(helper, &[]);
+        self.builder.seal_block(helper);
+        self.builder.switch_to_block(helper);
+        let result = self.emit_raw_call(self.sig_bool, Helper::ArrayPop, &[object])?;
+        self.emit_intrinsic_hit(result, Value::hole().bits() as i64, slow, merge, this_ptr);
+        Ok(())
+    }
+
     /// The dense-Array OVERWRITE arm of the compiled computed store (G20): a
     /// canonical index Number below the materialized length writes an EXISTING
     /// element in place. The append arm only serves `index == length`, so
@@ -8004,15 +8167,7 @@ impl<'a> Lowerer<'a> {
                         self.emit_array_push_inline(this, arg1, slow, merge, this_ptr)?;
                     }
                     Intrinsic::ArrayPop => {
-                        let result =
-                            self.emit_raw_call(self.sig_bool, Helper::ArrayPop, &[this])?;
-                        self.emit_intrinsic_hit(
-                            result,
-                            Value::hole().bits() as i64,
-                            slow,
-                            merge,
-                            this_ptr,
-                        );
+                        self.emit_array_pop_inline(this, slow, merge, this_ptr)?;
                     }
                     Intrinsic::ArrayReverse => {
                         let result =

@@ -3446,6 +3446,166 @@ fn emit_array_push_inline(
     Ok(())
 }
 
+/// The `%Array.prototype.pop%` inline (the optimizing mirror of
+/// `compiler.rs::emit_array_pop_inline`). A dense Array whose tail element is
+/// materialized and not a hole pops it in place: the cursor shrinks, the length
+/// cell and the generation follow, and the popped element is the answer.
+/// Everything else jumps to the `array_pop` helper, whose hole sentinel then
+/// takes the general call — an empty array, a hole (spec-absent, so the
+/// prototype chain would be consulted), a spilled buffer, a tail that is holes
+/// rather than elements, and a prototype receiver (whose `bump_generation`
+/// advances `PROTOTYPE_EPOCH`, which the compiled `generation` write does not).
+///
+/// The popping store needs no write barrier (it only removes an element) and no
+/// [[Extensible]] check (`length` is an existing own data property). The vacated
+/// slot is not holed: the buffer's geometry is the cursor, so `[elem_len, cap)`
+/// is neither traced nor readable.
+fn emit_array_pop_inline(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    object: ClifValue,
+    slow: Block,
+    merge: Block,
+    out: Variable,
+) -> Result<(), Unsupported> {
+    let kind = builder.create_block();
+    let dense_blk = builder.create_block();
+    let probe = builder.create_block();
+    let write = builder.create_block();
+    let loaded = builder.create_block();
+    let miss = builder.create_block();
+    let helper = builder.create_block();
+
+    let object_pattern = (crux::TAG_PREFIX >> 44) | crux::TAG_OBJECT;
+    let tag_bits = builder.ins().ushr_imm_u(object, 44);
+    let obj_ok = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, tag_bits, object_pattern as i64);
+    builder.ins().brif(obj_ok, kind, &[], helper, &[]);
+    builder.seal_block(kind);
+    builder.switch_to_block(kind);
+    let obj_ptr = builder.ins().band_imm_u(object, crux::PAYLOAD_MASK as i64);
+    let obj_ptr = builder.ins().ishl_imm_u(obj_ptr, 4);
+    let obj_ptr = builder
+        .ins()
+        .iadd_imm_s(obj_ptr, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let slots_base = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, array_dense) as i32),
+    );
+    let dense = builder.ins().icmp_imm_u(IntCC::NotEqual, slots_base, 0);
+    builder.ins().brif(dense, dense_blk, &[], helper, &[]);
+    builder.seal_block(dense_blk);
+    builder.switch_to_block(dense_blk);
+    let is_prototype = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, is_prototype) as i32),
+    );
+    let not_prototype = builder.ins().icmp_imm_u(IntCC::Equal, is_prototype, 0);
+    builder.ins().brif(not_prototype, probe, &[], helper, &[]);
+    builder.seal_block(probe);
+    builder.switch_to_block(probe);
+    let slots_ptr = builder
+        .ins()
+        .iadd_imm_s(slots_base, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let length = builder.ins().load(
+        types::F64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+    );
+    let elem_len = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    // The tail element must be the last materialized one: `length == elem_len`
+    // rules out a tail of holes (whose last index is spec-absent) and
+    // `elem_len != 0` rules out the empty array.
+    let len_u = crate::index_gate::index_from_number(builder, length);
+    let at_end = builder.ins().icmp(IntCC::Equal, elem_len, len_u);
+    let non_empty = builder.ins().icmp_imm_u(IntCC::NotEqual, elem_len, 0);
+    let tail_ok = builder.ins().band(at_end, non_empty);
+    builder.ins().brif(tail_ok, write, &[], helper, &[]);
+    builder.seal_block(write);
+    builder.switch_to_block(write);
+    let idx = builder.ins().iadd_imm_s(elem_len, -1);
+    let elem_ptr = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_ptr) as i32),
+    );
+    let offset = builder.ins().ishl_imm_u(idx, 3);
+    let addr = builder.ins().iadd(elem_ptr, offset);
+    let popped = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), addr, Offset32::new(0));
+    // A hole is spec-absent: its read consults the prototype chain.
+    let hole = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, popped, crux::value::HOLE_BITS as i64);
+    builder.ins().brif(hole, miss, &[], loaded, &[]);
+    builder.seal_block(loaded);
+    builder.switch_to_block(loaded);
+    builder.ins().store(
+        MemFlagsData::new(),
+        idx,
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, elem_len) as i32),
+    );
+    let new_length = crate::index_gate::number_from_index(builder, idx);
+    builder.ins().store(
+        MemFlagsData::new(),
+        new_length,
+        slots_ptr,
+        Offset32::new(std::mem::offset_of!(crux::object::ArraySlots, length) as i32),
+    );
+    let generation = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    let new_generation = builder.ins().iadd_imm_u(generation, 1);
+    builder.ins().store(
+        MemFlagsData::new(),
+        new_generation,
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, generation) as i32),
+    );
+    builder.def_var(out, popped);
+    builder.ins().jump(merge, &[]);
+    builder.seal_block(miss);
+    builder.switch_to_block(miss);
+    builder.ins().jump(helper, &[]);
+    builder.seal_block(helper);
+    builder.switch_to_block(helper);
+    let popped = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_bool,
+        Helper::ArrayPop,
+        &[object],
+    )?;
+    emit_intrinsic_sentinel(
+        builder,
+        popped,
+        JsValue::hole().bits() as i64,
+        slow,
+        merge,
+        out,
+    );
+    Ok(())
+}
+
 /// `bits & TAG_MASK == TAG_PREFIX` and `(bits >> 44) & 0xF == TAG_STRING` — the
 /// string check, mirroring the per-step `is_string` (the heap-prefix test runs
 /// first: a double can carry the tag bits by coincidence).
@@ -3613,6 +3773,9 @@ fn emit_intrinsic(
         Intrinsic::ArrayPush => {
             emit_array_push_inline(builder, helpers, abi, this, arg1, slow, merge, value)?;
         }
+        Intrinsic::ArrayPop => {
+            emit_array_pop_inline(builder, helpers, abi, this, slow, merge, value)?;
+        }
         Intrinsic::ArrayForEach => {
             // The fused loop runs in the interpreter's `do_call_intrinsic`; a
             // lifted body keeps the general call, and jumping to the shared
@@ -3665,14 +3828,6 @@ fn emit_intrinsic(
                         &[this, arg1, from],
                     )?
                 }
-                Intrinsic::ArrayPop => call_helper(
-                    builder,
-                    helpers,
-                    abi,
-                    abi.sig_bool,
-                    Helper::ArrayPop,
-                    &[this],
-                )?,
                 Intrinsic::ArrayReverse => call_helper(
                     builder,
                     helpers,

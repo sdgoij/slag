@@ -178,6 +178,18 @@ x86-64 has no unsigned conversion, so Cranelift expands each into a software seq
 
 **The next lever, with its evidence.** `arrays/index_loop` (3M iterations of `s += a[i & 199999]`) is 14.5 ms = 4.8 ns/iteration against node's 1.1 ns (4 cycles = one `fadd` latency). The CLIF shows the loop-carried locals in frame slots — `load v0+16; fadd; store v0+16` for `s`, the same for `i` — so the chain is store-to-load forwarding (~5-6 cycles) plus the arithmetic, not anything an opcode change reaches. That is the register tier's question (`register-tier-plan.md`), not another probe's, and `index_loop` is its benchmark: getting `s` and `i` into registers (stored to the frame only where a safepoint needs them) is the whole distance to node on this row.
 
+### The inline pop (2026-11-15, last)
+
+`arrays/push_pop` was the largest real row-vs-node ratio in the corpus (14x) and the census explained it in one line: `ArrayPush` 120 calls, `ArrayPop` **1,439,232** — the append has had an inline machine path for a while, pop was a helper call per operation. `emit_array_pop_inline` in both tiers shears the tail when `array_dense` is live, `is_prototype == 0`, `length == elem_len` (a tail of holes is spec-absent), `elem_len != 0` and the element is not the hole sentinel; anything else keeps the helper. It skips the write barrier (removal only), the [[Extensible]] check (`length` is an existing own data property), the `properties[0]` mirror write (not offset-addressable — the append skips it too, and the cell is authoritative while dense) and the holed vacated slot (the cursor is the geometry, so `[elem_len, cap)` is neither traced nor readable).
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `arrays/push_pop` | 2.554 | 1.703 | **-33.3%** |
+| `opcost/array_push` | 1.607 | 1.495 | -7.0% (layout) |
+| `arrays/index_loop` / `arrays/hof_methods` | | | +5.5 / +5.3% (layout) |
+
+Those two contain no `pop` and are pure layout: `ir_diff.py` reports **0 of 81 rows** with different IR, which is the tell for a lowering-only change (the tier's IR is untouched; only the emitted code moves). For that class the helper census is the discriminator, and it is exact here — `ArrayPop` 1.44 M -> **0** with the row's value unchanged.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

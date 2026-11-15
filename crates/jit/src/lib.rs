@@ -4176,10 +4176,11 @@ mod tests {
 
     #[test]
     fn installed_jit_array_pop_intrinsic_matches_the_interpreter() {
-        // The `Array.prototype.pop` splice (zero arguments): a `.pop()` call
-        // whose resolved callee is the realm's intrinsic truncates a dense Array
-        // and returns the last element. The helper declines for a non-Array/non-
-        // dense receiver or a hole at the end, and those take the general call.
+        // The `Array.prototype.pop` inline: a `.pop()` on a dense Array whose
+        // tail element is materialized and not a hole shrinks the cursor and
+        // answers the element. An empty array, a hole at the tail, a tail of
+        // holes, a generic receiver and a prototype receiver keep the general
+        // path; the helper count must stay far below one per loop iteration.
         static POP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn counting_pop(ctx: *mut c_void, this: u64) -> u64 {
             POP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4191,8 +4192,11 @@ mod tests {
                       function t(v) { out.push(String(v)); }\n\
                       var a = [1, 2, 3]; t(a.pop()); t(a.length); t(a.pop(9)); t(a.join(','));\n\
                       t([].pop());\n\
-                      var h = [1]; h[3] = 4; t(h.pop()); t(h.pop()); t(h.length);\n\
+                      var h = [1]; h[3] = 4; t(h.pop()); t(h.pop()); t(h.length); t(h.join(','));\n\
                       t(Array.prototype.pop.call({length: 2, 0: 'x', 1: 'y'}));\n\
+                      var pr = [1, 2, 3, 4]; var kid = Object.create(pr);\n\
+                      t(pr.pop()); t(pr.length); t(kid[0]);\n\
+                      var z = [7, 8, 9]; z.length = 0; t(z.pop()); t(z.length);\n\
                       function loop(n) { var a2 = []; var s = 0;\n\
                         for (var i = 0; i < n; i++) { a2.push(i); if (a2.length > 10) s += a2.pop(); }\n\
                         return s; }\n\
@@ -4218,13 +4222,13 @@ mod tests {
         agent.jit_hook = None;
         assert_eq!(
             value, interp,
-            "the Array.pop intrinsic splice must match the interpreter"
+            "the Array.pop inline must match the interpreter"
         );
         assert!(compiled >= 1, "{compiled} bodies");
         let calls = POP_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            calls >= 1000,
-            "the compiled loop must splice the pop intrinsic ({calls} helper calls)"
+            calls < 2000,
+            "the compiled dense pop must not call the helper per element ({calls} calls)"
         );
     }
 

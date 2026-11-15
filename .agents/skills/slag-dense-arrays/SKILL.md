@@ -1,6 +1,6 @@
 ---
 name: slag-dense-arrays
-description: "Load when working on Slag's dense Array element storage, its compiled append, or its compiled element read — `ArraySlots` (crates/crux/src/object.rs), the `Value::hole()` sentinel, the `elem_ptr`/`elem_len`/`elem_cap` cursor and `elements()`/`elements_mut()` guards, the JIT's inline dense append (`emit_dense_array_append_inline`) and inline element read (`emit_element_read` / `emit_dense_element_read_into` / `emit_typed_array_read_into`), the array-`length` read gates, or the `properties[0]` length mirror. Documents the traps - authoritative-vs-mirror length, cursor-based GC tracing, the hole sentinel's reserved tag, why a hole declines a read to the chain, inline re-validation of extensible + the chain verdict, why the read lane is single-agent only, and why the gate must stay branchy."
+description: "Load when working on Slag's dense Array element storage, its compiled append, its inline pop, or its compiled element read — `ArraySlots` (crates/crux/src/object.rs), the `Value::hole()` sentinel, the `elem_ptr`/`elem_len`/`elem_cap` cursor and `elements()`/`elements_mut()` guards, the JIT's inline dense append (`emit_dense_array_append_inline`), inline pop (`emit_array_pop_inline`) and inline element read (`emit_element_read` / `emit_dense_element_read_into` / `emit_typed_array_read_into`), the array-`length` read gates, or the `properties[0]` length mirror. Documents the traps - authoritative-vs-mirror length, cursor-based GC tracing, the hole sentinel's reserved tag, why a hole declines a read to the chain, inline re-validation of extensible + the chain verdict, why the read lane is single-agent only, and why the gate must stay branchy."
 ---
 
 # Slag dense Array stores and the compiled append
@@ -14,7 +14,7 @@ Locations: `crates/crux/src/object.rs` (`ArraySlots`, the cursor,
 `ChainVerdict`, `array_element_write`/`array_element_write_dense`,
 `spill_dense_array`, the length readers), `crates/crux/src/value.rs` (the
 hole sentinel), `crates/jit/src/compiler.rs`
-(`emit_dense_array_append_inline`, `emit_element_read`,
+(`emit_dense_array_append_inline`, `emit_array_pop_inline`, `emit_element_read`,
 `emit_dense_element_read_into`, `emit_typed_array_read_into`,
 `emit_computed_store`, `emit_member_cell_probe`'s length path`,
 `crates/jit/src/index_gate.rs` (the canonical-index gate),
@@ -165,6 +165,43 @@ memory is not mutated anywhere in the function, and the compiled body's own
 `store_chain_clean` — so the verdict loads can't carry it; and the link
 loads could only if no user code runs in the body, which `buildString`'s
 `a.length = 0` (a possible setter) defeats for a sound analysis.
+
+## 5c. The inline pop (the append's inverse)
+
+`emit_array_pop_inline` (both tiers, like the append) shears the tail element of
+a dense Array when the cursor is the whole story: `array_dense` non-null,
+`is_prototype == 0`, `length == elem_len` (a tail of holes is spec-absent, so
+the prototype chain could be consulted), `elem_len != 0`, and the element at
+`elem_len - 1` not the hole sentinel. It then answers the element, sets
+`elem_len = idx`, `slots.length = idx`, and bumps `generation`. Everything else
+jumps to the `array_pop` helper, whose hole sentinel takes the general call.
+
+Four things it deliberately does NOT do, each for a reason the append
+established:
+
+- **No write barrier.** It only removes an element, so no edge can form.
+- **No [[Extensible]] check.** `length` is an existing own writable data
+  property; adding is what needs extensible, and pop does not add.
+- **No `properties[0]` length-mirror write**, even though
+  `JsObject::array_pop_dense` (the interpreter fast path) writes it. The mirror
+  is not offset-addressable, which is why the compiled append skips it too; the
+  cell is authoritative while dense and every mirror reader syncs (§3). The
+  compiled path leaves the mirror stale-HIGH where the append leaves it
+  stale-LOW — same invariant, both directions.
+- **No holed vacated slot.** The buffer's geometry is the cursor, so
+  `[elem_len, cap)` is neither traced nor readable; writing the sentinel would
+  be a store the trace never looks at.
+
+`is_prototype` is the one gate that is NOT about the element: the compiled path
+writes `generation` directly, while `bump_generation` also advances
+`PROTOTYPE_EPOCH` when the receiver is a registered prototype, so a prototype
+receiver must reach the helper — exactly the append's rule.
+
+Measured (`arrays/push_pop`, the only corpus row that pops): 2.55 -> 1.70 ms,
+**-33%**, `ArrayPop` helper calls 1,439,232 -> 0. The test
+`installed_jit_array_pop_intrinsic_matches_the_interpreter` asserts value
+parity across the declining shapes (empty, hole tail, generic receiver,
+prototype receiver, `length = 0`) and a helper count far below one per pop.
 
 ## 6. The per-store generation bump is deliberate and cheap
 
