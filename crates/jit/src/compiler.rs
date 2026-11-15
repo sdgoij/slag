@@ -301,9 +301,9 @@ pub(crate) fn assemble(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    if std::env::var("JIT_DUMP_STACKMAP").is_ok() {
+    if runtime::diag::enabled(runtime::diag::Channel::StackMap) {
         for map in &maps {
-            eprintln!("stackmap {:x}: {:?}", map.offset, map.entries);
+            runtime::diag!(StackMap, "{:x}: {:?}", map.offset, map.entries);
         }
     }
     // SAFETY: the allocation outlives the cast and is executable; a data

@@ -45,6 +45,7 @@ All write to **stderr**. They are for debugging a workload, not for production.
 | `JIT_DUMP_STEPS` | on a lift refusal, dump the blocking step names (`opt-blockers:`) and a shape census (`opt-shapes:`). |
 | `JIT_HELPER_STATS` | the `slag` CLI prints per-helper call counts at exit (`helper <index> <count>`). |
 | `JIT_LEAF_TRACE` | trace the first few leaf-probe rejections (`leaf-probe reject: <why>`). |
+| `SLAG_TRACE` | select **named diagnostic channels**: a comma-separated list of `inline` (the optimizing tier's inliner: sites it found, why it refused), `live` (the values live across each call) and `stackmap` (the user stack maps a body finalized), or `*` for all. Each channel is its own stream, the selection is resolved once, and a disabled channel costs a test with no formatting; an unknown name warns on stderr. Replaces the one-off switches these three used. |
 | `SLAG_JIT_DEOPT_PROBE=<step>` | force a deopt guard at that step in every eligible body — exercises the spill/resume path deterministically. |
 | `SLAG_JIT_DEOPT_TRACE` | trace each deopt (`jit-deopt step=<n> depth=<n>`). |
 

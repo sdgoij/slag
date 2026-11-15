@@ -65,11 +65,14 @@ pub fn compile(
     max_stack: usize,
 ) -> Option<Compiled> {
     let conv = platform_call_conv(isa);
-    if std::env::var("JIT_DUMP_LIVE").is_ok() {
+    if runtime::diag::enabled(runtime::diag::Channel::Live) {
         for site in crate::opt::live::safepoint_roots(ir) {
-            eprintln!(
-                "opt live: b{} i{} roots {:?}",
-                site.block, site.index, site.roots
+            runtime::diag!(
+                Live,
+                "b{} i{} roots {:?}",
+                site.block,
+                site.index,
+                site.roots
             );
         }
     }

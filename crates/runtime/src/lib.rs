@@ -17,6 +17,7 @@ pub mod builtins;
 pub mod class;
 pub mod context;
 pub mod decorators;
+pub mod diag;
 pub mod dump;
 pub mod embed;
 pub mod env;

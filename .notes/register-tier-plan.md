@@ -533,7 +533,7 @@ to a safepoint instruction and `MachBufferFinalized::user_stack_maps` returns
 them finalized, so `assemble` now extracts every map into `Compiled::maps`
 (`StackMap { offset, entries: [StackEntry { sp_offset, width }] }`), keyed by the
 safepoint's code offset with the SP-relative offsets already resolved by
-regalloc, and `JIT_DUMP_STACKMAP` prints them. A test compiles a hand-built CLIF
+regalloc, and `SLAG_TRACE=stackmap` prints them. A test compiles a hand-built CLIF
 function whose call carries one entry and asserts the round trip, so the API,
 the finalized offsets and the extraction are pinned on this target.
 
@@ -548,7 +548,7 @@ question, `safepoint_roots` runs a backward data-flow fixpoint over the SSA CFG
 and reports, per call, the values live *after* it, excluding the call's own
 result and filtered to the types that may be a GC reference (`Unknown`, `Object`,
 `String`, `Number`, `Hole`; `Int`/`Float`/`Bool`/the immediates cannot be).
-`JIT_DUMP_LIVE` prints them, which is how the numbers below were read.
+`SLAG_TRACE=live` prints them, which is how the numbers below were read.
 
 Two things the first real check showed. The set is **conservative and large**:
 a probe loop body with four calls reports the same ten live values at every one
@@ -717,7 +717,7 @@ interpreter's call step, and both probes return early unless `SLAG_FEEDBACK` is
 set; the compiled tier never records. So a body compiled before its sites
 specialize never specializes at all, and `pass::inline` (which requires
 `IcState::Specialized` plus a callee id) sees nothing. Reading it with a new
-`JIT_DUMP_INLINE` diagnostic shows the shape: the hot `__t262Body` body reports
+`SLAG_TRACE=inline` channel shows the shape: the hot `__t262Body` body reports
 **101 call sites, 0 monomorphic**, while a colder body reports 33 sites with 1
 monomorphic and splices 30 steps.
 
@@ -733,7 +733,7 @@ site before its body is compiled. Both are cheaper than growing the splice, and
 neither can be measured until the recording exists.
 
 **The bodies that matter have no feedback store at all.** `sites_from_feedback`
-now reports what it found under `JIT_DUMP_INLINE`, and the answer is emphatic: of
+now reports what it found under `SLAG_TRACE=inline`, and the answer is emphatic: of
 the five lifted bodies in the head-let fixture, four print **no store**, meaning
 `record_call` never ran for them, and one prints `1 call records, 1 with a callee
 id`. `record_call_site` has exactly one caller, the interpreter's `CallFast` arm,

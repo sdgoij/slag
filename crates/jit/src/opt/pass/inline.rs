@@ -47,19 +47,14 @@ pub struct Callee {
 #[must_use]
 pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<InlineSite>> {
     let mut sites = vec![None; body.steps.len()];
-    let dump = std::env::var("JIT_DUMP_INLINE").is_ok();
     let mut calls = 0usize;
     let mut with_callee = 0usize;
     let Ok(feedback) = body.feedback.try_borrow() else {
-        if dump {
-            eprintln!("feedback: {} steps, record busy", body.steps.len());
-        }
+        runtime::diag!(Inline, "{} steps, record busy", body.steps.len());
         return sites;
     };
     let Some(store) = feedback.as_ref() else {
-        if dump {
-            eprintln!("feedback: {} steps, no store", body.steps.len());
-        }
+        runtime::diag!(Inline, "{} steps, no store", body.steps.len());
         return sites;
     };
     for (ip, site) in sites.iter_mut().enumerate() {
@@ -78,12 +73,11 @@ pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<Inlin
             });
         }
     }
-    if dump {
-        eprintln!(
-            "feedback: {} steps, {calls} call records, {with_callee} with a callee id",
-            body.steps.len()
-        );
-    }
+    runtime::diag!(
+        Inline,
+        "{} steps, {calls} call records, {with_callee} with a callee id",
+        body.steps.len()
+    );
     sites
 }
 
@@ -125,11 +119,12 @@ pub fn run(
     sites: &[Option<InlineSite>],
     resolve: &mut dyn FnMut(u64) -> Option<Callee>,
 ) -> bool {
-    let dump = std::env::var("JIT_DUMP_INLINE").is_ok();
+    let dump = runtime::diag::enabled(runtime::diag::Channel::Inline);
     if dump {
         let known = sites.iter().filter(|site| site.is_some()).count();
-        eprintln!(
-            "inline: {} call sites, {known} monomorphic, {} blocks",
+        runtime::diag!(
+            Inline,
+            "{} call sites, {known} monomorphic, {} blocks",
             sites.len(),
             func.block_count()
         );
@@ -153,8 +148,9 @@ pub fn run(
                 .filter(|inst| inst.op == Op::Call)
                 .count();
             let why = if spliced { "-" } else { last_refusal() };
-            eprintln!(
-                "inline: b{b} spliced={spliced} budget_left={budget} calls_left={calls} why={why}"
+            runtime::diag!(
+                Inline,
+                "b{b} spliced={spliced} budget_left={budget} calls_left={calls} why={why}"
             );
         }
     }
