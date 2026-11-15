@@ -47,22 +47,42 @@ pub struct Callee {
 #[must_use]
 pub fn sites_from_feedback(body: &runtime::ir::CompiledBody) -> Vec<Option<InlineSite>> {
     let mut sites = vec![None; body.steps.len()];
+    let dump = std::env::var("JIT_DUMP_INLINE").is_ok();
+    let mut calls = 0usize;
+    let mut with_callee = 0usize;
     let Ok(feedback) = body.feedback.try_borrow() else {
+        if dump {
+            eprintln!("feedback: {} steps, record busy", body.steps.len());
+        }
         return sites;
     };
     let Some(store) = feedback.as_ref() else {
+        if dump {
+            eprintln!("feedback: {} steps, no store", body.steps.len());
+        }
         return sites;
     };
     for (ip, site) in sites.iter_mut().enumerate() {
         let Some(runtime::feedback::SiteRecord::Call(call)) = store.site(ip) else {
             continue;
         };
-        if call.state() == runtime::feedback::IcState::Specialized && call.first_callee_id() != 0 {
+        calls += 1;
+        if call.first_callee_id() == 0 {
+            continue;
+        }
+        with_callee += 1;
+        if call.state() == runtime::feedback::IcState::Specialized {
             *site = Some(InlineSite {
                 callee_id: call.first_callee_id(),
                 callee_box: call.first_callee_box(),
             });
         }
+    }
+    if dump {
+        eprintln!(
+            "feedback: {} steps, {calls} call records, {with_callee} with a callee id",
+            body.steps.len()
+        );
     }
     sites
 }
@@ -80,6 +100,23 @@ fn inline_budget() -> usize {
         .unwrap_or(DEFAULT_INLINE_BUDGET)
 }
 
+thread_local! {
+    /// Why the last `try_inline` returned false, for `JIT_DUMP_INLINE`. A
+    /// refusal is otherwise a bare boolean, and "the site is not monomorphic"
+    /// and "the callee has no home for a slot" are different problems.
+    static REFUSAL: std::cell::RefCell<&'static str> =
+        const { std::cell::RefCell::new("no candidate call") };
+}
+
+fn refuse(reason: &'static str) -> bool {
+    REFUSAL.with(|slot| *slot.borrow_mut() = reason);
+    false
+}
+
+fn last_refusal() -> &'static str {
+    REFUSAL.with(|slot| *slot.borrow())
+}
+
 /// Inline every spliceable monomorphic call site, recursing into a callee's own
 /// sites under a step budget. `sites` is indexed by step (the `Op::Call`'s
 /// `Imm::Int`); `resolve` yields the callee. Returns whether the IR changed.
@@ -88,14 +125,37 @@ pub fn run(
     sites: &[Option<InlineSite>],
     resolve: &mut dyn FnMut(u64) -> Option<Callee>,
 ) -> bool {
+    let dump = std::env::var("JIT_DUMP_INLINE").is_ok();
+    if dump {
+        let known = sites.iter().filter(|site| site.is_some()).count();
+        eprintln!(
+            "inline: {} call sites, {known} monomorphic, {} blocks",
+            sites.len(),
+            func.block_count()
+        );
+    }
     let mut changed = false;
     let blocks = func.block_count() as u32;
     for b in 0..blocks {
         // The budget is per top-level site; the recursion shares it, so a
         // self-recursive callee stops expanding and leaves a real call.
         let mut budget = inline_budget();
-        if try_inline(func, b, sites, resolve, &mut budget) {
+        REFUSAL.with(|slot| *slot.borrow_mut() = "no candidate call");
+        let spliced = try_inline(func, b, sites, resolve, &mut budget);
+        if spliced {
             changed = true;
+        }
+        if dump {
+            let calls = func
+                .block(b)
+                .insts
+                .iter()
+                .filter(|inst| inst.op == Op::Call)
+                .count();
+            let why = if spliced { "-" } else { last_refusal() };
+            eprintln!(
+                "inline: b{b} spliced={spliced} budget_left={budget} calls_left={calls} why={why}"
+            );
         }
     }
     changed
@@ -121,34 +181,49 @@ fn try_inline(
     let (at, args, result, ty, step, site) = {
         let insts = &func.block(b).insts;
         let mut found = None;
+        let mut why = "no call in block";
         for (at, inst) in insts.iter().enumerate().rev() {
             if inst.op != Op::Call {
                 continue;
             }
+            why = "call without a step imm";
             let Imm::Int(step) = inst.imm else {
                 continue;
             };
+            why = "call site not monomorphic";
             let Some(&Some(site)) = sites.get(step as usize) else {
                 continue;
             };
-            let Some(result) = inst.result else {
-                continue;
-            };
-            found = Some((at, inst.args.clone(), result, inst.ty, step, site));
+            // A statement-position call has no result: the continuation takes no
+            // parameter and there is nothing to rewrite, which is the shape every
+            // assert-style body and every callback statement has.
+            found = Some((at, inst.args.clone(), inst.result, inst.ty, step, site));
             break;
         }
         let Some(found) = found else {
-            return false;
+            return refuse(why);
         };
         found
     };
     let Some(callee) = resolve(site.callee_id) else {
-        return false;
+        return refuse("callee unresolved");
     };
     // Every input slot must have a call operand to bind to, the callee must be
     // spliceable, and it must fit the remaining budget.
-    if args.len() < 2 + callee.arity || !spliceable(&callee) || callee.steps > *budget {
-        return false;
+    // A call may pass fewer arguments than the callee declares: a missing
+    // parameter is `undefined` (spec 10.2.1.3), and `assert.sameValue(f(a), b)`
+    // against a three-parameter callee is the common shape. The splice binds
+    // every input slot, so the absent ones bind to a `const undefined`; the
+    // fallback call keeps the original operand list, which a callee that reads
+    // `arguments.length` can tell apart.
+    if args.len() < 2 {
+        return refuse("arity");
+    }
+    if !spliceable(&callee) {
+        return refuse("not spliceable");
+    }
+    if callee.steps > *budget {
+        return refuse("budget");
     }
     *budget -= callee.steps;
 
@@ -164,8 +239,10 @@ fn try_inline(
     };
     let old_term = func.block_mut(b).term.take();
     let cont = func.push_block();
-    let param = func.push_value(ty);
-    func.block_mut(cont).params.push(param);
+    let param = result.map(|_| func.push_value(ty));
+    if let Some(param) = param {
+        func.block_mut(cont).params.push(param);
+    }
     func.block_mut(cont).insts = tail;
     func.block_mut(cont).term = old_term;
 
@@ -175,6 +252,18 @@ fn try_inline(
         .map(|_| func.push_block())
         .collect();
     let mut value_map: Vec<Option<ValueId>> = vec![None; callee.ir.value_count() as usize];
+    let missing = (args.len() < 2 + callee.arity).then(|| {
+        let v = func.push_value(Type::Undefined);
+        func.block_mut(b).insts.push(Inst {
+            op: Op::Const,
+            args: Vec::new(),
+            result: Some(v),
+            ty: Type::Undefined,
+            effects: Effects::pure(),
+            imm: Imm::U64(crux::Value::Undefined.bits()),
+        });
+        v
+    });
     for k in 0..callee.ir.block_count() as u32 {
         let src = callee.ir.block(k);
         let dst = block_map[k as usize];
@@ -197,7 +286,10 @@ fn try_inline(
                 let bound = if Some(slot as usize) == callee.this_slot {
                     args[0]
                 } else {
-                    args[2 + slot as usize]
+                    match args.get(2 + slot as usize) {
+                        Some(&value) => value,
+                        None => missing.unwrap_or(args[0]),
+                    }
                 };
                 value_map[inst.result.expect("a load has a result") as usize] = Some(bound);
                 continue;
@@ -226,7 +318,11 @@ fn try_inline(
         let term = match src.term.as_ref().expect("spliceable has a terminator") {
             Term::Return(Some(v)) => Term::Jump {
                 target: cont,
-                args: vec![map(*v)],
+                args: if result.is_some() { vec![map(*v)] } else { Vec::new() },
+            },
+            Term::Return(None) if result.is_none() => Term::Jump {
+                target: cont,
+                args: Vec::new(),
             },
             Term::Jump { target, args } => Term::Jump {
                 target: block_map[*target as usize],
@@ -277,18 +373,18 @@ fn try_inline(
         imm: Imm::None,
     });
     let fallback = func.push_block();
-    let called = func.push_value(ty);
+    let called = result.map(|_| func.push_value(ty));
     func.block_mut(fallback).insts.push(Inst {
         op: Op::Call,
         args: args.clone(),
-        result: Some(called),
+        result: called,
         ty,
         effects: Effects::call(),
         imm: Imm::Int(step),
     });
     func.block_mut(fallback).term = Some(Term::Jump {
         target: cont,
-        args: vec![called],
+        args: called.into_iter().collect(),
     });
     func.block_mut(b).term = Some(Term::Branch {
         cond: ok,
@@ -298,7 +394,9 @@ fn try_inline(
         else_args: Vec::new(),
     });
 
-    replace_uses(func, result, param);
+    if let (Some(result), Some(param)) = (result, param) {
+        replace_uses(func, result, param);
+    }
 
     // I5c-2c-iv: recurse into the callee's own calls, under the shared budget.
     for &dst in &block_map {

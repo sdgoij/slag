@@ -711,9 +711,74 @@ chain via `JsObject::has_property` + `get_property`) with the callback run on
 *this* Vm instead of a pooled one, the leaf lane `CallbackVm` uses, minus the
 builtin dispatch, `to_object`, `length_of_array_like` and the pool round trip.
 
-**D5 is blocked on C2, which §5 did not price** (found 2026-11-14 reading
-`opt_lower.rs`). A fused loop must hold the array and the callback across every
-`emit_leaf_call` in its body, and that is a heap reference live at a safepoint
+**The inline pass has no input by default, and that is why nobody could
+measure it** (2026-11-15). `record_call` is called from exactly one place, the
+interpreter's call step, and both probes return early unless `SLAG_FEEDBACK` is
+set; the compiled tier never records. So a body compiled before its sites
+specialize never specializes at all, and `pass::inline` (which requires
+`IcState::Specialized` plus a callee id) sees nothing. Reading it with a new
+`JIT_DUMP_INLINE` diagnostic shows the shape: the hot `__t262Body` body reports
+**101 call sites, 0 monomorphic**, while a colder body reports 33 sites with 1
+monomorphic and splices 30 steps.
+
+With `SLAG_FEEDBACK=1 SLAG_INLINE=1` the head-let row does move: 317.7 / 318.6 ms
+to **304.5 / 306.8** ms over two pairs, about 3.7%, from that one 30-step splice.
+That is the whole of trial inlining's measured effect today, and the reason is
+the missing recording rather than the splice: the body that holds 45% of the
+corpus gap is the one with zero monomorphic sites.
+
+The next cut is therefore to feed the probes from compiled code, either by
+recording on the compiled call path under the same gate or by specializing a
+site before its body is compiled. Both are cheaper than growing the splice, and
+neither can be measured until the recording exists.
+
+**The bodies that matter have no feedback store at all.** `sites_from_feedback`
+now reports what it found under `JIT_DUMP_INLINE`, and the answer is emphatic: of
+the five lifted bodies in the head-let fixture, four print **no store**, meaning
+`record_call` never ran for them, and one prints `1 call records, 1 with a callee
+id`. `record_call_site` has exactly one caller, the interpreter's `CallFast` arm,
+and a body that contains a loop compiles on its first consult (Cut 69), so it
+never runs interpreted at all. `__t262Body` has the `for in` loop, which is why it
+reports 101 call sites and nothing recorded. The only body that records is a
+33-step, loop-free one, and that is the one that splices.
+
+So the inline pass cannot see the bodies it was built for, and neither the
+threshold nor the splice size is the problem. Recording must move to the compiled
+call path, where `Op::Call` already carries the step index in `Imm::Int`.
+
+**A loop body now waits under the probe** (2026-11-15), which is the cheap half
+of that: `lookup_info` lets a loop body bypass the compile threshold only when
+the feedback probe is off, so under `SLAG_FEEDBACK` a loop body runs interpreted
+like any other body until the count is reached, records its calls, and compiles
+with feedback in hand. The probe's own gate keeps production behaviour
+unchanged. `__t262Body` goes from **0 to 10 call records, 9 monomorphic**.
+
+Measured on head-let, two pairs: 334.0 / 335.8 ms without the probe, 312.9 /
+311.7 ms with it, about 6.7% (it was 3.7% when only the loop-free body could
+splice). The 81-row differential is exact with the probe on, and 1161 runtime
+tests pass.
+
+What has NOT changed: `try_inline` still refuses those nine sites
+(`spliced=false, calls_left=1`), so the visibility is not yet the splice.
+
+**And the refusal is a shape rule, not a resolver failure** (2026-11-15). With
+the reason reported, the answer is `why=no candidate call` while `calls_left=1`:
+the candidate scan skips any `Op::Call` whose `result` is `None`, and every call
+in this body is an expression statement (`assert.sameValue(...)`, `fns.a()`), so
+none of them is ever a candidate. Nine monomorphic sites, and the splice cannot
+see one of them.
+
+That is a bounded defect rather than a design limit: the splice builds a
+continuation block for the call's result and rewrites its uses, and a call whose
+result is discarded has neither. The shapes that need it are everywhere (every
+assert-style body, and the callback statements in the corpus), so it is worth
+doing before anything about callee shape or budget, which is what the next
+refusals will be.
+
+**The fused array loop is blocked on C2, which the ordering did not price**
+(found 2026-11-14 reading `opt_lower.rs`). A fused loop must hold the array and
+the callback across every `emit_leaf_call` in its body, and that is a heap
+reference live at a safepoint
 inside compiled code, exactly what C1's policy forbids. The tier's answer today
 is the refusal: a heap value is never promoted, so it lives at level 1 in a
 frame slot. `Op::Call` can hold `callee`/`this` in SSA only because it needs

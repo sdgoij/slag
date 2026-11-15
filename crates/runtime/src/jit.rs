@@ -7065,8 +7065,14 @@ pub(crate) fn lookup_info(
         // and without this a body used once per frame is recompiled on every
         // frame — a small body compiles in ~0.4ms, which is a frame's budget.
         // The cache bumps `jit_evictions` and resets the count when it evicts.
+        // A loop body compiles on the first consult unless the feedback probe is
+        // on: the probe records call sites while the body runs interpreted, and a
+        // body that compiles immediately never records, which is what left the
+        // inline pass with nothing to splice (`sites_from_feedback` reads the
+        // store at compile time). Under the probe a loop body waits the same
+        // count as any other, so measurement sees the calls it is measuring.
         if ir.jit_calls.get() < JIT_COMPILE_THRESHOLD
-            && (!ir.has_loop || ir.jit_evictions.get() > 0)
+            && (!ir.has_loop || ir.jit_evictions.get() > 0 || crate::feedback::enabled())
         {
             ir.jit_calls.set(ir.jit_calls.get().saturating_add(1));
             return std::ptr::null();
