@@ -1,0 +1,72 @@
+# cargo-deny policy: what this workspace is allowed to depend on, and from
+# where.
+#
+# Permissive licences only. The engine ships as a redistributable binary and its
+# crates are part of a published workspace, so a copyleft dependency would
+# change what can be released, and that decision should not be made by a
+# transitive dependency arriving in a patch release.
+
+[graph]
+all-features = true
+# Check the graphs CI actually builds: the three native targets in the test
+# matrix plus the wasm32 target the browser demo compiles. Without this, a
+# dependency resolved only by the Linux or the wasm job can pass on a Windows
+# development host and fail in CI, which is the one failure mode this gate
+# exists to prevent.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "wasm32-unknown-unknown",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+# An unmaintained advisory fails when the crate is one this workspace names
+# directly, which is where the choice is ours; a maintenance announcement deeper
+# in the tree is reported by `cargo audit` without blocking every commit.
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# `inspector` and `slag-fuzz` carry no license field and are never published;
+# ignoring private crates keeps that visible instead of implying they are
+# licensed for redistribution.
+private = { ignore = true }
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "NCSA",
+    "OpenSSL",
+    "BSL-1.0",
+    "Unlicense",
+]
+
+[bans]
+# Two versions of a crate are a warning rather than a failure: the engine pins
+# Cranelift, and a host (Deno) legitimately carries its own copy alongside.
+multiple-versions = "warn"
+# The crates in this workspace refer to each other by path with no version, and
+# cargo-deny only exempts that for crates marked `publish = false` — which these
+# are not (only `v8`, `inspector` and `slag-fuzz` say so). Whether the workspace
+# publishes to crates.io is its own decision, so the wildcard check is off here
+# rather than forcing `publish = false` on 21 manifests to satisfy a lint. Nothing
+# in the graph takes a wildcard version from a registry; `sources` is what pins
+# where a dependency may come from.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

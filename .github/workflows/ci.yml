@@ -224,6 +224,13 @@ jobs:
           tool: cargo-audit@0.22.2
       - name: Audit Cargo.lock
         run: cargo audit
+      # The same policy gate the pre-commit hook runs, so a clone without the
+      # hook installed cannot land a licence, yanked crate or unknown registry.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Check the dependency policy
+        run: cargo deny check
 
   # Manual only: interpreting even the small crates takes minutes, so this is
   # not on the push/PR path. It covers the lexer and syntax layer, which finish

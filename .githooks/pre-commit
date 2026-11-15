@@ -1,0 +1,55 @@
+#!/bin/sh
+# Pre-commit gate: refuse commits that fail formatting, lints or the dependency
+# policy.
+#
+# Installed once per clone with:
+#     git config core.hooksPath .githooks
+# Bypass once with `git commit --no-verify` when you really mean it.
+#
+# The hook checks the working tree, not the index: this repository commits after
+# the gates pass, and splitting staged from unstaged content would need a stash.
+# Set SLAG_PRECOMMIT_TESTS=1 to run the workspace tests as well.
+#
+# `fuzz/` is its own workspace, so the root `--all`/`--workspace` flags never
+# reach it. It is gated on its own manifest here because a root-only run is
+# exactly how a lint reached CI once already: the formatting step aborted the
+# job before the fuzz clippy step could run.
+
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: no cargo on PATH; skipping the gate" >&2
+    exit 0
+fi
+
+echo "pre-commit: fmt --all"
+cargo fmt --all -- --check
+
+echo "pre-commit: fmt fuzz targets"
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+echo "pre-commit: clippy --locked --workspace --all-targets"
+cargo clippy --locked --workspace --all-targets -- -D warnings
+
+echo "pre-commit: clippy --locked fuzz targets"
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
+# The dependency policy needs a tool cargo does not ship. Skipping it with a
+# warning keeps a fresh clone committable; CI runs it either way.
+if command -v cargo-deny >/dev/null 2>&1; then
+    echo "pre-commit: deny check"
+    cargo deny check
+else
+    echo "pre-commit: cargo-deny is not installed; skipping the licence and advisory check" >&2
+    echo "pre-commit: install it with 'cargo install cargo-deny --locked'" >&2
+fi
+
+if [ "${SLAG_PRECOMMIT_TESTS:-0}" = "1" ]; then
+    echo "pre-commit: test --workspace"
+    cargo test --workspace
+fi
+
+echo "pre-commit: ok"
