@@ -63,12 +63,12 @@ Enabling both is a `compile_error!`; clippy must be run per feature set, never
 The build emits a staticlib and a cdylib, plus a small C shim (the variadic
 `JS_New*Error` / `JS_Throw*Error` symbols). The staticlib is not
 self-contained: a C host also links the shim and the platform system libraries
-the Rust std uses. `tools/link-test-quickjs.sh` demonstrates the exact link
-line and runs a tiny C host against both artifacts:
+the Rust std uses. `cargo run -p xtask -- quickjs link-test` demonstrates the
+exact link line and runs a tiny C host against both artifacts (it defaults to
+both skins, `... -- quickjs link-test ng` narrows it):
 
 ```
-bash tools/link-test-quickjs.sh ng
-bash tools/link-test-quickjs.sh bellard
+cargo run -p xtask -- quickjs link-test
 ```
 
 The C tests (`c/tests/{ng,bellard}/*.c`) are compiled by `build.rs` and driven

@@ -20,10 +20,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+mod quickjs;
+
 /// The packages this task knows, in the order the key records them.
 const KNOWN_PACKAGES: [&str; 3] = ["cli", "test262", "wasmtest"];
 
 const USAGE: &str = "\
+usage: cargo run -p xtask -- <task> [options]
+
+tasks:
+  build        cached release binaries: slag, leak, sweep, wasmtest
+  quickjs      the QuickJS C facade: build, link-test, check-headers,
+               check-surface (`cargo run -p xtask -- quickjs --help`)
+
 usage: cargo run -p xtask -- build [options]
 
 Builds release binaries into target/release, reusing a content-addressed cache
@@ -47,7 +56,7 @@ the right binaries.
 ";
 
 #[derive(Debug)]
-enum Error {
+pub(crate) enum Error {
     Io(std::io::Error),
     /// The command could not be run at all (as opposed to exiting non-zero).
     Spawn {
@@ -166,9 +175,10 @@ fn main() -> ExitCode {
 fn run(arguments: &[String]) -> Result<(), Error> {
     match arguments.first().map(String::as_str) {
         Some("build") => build(&arguments[1..]),
+        Some("quickjs") => quickjs::run(&arguments[1..]),
         Some("-h" | "--help") | None => Err(Error::Help),
         Some(other) => Err(Error::Usage(format!(
-            "unknown task {other:?}; the one task is `build`"
+            "unknown task {other:?}; the tasks are `build` and `quickjs`"
         ))),
     }
 }
@@ -406,7 +416,7 @@ fn wanted_binaries(selected: &[Package]) -> Vec<&'static str> {
 /// part of the key. `canonicalize` is deliberately not used: on Windows it
 /// yields the `\\?\C:\...` extended-length form, which is the same directory as
 /// the drive-letter, forward-slash spelling under a different key.
-fn workspace_root() -> Result<PathBuf, Error> {
+pub(crate) fn workspace_root() -> Result<PathBuf, Error> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest
         .parent()
@@ -703,7 +713,7 @@ fn rustc_text(root: &Path, arguments: &[&str]) -> Result<String, Error> {
         .to_owned())
 }
 
-fn stderr_of(output: &Output) -> String {
+pub(crate) fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr)
         .trim_end()
         .to_owned()

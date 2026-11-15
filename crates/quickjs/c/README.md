@@ -20,8 +20,8 @@ They are selected by feature: `c/include/ng/quickjs.h` for `--features ng`,
 
 ## Checksums
 
-The drift gate (`tools/check-quickjs-headers.sh`) pins the *vendored* file,
-which for Bellard means the post-patch file, not the upstream tarball:
+The drift gate (`cargo run -p xtask -- quickjs check-headers`) pins the *vendored*
+file, which for Bellard means the post-patch file, not the upstream tarball:
 
 - `ng/quickjs.h` — `6d3879c856551653a1c64fabe52d6d07dc84e97bac3df45848df626702fc30de`
 - `bellard/quickjs.h` — `6904cf9ef0aa0b8ff4e9f32f8fa0e19a3971ebb1433c02a7854c8ea81083ec26`

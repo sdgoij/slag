@@ -7,16 +7,6 @@
 
 set shell := ["sh", "-cu"]
 
-# The recipes are POSIX sh; the cache build is `crates/xtask`. The four QuickJS
-# scripts are still bash, and on Windows `bash` on PATH is the WSL launcher in
-# System32, which cannot run them, so those calls name Git's bash outright.
-# SLAG_BASH overrides the location when Git is installed somewhere else.
-bash_bin := if os() == "windows" {
-    env("SLAG_BASH", "C:/Program Files/Git/bin/bash.exe")
-} else {
-    "bash"
-}
-
 # Local sweep deadlines. The repository rule is 15s and CI raises it to 30/60 to
 # absorb a slower runner VM; locally, something that overruns 15s is a real
 # result rather than a mis-timed deadline.
@@ -141,10 +131,10 @@ celld:
 
 # The QuickJS facade: both C skins, the link test, and the header and symbol drift checks.
 quickjs:
-    "{{bash_bin}}" tools/build-quickjs.sh
-    "{{bash_bin}}" tools/link-test-quickjs.sh
-    "{{bash_bin}}" tools/check-quickjs-headers.sh
-    "{{bash_bin}}" tools/check-quickjs-surface.sh
+    cargo run --quiet -p xtask -- quickjs build
+    cargo run --quiet -p xtask -- quickjs link-test
+    cargo run --quiet -p xtask -- quickjs check-headers
+    cargo run --quiet -p xtask -- quickjs check-surface
 
 # Miri over the front end; minutes per crate under the interpreter, so it is manual in CI too.
 miri:

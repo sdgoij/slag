@@ -116,13 +116,13 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Build and separate the facade artifacts
-        run: bash tools/build-quickjs.sh
+        run: cargo run --locked --quiet -p xtask -- quickjs build
       - name: Link a C host against both artifacts
-        run: bash tools/link-test-quickjs.sh
+        run: cargo run --locked --quiet -p xtask -- quickjs link-test
       - name: Check the vendored headers for drift
-        run: bash tools/check-quickjs-headers.sh
+        run: cargo run --locked --quiet -p xtask -- quickjs check-headers
       - name: Check the C symbol surface
-        run: bash tools/check-quickjs-surface.sh
+        run: cargo run --locked --quiet -p xtask -- quickjs check-surface
 
   # The sweep areas run as separate jobs, which is also how they are measured
   # locally: `annexB` is small and `language`/`built-ins` are ~24k fixtures each.
