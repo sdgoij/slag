@@ -11,6 +11,14 @@
 //! Runs after `mem2reg` (the counter is then a block parameter, not a slot) and
 //! before `normalize_param_types`, which re-types the parameter from the
 //! (now `Int`) increment.
+//!
+//! The register-body lane may already have emitted the wrapping increment
+//! (`IntAdd`/`IntSub`) for a counter its int plan proved, while the counter's
+//! entry constant is still a `Number` — the join of the two then types the
+//! loop parameter `Number`, and `opt_lower` refuses the whole body
+//! (`opt:int-operand`: an `Int` op over a word register). Proving that same
+//! counter here re-types its entry constant as well, so the parameter joins to
+//! `Int` and the body lowers as the register plan intended.
 
 use std::collections::HashMap;
 
@@ -24,6 +32,8 @@ struct Increment {
     kv: ValueId,
     konst: (BlockId, usize),
     delta: i32,
+    /// Where the entry constants into the header are defined.
+    inits: Vec<(BlockId, usize)>,
 }
 
 /// Run the pass over `func`. Returns whether the IR changed.
@@ -113,6 +123,24 @@ pub fn run(func: &mut Function) -> bool {
         if let Some(r) = inst.result {
             func.set_value_type(r, Type::Int);
         }
+        // The counter is int32 on every iteration (prove checked init, limit
+        // and delta), so the entry constants are int32 too. Re-typing them is
+        // what makes `normalize_param_types` join the header parameter to
+        // `Int` rather than `Number`: without it the increment is an i32 op
+        // over a word-typed parameter and `opt_lower` refuses the body.
+        for (ib, ii) in inc.inits {
+            let iinst = &mut func.block_mut(ib).insts[ii];
+            if iinst.op != Op::Const {
+                continue;
+            }
+            iinst.ty = Type::Int;
+            if let Imm::Float(f) = iinst.imm {
+                iinst.imm = Imm::Int(f as i32);
+            }
+            if let Some(r) = iinst.result {
+                func.set_value_type(r, Type::Int);
+            }
+        }
     }
     // A clone must precede its increment or it fails dominance. Insert
     // highest index first so an insertion cannot shift a position still to be
@@ -153,6 +181,7 @@ fn prove(
     def: &HashMap<ValueId, (BlockId, usize)>,
 ) -> Option<Increment> {
     let mut init: Option<i32> = None;
+    let mut inits: Vec<(BlockId, usize)> = Vec::new();
     let mut inc: Option<Increment> = None;
     let mut bound: Option<(i32, bool)> = None;
     for body in 0..func.block_count() as u32 {
@@ -189,11 +218,18 @@ fn prove(
             if init.replace(c).is_some() {
                 return None;
             }
+            inits.push((db, di));
             continue;
         }
+        // `Add`/`Sub` are the f64 forms the lift emits; `IntAdd`/`IntSub` are
+        // what the register-body lane already emits for a counter its int plan
+        // proved, with the entry constant still a `Number`. Proving either
+        // shape makes the counter int32, so both are accepted.
         let (op, konst) = match d.op {
             Op::Add => (Op::IntAdd, d.args.get(1)),
             Op::Sub => (Op::IntSub, d.args.get(1)),
+            Op::IntAdd => (Op::IntAdd, d.args.get(1)),
+            Op::IntSub => (Op::IntSub, d.args.get(1)),
             _ => return None,
         };
         if d.args.first() != Some(&p) {
@@ -215,6 +251,7 @@ fn prove(
             kv: cv,
             konst: (kb, ki),
             delta,
+            inits: std::mem::take(&mut inits),
         });
         bound = Some((limit, increasing));
     }
@@ -350,6 +387,94 @@ mod tests {
             b.term(exit, Term::Return(None));
         }
         (func, header)
+    }
+
+    /// The shape the register-body lane emits for a canonical `for` loop: the
+    /// counter's entry constant is a `Number` (shared with the accumulator's
+    /// `s = 0`), while the increment is already the wrapping `IntAdd`. Joining
+    /// those used to type the header parameter `Number`, and `opt_lower` then
+    /// refused the whole body with `opt:int-operand`.
+    fn register_loop_body(limit: f64) -> (Function, BlockId) {
+        let mut func = Function::new();
+        let e = func.entry();
+        let header;
+        {
+            let mut b = Builder::new(&mut func);
+            let zero = b.emit(
+                e,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(0.0),
+            );
+            header = b.block();
+            let exit = b.block();
+            b.term(
+                e,
+                Term::Jump {
+                    target: header,
+                    args: vec![zero],
+                },
+            );
+            let p = b.param(header, Type::Number);
+            let one = b.emit(
+                header,
+                Op::Const,
+                &[],
+                Type::Int,
+                Effects::pure(),
+                Imm::Int(1),
+            );
+            let inc = b.emit(
+                header,
+                Op::IntAdd,
+                &[p, one],
+                Type::Int,
+                Effects::pure(),
+                Imm::None,
+            );
+            let lim = b.emit(
+                header,
+                Op::Const,
+                &[],
+                Type::Number,
+                Effects::pure(),
+                Imm::Float(limit),
+            );
+            let cond = b.emit(
+                header,
+                Op::Lt,
+                &[inc, lim],
+                Type::Bool,
+                Effects::pure(),
+                Imm::None,
+            );
+            b.term(
+                header,
+                Term::Branch {
+                    cond,
+                    then_block: header,
+                    then_args: vec![inc],
+                    else_block: exit,
+                    else_args: vec![],
+                },
+            );
+            b.term(exit, Term::Return(None));
+        }
+        (func, header)
+    }
+
+    #[test]
+    fn retypes_the_entry_of_an_already_wrapping_counter() {
+        let (mut func, header) = register_loop_body(100.0);
+        assert!(run(&mut func));
+        // The pass proves the counter int32, so the entry belongs to the same
+        // representation the increment produces — then the header parameter
+        // joins to `Int` and the body lowers instead of bailing.
+        crate::opt::pass::run(&mut func, None, &[], &mut |_: u64| None);
+        assert_eq!(func.value_type(func.block(header).params[0]), Type::Int);
+        assert_eq!(verify(&func), Ok(()));
     }
 
     #[test]

@@ -92,8 +92,24 @@ The morning revision listed these as future work. They are in the tree:
 | `TemplateSub` delta fix | `opt/lift/mod.rs` | the substitution fence is a pop *and* a push; charging it −1 drifted the block depth and refused any body with a template before a conditional |
 | closure phase instrument | `function::phases`, `SLAG_CLOSURE_PHASES` | per-phase TSC cycles per closure, overhead-calibrated; §4 A0 |
 | `Int`-op operand check | `opt_lower.rs` (`opt:int-operand`) | a wrapping `i32` op over `Value`-word operands refuses instead of `iadd`ing tag bits |
+| counter entry re-typing | `pass/loop_counter.rs` | the pass proves a counter whose increment the register lane already emitted as `IntAdd`/`IntSub`, and re-types its entry constant, so the header parameter joins `Int` instead of `Number` and the whole body stops bailing at `opt:int-operand` |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
+
+The counter re-typing closes a refusal that had been hiding behind a green
+sweep: `loop_counter` only recognised an `Op::Add`/`Op::Sub` increment, while
+the register-body lane emits `IntAdd`/`IntSub` for a counter its int plan
+proved. The entry constant (often shared, as in `s = 0`) stayed a `Number`, so
+`normalize_param_types` joined the header parameter to `Number`, and
+`opt_lower` refused the entire body rather than `iadd` tag bits. The pass now
+accepts the already-wrapping increment and re-types the entry constants too,
+which is sound on its own range proof (init, limit and delta all fit i32). Six
+corpus rows were falling back to the per-step tier on this, and only those six
+have different IR afterwards (checked by diffing `JIT_DUMP_IR` over all 81).
+Isolated, interleaved, min-of-15 in one session: `warm_store` 41.3 to 24.1 ms,
+`compound_assign` 49.9 to 30.9, `opcost/array_includes` -25%, `opcost/set_has`
+-9%, `calls/method_call` -4%, `builtins/async_churn` +2.6% (inside the row's
+noise; its hot loop is promise machinery, not the counter).
 
 ### 1.3 The B0 census: what the rest of Phase B is worth
 
