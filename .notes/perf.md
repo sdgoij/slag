@@ -46,6 +46,27 @@ Same-session, interleaved, min-of-15 isolated: `objects/warm_store` 41.3 to 24.1
 
 - **The per-iteration chain** (`function.rs`). A closure creation looked its own fresh record up again after registering it, only to install the creation site's per-iteration chain. Carrying the chain into `register_function` removes that probe: 3347.7 to 2501.0 TSC cycles per closure on a 3-captured-closures loop, and -5.7% on that loop (min-of-15, one aligned binary pair). It must be installed after `shared_compiled_body`, because the compile reads it and the compiled body is shared per site.
 
+### The helper re-entry census (2026-11-15)
+
+`python tools/corpus/helper_rows.py` runs one row per process with `JIT_HELPER_STATS` and attributes the histogram, which is the census that replaced guesswork after the closure-path cut landed and `head-let` did not move. Corpus-wide totals, largest first:
+
+| helper | calls | where |
+|---|---:|---|
+| `GetMemberName` | 82.8 M | `objects/proto_read` 28.0 M (essentially all of it), `set_churn` 8.4 M, `apply_call` 7.0 M, `map_churn` 6.3 M, `prim_prop` 6.0 M |
+| `CallSlow` | 39.6 M | `recursive_fib` 14.9 M (every `fib` call), `set_churn` 4.2 M, `map_churn` 2.1 M |
+| `BinarySlow` | 12.7 M | `coercion_concat` 6.3 M, `head-let` 4.2 M |
+| `ToBooleanSlow` | 10.7 M | `set_churn` 4.2 M, `map_churn` 2.1 M |
+| `CertifiedCall` | 10.3 M | the certified lane working as designed |
+| `UnarySlow` | 7.8 M | `head-let` 4.2 M + `evaluation-order` 3.5 M (`!is(...)` in `sameValue`) |
+
+`head-let`, the biggest row, makes ~58 helper calls per iteration (`CertifiedCall` 9, `BinarySlow` 6, `UnarySlow` 6, `LeafCallProbe` 3, `LoadIdent` 3, `CreateFunction` 3, `AssignMemberName`/`AssignMemberComputed`/`FastArrayElementWrite` 3 each, `LoadPerIter`/`StorePerIter`/`PerIteration` 3 each, `ForInNext` 4, `TypeofTop` 3, `EnterPerIteration`/`InitContext`/`ObjectBegin`/`LeaveBlock`/`ForInBegin` 1 each). That surface, not closure creation, is what the row is bound by: a 25% cheaper closure path moved it 0.4%.
+
+Three findings that size the next cuts:
+
+- **`GetMemberName`'s traffic is prototype reads whose cache is *inside* the helper.** `proto_read` (one stable receiver, two prototype data properties, 4 M reads) takes 28 M helper calls because the compiled read probes only the own-property cell; `member_chain_get`'s identity- and map-keyed chain cells (Cut 75) then serve the body cheaply, but the call itself is already paid. Inlining the chain probe into the compiled named read is the cut, and the obstacle is the link walk being a variable-length loop.
+- **`ToBooleanSlow` in a lifted body is a missing port, not a workload.** The per-step tier has `emit_truthiness` (numbers, tags, and a slow arm); `opt_lower`'s `Term::Branch` has no inline path at all for a non-`Bool` condition, so `if (st.has(k))` pays a helper per iteration even though the answer is a `Bool`. `set_churn` is 600 k such calls per `bench()` in a 49 ms row.
+- **`recursive_fib`'s 14.9 M `CallSlow` is the self-call lane's own cost, not a funnel miss** (`JIT_LEAF_TRACE` says `leaf-lookup-miss` and the self path runs inside `call_slow`). 31 ns per self call against node's 4 ns lives in `self_call_inline`'s frame work, which the plan's §20 already records as a bloat-sensitive area.
+
 Two things this arc re-confirmed about measuring here. A whole-corpus single pass per side is not an instrument: rows whose generated IR was *identical* moved by 30-40% between the two binaries, so the per-row isolated, many-round protocol is what decides a row. And `JIT_DUMP_IR` diffs are the way to establish which rows a tier change can even touch: `python` diffing the dump over all 81 rows (heap addresses stripped) named exactly six rows for each cut, which is what made the layout swings on the other 75 identifiable as noise.
 
 ## What the current design has taken as far as it goes
@@ -102,7 +123,9 @@ Instruments: `node tools/corpus/bench.js` (the cross-engine run that prints the
 table above), `python tools/corpus/measure.py` (interleaved min-per-row totals),
 `ab_lift.py`, `census_probe.py`, `refusal_probe.py` (now including the
 `opt-lower bail` gate, which is a different refusal from `opt bail` and hid six
-rows) and `ir_diff.py` (which rows' IR two binaries actually differ on, so a
-delta on any other row is known to be layout); in the engine, `JIT_DUMP_IR`,
+rows), `ir_diff.py` (which rows' IR two binaries actually differ on, so a
+delta on any other row is known to be layout) and `helper_rows.py` (the
+`JIT_HELPER_STATS` histogram attributed per row, one row per process); in the
+engine, `JIT_DUMP_IR`,
 `JIT_DUMP_CLIF`, `JIT_HELPER_STATS`, and `--features step-stats`.
 `ENVIRONMENT.md` documents each switch.
