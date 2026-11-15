@@ -96,6 +96,7 @@ The morning revision listed these as future work. They are in the tree:
 | register-body named read | `opt/lift/mod.rs` (`LeafOp::GetMemberName`) | an `x.name` read whose object is already in the accumulator (a chained read like `a[i].n`) now lifts to the same member-value cell probe the `Step` form uses; each refused leaf op is named through `leaf_op_name` instead of the opaque `RunRegBody` |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
+| inline truthiness in the optimizing tier | `opt_lower.rs` (`emit_falsy`) | the per-step tier has had `emit_truthiness` since its first cut; the optimizing tier had no port, so every `if (x)` on a condition the typer did not prove `Bool` called `ToBooleanSlow` (`if (set.has(k))` is the shape). `ToBooleanSlow` traffic over the corpus goes 10.7M to 0 |
 | per-iteration chain on the record | `function.rs` (`register_function`) | the chain install moved inside registration, so a closure creation no longer pays a second `ecma_functions` probe (a random access into a table holding one record per live function) after the insert. It must stay AFTER `shared_compiled_body`: `compile_body` reads the chain into the compiler and the compiled body is shared per site, so setting it in the record literal bakes the first closure's chain into every later one (`installed_jit_per_iteration_head_inside_another_loop` returns the wrong bindings) |
 
 The counter re-typing closes a refusal that had been hiding behind a green
@@ -126,6 +127,30 @@ register-body blocker left in the corpus is `leaf:BinRemConst`
 -4 to -13%. `strings/split_join`, `opcost/array_to_sorted` and
 `builtins/json_roundtrip` also lift now but are dominated by allocation and JSON
 work, so their deltas sit inside a 5-20% run-to-run band and are not claimed.
+
+A fourth cut is the first one this arc to move the dominant row. `opt_lower`'s
+`Term::Branch` called `Helper::ToBooleanSlow` for every condition the typer had
+not proved `Bool`, and its `Op::Not` did the same, where the per-step tier has
+inlined truthiness since its first cut. The port (`emit_falsy`) drives the
+corpus-wide `ToBooleanSlow` count to zero, and layout-neutral
+(`-align-all-functions=5` on both sides) it is `head-let` -3.7%,
+`evaluation-order` -2.1%, `builtins/map_churn` -6.2%, with everything else inside
++-2%.
+
+**The length of the inline sequence is the whole result.** The first version also
+folded the `object`/`function`/`symbol` tags into the fast path (six more
+compares, to keep `if (obj)` off the helper); it measured `set_churn` +1.7% and
+`opcost/object_keys` +8.7%, and the second run of the *minimal* version (exactly
+the per-step sequence: doubles plus the four value tags) measured -5.1%/-7.1% on
+the same rows. A helper call is ~5 instructions plus a tiny body; an inline
+sequence longer than that is a wash at best. Keep this one at parity with
+`compiler.rs::emit_truthiness` and do not "improve" it.
+
+Two measurement notes from the same cut, both of which nearly cost the result:
+`opcost/object_keys` measured +30.9% under the isolated min-of-9 protocol and its
+IR is identical between the binaries, so the delta was native layout; under
+alignment it is 0.0%. And the whole-corpus single-pass A/B showed 38 rows moving
+by 6-30% in both directions, which is why no row-level number here comes from it.
 
 A third cut takes the closure path itself. `instantiate_function_with_source`
 installed the per-iteration chain by looking the fresh record up again after

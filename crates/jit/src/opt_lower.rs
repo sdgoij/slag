@@ -309,15 +309,8 @@ fn lower(
                         JsValue::Boolean(false).bits() as i64,
                     )
                 } else {
-                    let truthy = call_helper(
-                        &mut builder,
-                        helpers,
-                        &abi,
-                        abi.sig_bool,
-                        Helper::ToBooleanSlow,
-                        &[c],
-                    )?;
-                    builder.ins().icmp_imm_u(IntCC::NotEqual, truthy, 0)
+                    let falsy = emit_falsy(&mut builder, helpers, &abi, c)?;
+                    builder.ins().icmp_imm_u(IntCC::Equal, falsy, 0)
                 };
                 let then_vals = resolve(&mut builder, ir, *then_block, then_args, &values)?;
                 let else_vals = resolve(&mut builder, ir, *else_block, else_args, &values)?;
@@ -655,14 +648,22 @@ fn lower_inst(
         Op::ToNumber | Op::Neg | Op::BitNot | Op::Not => {
             // `!b` on a proven Boolean `Value` is a flip of the canonical bits
             // — the `select` the branch terminator folds, no helper.
-            if inst.op == Op::Not && types.get(inst.args[0] as usize) == Some(&Type::Bool) {
+            if inst.op == Op::Not {
+                if types.get(inst.args[0] as usize) == Some(&Type::Bool) {
+                    let value = arg!(0);
+                    let is_false = builder.ins().icmp_imm_u(
+                        IntCC::Equal,
+                        value,
+                        JsValue::Boolean(false).bits() as i64,
+                    );
+                    return Ok(canonical_bool(builder, is_false));
+                }
+                // `!x` IS the falsiness of `x`, so a non-`Bool` operand needs no
+                // helper either (see `emit_falsy`).
                 let value = arg!(0);
-                let is_false = builder.ins().icmp_imm_u(
-                    IntCC::Equal,
-                    value,
-                    JsValue::Boolean(false).bits() as i64,
-                );
-                return Ok(canonical_bool(builder, is_false));
+                let falsy = emit_falsy(builder, helpers, abi, value)?;
+                let flag = builder.ins().icmp_imm_u(IntCC::NotEqual, falsy, 0);
+                return Ok(canonical_bool(builder, flag));
             }
             let disc = unary_op(inst.op).ok_or(Unsupported::Step("opt:unary"))?;
             let op = builder.ins().iconst(types::I64, disc as i64);
@@ -5933,6 +5934,75 @@ fn call_numeric_binary(
     builder.def_var(result, slow_res);
     builder.ins().jump(merge, &[]);
     builder.seal_block(slow);
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    Ok(builder.use_var(result))
+}
+
+/// `ToBoolean(bits)` as a 0/1 falsiness flag, inline for every value whose
+/// truthiness is a tag or a numeric test: a double is falsy at `0`, `-0` and
+/// NaN, `false`/`null`/`undefined` are falsy, `true` and the `object`,
+/// `function` and `symbol` tags are truthy. A string (an empty one is falsy)
+/// or a BigInt (`0n` is falsy) takes `Helper::ToBooleanSlow` through a
+/// diamond, so the answer stays exact.
+///
+/// The per-step tier has had this since its first cut (`emit_truthiness`);
+/// the optimizing tier never got the port, so every `if (x)` whose condition
+/// the typer did not prove `Bool` called the helper — including a value that
+/// IS one, like a builtin call returning a boolean (`if (set.has(k))`).
+fn emit_falsy(
+    builder: &mut FunctionBuilder,
+    helpers: &JitHelpers,
+    abi: &Abi,
+    bits: ClifValue,
+) -> Result<ClifValue, Unsupported> {
+    fn wide(builder: &mut FunctionBuilder, v: ClifValue) -> ClifValue {
+        builder.ins().uextend(types::I64, v)
+    }
+    fn is(builder: &mut FunctionBuilder, bits: ClifValue, other: u64) -> ClifValue {
+        builder.ins().icmp_imm_u(IntCC::Equal, bits, other as i64)
+    }
+    let number = is_number(builder, bits);
+    let num = value_as_f64(builder, bits);
+    let zero = builder.ins().f64const(0.0);
+    let is_zero = builder.ins().fcmp(FloatCC::Equal, num, zero);
+    let is_nan = builder.ins().fcmp(FloatCC::Unordered, num, num);
+    let num_falsy = builder.ins().bor(is_zero, is_nan);
+    let falsy_num = wide(builder, num_falsy);
+    let f = is(builder, bits, JsValue::Boolean(false).bits());
+    let n = is(builder, bits, JsValue::Null.bits());
+    let u = is(builder, bits, JsValue::Undefined.bits());
+    let t = is(builder, bits, JsValue::Boolean(true).bits());
+    let f_or_n = builder.ins().bor(f, n);
+    let tag_falsy = builder.ins().bor(f_or_n, u);
+    let falsy_tag = wide(builder, tag_falsy);
+    let truthy_tag = wide(builder, t);
+    let number_wide = wide(builder, number);
+    let known = builder.ins().bor(falsy_tag, truthy_tag);
+    let not_number = is(builder, number_wide, 0);
+    let not_known = is(builder, known, 0);
+    let needs_slow = builder.ins().band(not_number, not_known);
+
+    let result = builder.declare_var(types::I64);
+    let falsy = builder.ins().select(number, falsy_num, falsy_tag);
+    builder.def_var(result, falsy);
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.ins().brif(needs_slow, slow, &[], merge, &[]);
+    builder.switch_to_block(slow);
+    builder.seal_block(slow);
+    let truthy = call_helper(
+        builder,
+        helpers,
+        abi,
+        abi.sig_bool,
+        Helper::ToBooleanSlow,
+        &[bits],
+    )?;
+    let slow_flag = is(builder, truthy, 0);
+    let slow_falsy = wide(builder, slow_flag);
+    builder.def_var(result, slow_falsy);
+    builder.ins().jump(merge, &[]);
     builder.switch_to_block(merge);
     builder.seal_block(merge);
     Ok(builder.use_var(result))

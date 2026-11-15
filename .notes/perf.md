@@ -44,6 +44,7 @@ Three cuts. The first two are refusals that had been silently costing whole rows
 
 Same-session, interleaved, min-of-15 isolated: `objects/warm_store` 41.3 to 24.1 ms and `objects/compound_assign` 49.9 to 30.9 (both bodies now lower through the tier), `opcost/prim_prop` 1.73 to 1.16, `objects/many_objects_read` 23.0 to 18.7. Corpus total, whole-corpus A/B over five alternating rounds against the pre-cut tree: **2623.5 to 2534.4 ms (-3.4%)**, 81/81 identical results.
 
+- **Inline truthiness in the optimizing tier** (`opt_lower.rs`). `Term::Branch` and `Op::Not` called `Helper::ToBooleanSlow` for any condition not typed `Bool`; the per-step tier's `emit_truthiness` was never ported. Corpus-wide `ToBooleanSlow` goes 10.7M to 0, and layout-neutral that is `head-let` -3.7%, `evaluation-order` -2.1%, `map_churn` -6.2%. The first attempt added the object/function/symbol tags to the fast path and measured *nothing* (and +8.7% on `object_keys`); the inline sequence has to stay as short as the call it replaces.
 - **The per-iteration chain** (`function.rs`). A closure creation looked its own fresh record up again after registering it, only to install the creation site's per-iteration chain. Carrying the chain into `register_function` removes that probe: 3347.7 to 2501.0 TSC cycles per closure on a 3-captured-closures loop, and -5.7% on that loop (min-of-15, one aligned binary pair). It must be installed after `shared_compiled_body`, because the compile reads it and the compiled body is shared per site.
 
 ### The helper re-entry census (2026-11-15)
