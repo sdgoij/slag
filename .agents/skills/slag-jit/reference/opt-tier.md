@@ -308,3 +308,39 @@ Goats reproduced it in `terrainMesh = rl.makeModel(...)`.
 - **The store sites are defensive now.** An empty reference stack falls back to
   `store_ident_value(..., true)` (the global binding the pre-resolve targeted)
   instead of throwing, in both the interpreter and `store_ident`.
+
+## 37. A `RunRegBody` cannot carry a read guard, so its accumulator stays in memory
+
+The typer's read guard (`Op::GuardType`, T2) is what makes an arithmetic chain
+type-provable: a guarded read is a `Number`, so `Add` over it is a `Number`, so
+`narrow` proves the slot numeric, so `mem2reg` can promote it (`SLAG_MEM2REG=0`
+is the seam; the top-level promotion exists and refuses only heap-possible
+slots — `non_heap_slots` in `opt/pass/mod.rs`). The guard's `Imm::Int` is a
+**step index the interpreter resumes at** when the speculation is wrong.
+
+A certified body that lowered entirely to `LeafOp`s is a single
+`Step::RunRegBody`, and the lift lowers its ops through `emit_leaf_op`
+(`LeafOp::GetMemberComputedLocal` → `Op::ElementLoad`) with **no guard** — there
+is no step inside a fused register program to resume at, and resuming at the
+`RunRegBody` step would re-run the whole body (re-firing a getter, re-applying a
+store). So in that lane:
+
+- every read is `Type::Unknown`;
+- `Add`/`Sub`/... over it is Unknown too (a `+` can be a string concat, so this
+  is correct, not conservative-by-accident);
+- the slot holding the result is heap-possible, so `mem2reg` declines it and the
+  accumulator round-trips through the frame every iteration.
+
+Diagnose it by the census, not the source: `SLAG_TYPER=1 JIT_DUMP_IR=1` prints
+`v15:? = ElementLoad` feeding `v17:? = Add` with `guard 0`, where a step-lifted
+body (`push_pop`'s `.length` read) shows `v19:num = GuardType(...)`. `index_loop`
+pays ~17 cycles/iteration against node's ~4 for exactly this reason, and read-lane
+work barely moves it (the canonical-index gate's two software sequences bought
+3%).
+
+The fix is sub-step resume points: a resumable `(op index, reconstructed operand
+stack)` the guard can name, so a read guard can live inside a register body.
+Note what is NOT needed — a stack map (C2): the promoted slot here is a Number,
+not a GC root. Do not "fix" this by typing `Add` numeric or by promoting
+heap-possible slots: the first miscompiles `"a" + b`, the second unroots a live
+object.

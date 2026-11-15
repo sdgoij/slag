@@ -317,17 +317,13 @@ A0 rather than a lift:
   by the ablation it cannot be *sufficient*: the closures it creates cost 340 ns
   each and the tier does not change that.
 
-One correction to "not register traffic", because it is row-dependent and the
-frame-slot term does bind on tight arithmetic/array loops. `arrays/index_loop`
-(3M iterations of `s += a[i & 199999]`) runs 14.4 ms = 4.8 ns/iteration
-(~17 cycles) against node's 1.1 ns (~4 cycles, i.e. one `fadd` latency), and the
-CLIF shows a lifted body carrying its two loop-carried locals in frame slots —
-`load v0+16; fadd; store v0+16` for `s`, the same round trip for `i` — so the
-chain is store-to-load forwarding (~5-6 cycles) plus the arithmetic. That row is
-the benchmark for whatever keeps locals out of memory (C2's stack map is the
-precondition), and it is worth its own measurement: it does not move for helper,
-cell, or opcode work (the canonical-index gate's software sequences went away
-and bought 3%).
+One correction to "not register traffic", because it is row-dependent and the frame-slot term does bind on tight arithmetic/array loops — but the mechanism is NOT what it looks like, and it was measured down to the cause (2026-11-15). `arrays/index_loop` (3M iterations of `s += a[i & 199999]`) runs 14.4 ms = 4.8 ns/iteration (~17 cycles) against node's 1.1 ns (~4 cycles, i.e. one `fadd` latency). The loop counter `i` is already a block parameter (a register); only the accumulator `s` round-trips through the frame (`FrameLoad slot2; Add; FrameStore slot2`).
+
+Promotion machinery already exists and works: `opt/pass/mem2reg.rs` promotes frame slots, the top-level pipeline runs it (`SLAG_MEM2REG=0` is the seam), it supports guards (it runs after `guard::run` so it can materialize a promoted slot on a guard's deopt path), and it restricts itself to slots that never hold a heap value because a frame slot is a GC root. What refuses `s` is that restriction: `non_heap_slots` disqualifies a slot whose store's value is `Type::Unknown`, and `Add(Unknown, Unknown)` is Unknown — correctly, since a `+` can be a string concatenation. The only sound way to type it is the typer's read guard (`Op::GuardType` on the read that feeds the arithmetic), which `narrow` already models as producing a `Number`.
+
+And that is what is missing on this row: the body is a single `Step::RunRegBody` ("a whole certified body can be one `RunRegBody` instead of straight-line fragments around dispatched `Step`s"), so the lift lowers `LeafOp`s directly (`emit_leaf_op` -> `LeafOp::GetMemberComputedLocal`) and **never emits a read guard** — a guard's `Imm::Int` is a *step index the interpreter can resume at*, and inside a fused register program no such step exists (resuming at the `RunRegBody` step would re-run the whole body, re-firing a getter or a store). Verified: `SLAG_TYPER=1 JIT_DUMP_IR=1` on `index_loop` shows `v15:? = ElementLoad` feeding `v17:? = Add` with `guard 0` in the census, while `push_pop`'s `.length` read in a *step*-lifted body does show `v19:num = GuardType(...)`.
+
+So the next cut is **sub-step resume points for a register body**: a resumable `(ops index, reconstructed operand stack)` a guard can name, so the typer's read guard can live inside a `RunRegBody`. Then `Add` types as `Number`, `s` becomes a promotable non-heap slot, and the accumulator stops touching memory — the same chain that already works for step-lifted bodies. Neither a stack map (C2) nor a new promotion rule is on this path: the slot is a Number, not a root.
 
 ---
 

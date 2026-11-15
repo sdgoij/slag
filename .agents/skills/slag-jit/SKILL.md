@@ -31,6 +31,7 @@ split** — an older note that cites `slag-jit` §18 means §18, wherever it liv
 §30      reference/member-reads.md
 §31-§34  reference/opt-tier.md
 §35-§36  reference/member-reads.md
+§37      reference/opt-tier.md
 ```
 
 | file | what is in it | open it when |
@@ -70,6 +71,9 @@ Each of these has a section in the file named; none is guessable from the code.
 - **The primitive-receiver read is a measured non-lever** (`member-reads.md`
   §36): a string's `.length` and a number's `.valueOf` are ~12% of their own
   row, and `opcost/*`'s node column is a folded loop.
+- **A register body cannot carry a read guard** (`opt-tier.md` §37): its lift
+  lowers `LeafOp`s with no resumable step, so its reads stay `Unknown`, its
+  arithmetic stays unproven, and `mem2reg` leaves the accumulator in the frame.
 
 ## 15. Validation
 
