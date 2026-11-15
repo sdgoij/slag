@@ -126,8 +126,9 @@ table above), `python tools/corpus/measure.py` (interleaved min-per-row totals),
 `ab_lift.py`, `census_probe.py`, `refusal_probe.py` (now including the
 `opt-lower bail` gate, which is a different refusal from `opt bail` and hid six
 rows), `ir_diff.py` (which rows' IR two binaries actually differ on, so a
-delta on any other row is known to be layout) and `helper_rows.py` (the
-`JIT_HELPER_STATS` histogram attributed per row, one row per process); in the
-engine, `JIT_DUMP_IR`,
+delta on any other row is known to be layout), `helper_rows.py` (the
+`JIT_HELPER_STATS` histogram attributed per row, one row per process) and
+`seam_ab.py` (a same-binary A/B of an env-gated pass, the only protocol that
+resolves a row under ~5 ms); in the engine, `JIT_DUMP_IR`,
 `JIT_DUMP_CLIF`, `JIT_HELPER_STATS`, and `--features step-stats`.
 `ENVIRONMENT.md` documents each switch.

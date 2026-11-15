@@ -1,6 +1,6 @@
 ---
 name: slag-perf-measurement
-description: Measure and A/B a Slag interpreter/JIT performance change without fooling yourself. Load before claiming any speedup or regression from wall-clock numbers, comparing two binaries, or reporting a benchmark row. Covers the same-session interleaved control protocol, dependency-provenance and native-layout swings (git vs path dep, `-align-all-functions`), representation changes that are free in one tier and paid in the other, the global-loop-bound confound, jitless vs JIT mode checks, the step census (--features step-stats) and how to read its bucket totals, and the traps that produced a false "minus 19 percent".
+description: Measure and A/B a Slag interpreter/JIT performance change without fooling yourself. Load before claiming any speedup or regression from wall-clock numbers, comparing two binaries, or reporting a benchmark row. Covers the same-session interleaved control protocol, the same-binary env seam for rows under 5 ms, `ir_diff.py` to bound a change's blast radius, the helper census (`helper_rows.py`), dependency-provenance and native-layout swings (git vs path dep, `-align-all-functions`), representation changes that are free in one tier and paid in the other, the global-loop-bound confound, jitless vs JIT mode checks, the step census (--features step-stats) and how to read its bucket totals, and the traps that produced a false "minus 19 percent".
 ---
 
 # Measuring a Slag performance change
@@ -58,6 +58,57 @@ was 211 ms, five fresh control runs were 166-175 ms, and the variant was 171 ms.
   "+7.8% frame" measured path-built against a previous pin reversed sign under
   alignment (the newer pin came out 0.2 ms *faster*), so the whole delta was
   layout. Re-run the control with the flag before blaming a commit.
+- **Alignment is not enough for a 1-2 ms row.** Even with
+  `-C llvm-args=-align-all-functions=5` on both sides, an inlined prototype-cell
+  read measured `opcost/array_at` +73%, `arrays/push_pop` +60% and
+  `opcost/array_indexof` +34% across binaries, and -2.9%, +0.9%, -1.5% within one
+  binary. Three rows nearly paid for a 1.9x win. Below ~5 ms there is no
+  cross-binary measurement, aligned or not.
+
+## The same-binary seam (the instrument for small rows)
+
+Gate the change itself behind an env var read once per process
+(`SLAG_CHAIN_PROBE`, `SLAG_UNBOX`, `SLAG_GUARD`, `SLAG_INLINE` are the existing
+ones; add yours in `ENVIRONMENT.md`), then A/B the two settings of ONE binary:
+
+```
+python tools/corpus/seam_ab.py target/release/slag.exe SLAG_CHAIN_PROBE row/a.js row/b.js
+```
+
+Both sides are the same executable, so the delta is the pass's marginal effect
+with no layout, no provenance and no rebuild in it. This is the only way that
+held up on this corpus: the same probe read +73% cross-binary and -2.9% here.
+Prefer it whenever the change has a switchable seam; keep the seam afterwards, it
+costs one cached env read per compile.
+
+## Bound the blast radius before timing anything
+
+A tier change can only move a row whose generated IR differs. Diff it first
+(`python tools/corpus/ir_diff.py CONTROL VARIANT`, heap addresses stripped),
+because every other row's delta is layout. This named exactly 6 of 81 rows for
+two of the cuts in the 2026-11-15 arc; the other 75 swung 30-40% in the same
+whole-corpus passes. A change that is lowering-only (same IR, different emitted
+code) has no such filter — use the seam.
+
+## Do not judge on the corpus total
+
+`head-let` alone swings +-20% (about +-90 ms of a 2400 ms total), which swamps
+every gain a session lands. Two whole-corpus passes five rounds apart reported
++0.3% and -4.1% for the same binary pair. Total the rows that are quiet instead
+(state the exclusion): the 79 rows other than `head-let` and
+`evaluation-order` read -5.2% for the same pair, consistent with the per-row
+numbers. Quote the row table, not the total.
+
+## Attribute traffic with the helper census
+
+`python tools/corpus/helper_rows.py` runs one row per process with
+`JIT_HELPER_STATS` and attributes the histogram (the array itself is
+process-wide, so a whole-corpus run sizes a helper but cannot say who pays it).
+Use it before designing anything: it turned "head-let should respond to a cheaper
+closure path" into "head-let makes ~58 helper calls per iteration", and it sized
+the three cuts after it. A helper-count drop is NOT a win by itself — inlining
+`ToBooleanSlow` to zero moved the rows only once the inline sequence was as short
+as the call it replaced.
 
 ## The step census
 
