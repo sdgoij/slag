@@ -14,7 +14,9 @@ fuzz_target!(|data: &[u8]| {
         .map(|byte| u16::from(*byte))
         .collect();
     let pattern: Vec<u16> = pattern_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     if let Ok(re) = regexp::compile_with_flags(&pattern, &flags) {

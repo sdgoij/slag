@@ -7,7 +7,9 @@ use libfuzzer_sys::fuzz_target;
 // reaches a different path, and the runtime's own string type is UTF-16.
 fuzz_target!(|data: &[u8]| {
     let units: Vec<u16> = data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let _ = parser::parse_script_utf16(&units);
