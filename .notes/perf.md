@@ -98,6 +98,9 @@ built from different trees; check binary freshness before trusting a number.
 
 Instruments: `node tools/corpus/bench.js` (the cross-engine run that prints the
 table above), `python tools/corpus/measure.py` (interleaved min-per-row totals),
-`ab_lift.py`, `census_probe.py` and `refusal_probe.py`; in the engine,
-`JIT_DUMP_IR`, `JIT_DUMP_CLIF`, `JIT_HELPER_STATS`, and `--features step-stats`.
+`ab_lift.py`, `census_probe.py`, `refusal_probe.py` (now including the
+`opt-lower bail` gate, which is a different refusal from `opt bail` and hid six
+rows) and `ir_diff.py` (which rows' IR two binaries actually differ on, so a
+delta on any other row is known to be layout); in the engine, `JIT_DUMP_IR`,
+`JIT_DUMP_CLIF`, `JIT_HELPER_STATS`, and `--features step-stats`.
 `ENVIRONMENT.md` documents each switch.

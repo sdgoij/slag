@@ -42,6 +42,10 @@ from census_probe import (  # noqa: E402
 )
 
 BAIL = re.compile(r"opt bail: (.+?) \(\d+ steps\)")
+# The lift ACCEPTED the body and the lowering refused it — a different gate from
+# the `opt bail` above, and the one that hid six rows behind an unexplained
+# fall-back before the counter re-typing and the named-read lift.
+LOWER_BAIL = re.compile(r"opt-lower bail: (.+)$")
 BLOCKERS = re.compile(r"^opt-blockers:(.*)$")
 SHAPES = re.compile(r"^opt-shapes:(.*)$")
 REFUSE = re.compile(r"^opt-refuse: (.+)$")
@@ -51,18 +55,20 @@ def probe_row(rel, slag):
     proc = run_workload(
         WORKLOADS / rel, slag, extra_env={"JIT_DUMP_CLIF": "1", "JIT_DUMP_STEPS": "1"}
     )
-    bails, blockers, shapes, refuses = [], set(), set(), []
+    bails, lower_bails, blockers, shapes, refuses = [], [], set(), set(), []
     for line in proc.stderr.splitlines():
         line = line.strip()
         if m := BAIL.search(line):
             bails.append(m.group(1))
+        elif m := LOWER_BAIL.search(line):
+            lower_bails.append(m.group(1))
         elif m := BLOCKERS.match(line):
             blockers.update(n for n in m.group(1).strip().split(",") if n)
         elif m := SHAPES.match(line):
             shapes.update(n for n in m.group(1).strip().split(",") if n)
         elif m := REFUSE.match(line):
             refuses.append(m.group(1))
-    return proc, bails, sorted(blockers), sorted(shapes), refuses
+    return proc, bails, lower_bails, sorted(blockers), sorted(shapes), refuses
 
 
 def main(argv=None):
@@ -96,8 +102,10 @@ def main(argv=None):
         rows = [Path(s) for s in selection]
 
     for rel in rows:
-        proc, bails, blockers, shapes, refuses = probe_row(rel, slag)
+        proc, bails, lower_bails, blockers, shapes, refuses = probe_row(rel, slag)
         reason = " | ".join(sorted(set(bails))) or "<no opt bail>"
+        if lower_bails:
+            reason += " | lower: " + ", ".join(sorted(set(lower_bails)))
         print(f"{label(rel)}\t{reason}")
         if blockers:
             print(f"  blockers: {', '.join(blockers)}")
