@@ -4405,6 +4405,9 @@ fn emit_chain_probe(
     value: Variable,
 ) {
     let gated = builder.create_block();
+    let map_gate = builder.create_block();
+    let map_cell = builder.create_block();
+    let map_keyed = builder.create_block();
     let links1 = builder.create_block();
     let link1_live = builder.create_block();
     let after1 = builder.create_block();
@@ -4412,20 +4415,21 @@ fn emit_chain_probe(
     let link2_live = builder.create_block();
     let value1 = builder.create_block();
     let value2 = builder.create_block();
+    // The cell pointer is a parameter: the identity probe and the map-keyed
+    // probe land on the same link/value tail.
+    builder.append_block_param(links1, types::I64);
 
-    // The identity-keyed chain cell the interpreter records
-    // (`Vm::member_chain_index`): the receiver's own id and generation, the
-    // name, and the links the resolution walked. This is the same cell shape
-    // the per-step lane probes (`compiler.rs::emit_chain_cell_probe`), so the
-    // two tiers answer from one table — the runtime fills it once and both
-    // read it.
+    // Two chain cells, one tail. The IDENTITY cell (`Vm::member_chain_index`)
+    // needs a receiver whose generation still matches; the MAP-keyed cell
+    // (`Vm::member_map_cell_index`) shares one resolution across every receiver
+    // of a shape and needs instead a structural proof that the receiver owns no
+    // `name` (below). Both cache the RESOLUTION, not the value: the found
+    // link's `member_value_cells` entry is re-read under its live generation, so
+    // a prototype method's value write (a no-bump warm store refreshes that
+    // cell) is observed.
     builder.switch_to_block(entry);
     let name_imm = builder.ins().iconst(types::I64, name as i64);
     let obj_ptr = crate::cells::object_data_ptr(builder, object);
-    // Decline a dense Array or a TypedArray BEFORE the cell touch: both bump
-    // their generation on every element write, so the identity cell can never
-    // validate for them (their method reads stay on the helper, exactly as in
-    // the per-step lane).
     let dense = builder.ins().load(
         types::I64,
         MemFlagsData::new(),
@@ -4438,9 +4442,21 @@ fn emit_chain_probe(
         obj_ptr,
         Offset32::new(std::mem::offset_of!(crux::JsObject, typed_array) as i32),
     );
+    let named_version = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
+    );
+    let deferred = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, props_deferred) as i32),
+    );
     let exotic = builder.ins().bor(dense, typed);
     let plain = builder.ins().icmp_imm_u(IntCC::Equal, exotic, 0);
-    builder.ins().brif(plain, gated, &[], miss, &[]);
+    builder.ins().brif(plain, gated, &[], map_gate, &[]);
     builder.seal_block(gated);
     builder.switch_to_block(gated);
     let receiver_id = builder.ins().load(
@@ -4495,22 +4511,108 @@ fn emit_chain_probe(
     // mutation (Set.add, Map.set) bumps the generation without touching a
     // named property, which is exactly the shape this probe kept declining.
     let gen_ok = builder.ins().icmp(IntCC::Equal, cell_gen, receiver_gen);
-    let named_version = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        obj_ptr,
-        Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
-    );
     let shadow_free = builder.ins().icmp_imm_u(IntCC::Equal, named_version, 0);
     let gen_ok = builder.ins().bor(gen_ok, shadow_free);
     let cell_ok = builder.ins().band(id_ok, name_ok);
     let cell_ok = builder.ins().band(cell_ok, gen_ok);
-    builder.ins().brif(cell_ok, links1, &[], miss, &[]);
+    builder
+        .ins()
+        .brif(cell_ok, links1, &[cell.into()], map_gate, &[]);
+    // The MAP-keyed cell: one resolution shared by every receiver of a shape,
+    // which is the only cell a per-iteration-fresh receiver or a dense Array can
+    // use (the identity cell needs a matchable generation). Its soundness rests
+    // on the receiver owning no `name`, proven structurally instead of scanned:
+    //
+    // - the cell is only recorded for a name the receiver's map does NOT
+    //   describe (`resolve_chain_cell`'s `map.find(..).is_none()` guard);
+    // - so `name` can only be an own property of this receiver as a vector-only
+    //   key, which neither shape below can hold:
+    //   * `props_deferred` — the vector is empty and every own key is a map
+    //     descriptor (a boilerplate-presized instance, an object literal, a
+    //     filled class instance). It also implies Ordinary: `define_fresh`
+    //     refuses every other kind, so no exotic can reach this arm.
+    //   * a dense Array whose property vector is EMPTY (`PROPS_LEN_OFFSET ==
+    //     0`) — a dense Array keeps `length` in its slots and its elements in
+    //     the buffer, so an empty vector means it has never gained a
+    //     string-keyed own property at all. An array that took one (or that
+    //     spilled, so `array_dense` is clear) declines here.
+    builder.seal_block(map_gate);
+    builder.switch_to_block(map_gate);
+    let deferred_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, deferred, 0);
+    let dense_ok = builder.ins().icmp_imm_u(IntCC::NotEqual, dense, 0);
+    let own_len = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(crux::object::PROPS_LEN_OFFSET as i32),
+    );
+    // A dense Array keeps `length` in its slots: the vector holds at most the
+    // creation's one `length` entry, and `named_version == 0` says no
+    // string-keyed define or delete has happened since (the array-length write
+    // is in place and does not advance it). Together they rule out any other
+    // own name.
+    let vector_short = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, own_len, 1);
+    let no_named = builder.ins().icmp_imm_u(IntCC::Equal, named_version, 0);
+    let array_ok = builder.ins().band(dense_ok, vector_short);
+    let array_ok = builder.ins().band(array_ok, no_named);
+    let own_free = builder.ins().bor(deferred_ok, array_ok);
+    builder.ins().brif(own_free, map_cell, &[], miss, &[]);
+    builder.seal_block(map_cell);
+    builder.switch_to_block(map_cell);
+    let map_handle = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        obj_ptr,
+        Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+    );
+    let has_map = builder.ins().icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+    builder.ins().brif(has_map, map_keyed, &[], miss, &[]);
+    builder.seal_block(map_keyed);
+    builder.switch_to_block(map_keyed);
+    let map_data = builder
+        .ins()
+        .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+    let map_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        map_data,
+        Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+    );
+    let map_cells = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        abi.vm,
+        Offset32::new(std::mem::offset_of!(JitCallContext, member_chain_map_cells) as i32),
+    );
+    let map_cell_ptr =
+        crate::cells::member_chain_map_cell_addr(builder, map_cells, map_id, name_imm);
+    let map_cell_id = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        map_cell_ptr,
+        Offset32::new(std::mem::offset_of!(MemberChainCell, id) as i32),
+    );
+    let map_cell_name = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        map_cell_ptr,
+        Offset32::new(std::mem::offset_of!(MemberChainCell, name) as i32),
+    );
+    let map_cell_name = builder.ins().uextend(types::I64, map_cell_name);
+    let map_id_ok = builder.ins().icmp(IntCC::Equal, map_cell_id, map_id);
+    let map_name_ok = builder.ins().icmp(IntCC::Equal, map_cell_name, name_imm);
+    let map_ok = builder.ins().band(map_id_ok, map_name_ok);
+    builder
+        .ins()
+        .brif(map_ok, links1, &[map_cell_ptr.into()], miss, &[]);
     builder.seal_block(links1);
     // The links: each cached (id, generation) is re-checked walking from the
     // receiver's direct prototype. The link_count decides whether the found
     // property is on the first or second link.
     builder.switch_to_block(links1);
+    let cell = builder.block_params(links1)[0];
     let link_count = builder.ins().load(
         types::I8,
         MemFlagsData::new(),

@@ -1925,10 +1925,24 @@ impl<'a> Lowerer<'a> {
         );
         let exotic = self.builder.ins().bor(dense, typed);
         let plain_receiver = self.builder.ins().icmp_imm_u(IntCC::Equal, exotic, 0);
+        let named_version = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
+        );
+        // A dense Array or a TypedArray skips the IDENTITY probe (its generation
+        // churns on every element write, so a cell can never validate) and goes
+        // straight to the map-keyed arm below, which is what serves its method
+        // reads. The identity probe's hash and cell touch are what the skip
+        // avoids.
         let indexed = self.builder.create_block();
+        let map_gate = self.builder.create_block();
+        let map_cell = self.builder.create_block();
+        let map_keyed = self.builder.create_block();
         self.builder
             .ins()
-            .brif(plain_receiver, indexed, &[], miss, &[]);
+            .brif(plain_receiver, indexed, &[], map_gate, &[]);
         self.builder.switch_to_block(indexed);
         self.builder.seal_block(indexed);
         let receiver_id = self.builder.ins().load(
@@ -1969,18 +1983,6 @@ impl<'a> Lowerer<'a> {
             cell,
             Offset32::new(std::mem::offset_of!(MemberChainCell, generation) as i32),
         );
-        let cell_link_id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberChainCell, links) as i32),
-        );
-        let cell_link_gen = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            cell,
-            Offset32::new(std::mem::offset_of!(MemberChainCell, links) as i32 + 8),
-        );
         let cell_count = self.builder.ins().load(
             types::I8,
             MemFlagsData::new(),
@@ -2001,12 +2003,6 @@ impl<'a> Lowerer<'a> {
             .builder
             .ins()
             .icmp(IntCC::Equal, cell_gen, receiver_gen);
-        let named_version = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            ptr,
-            Offset32::new(std::mem::offset_of!(crux::JsObject, named_version) as i32),
-        );
         let shadow_free = self
             .builder
             .ins()
@@ -2017,9 +2013,141 @@ impl<'a> Lowerer<'a> {
         let ok = self.builder.ins().band(ok, gen_ok);
         let ok = self.builder.ins().band(ok, count_ok);
         let walk = self.builder.create_block();
-        self.builder.ins().brif(ok, walk, &[], miss, &[]);
+        self.builder.append_block_param(walk, types::I64);
+        // The MAP-keyed cell: one resolution shared by every receiver of a
+        // shape. It is the only cell a per-iteration-fresh receiver or a dense
+        // Array can use, and its soundness rests on the receiver owning no
+        // `name`, proven structurally rather than scanned — the cell exists
+        // only for a name the receiver's map does NOT describe
+        // (`resolve_chain_cell`'s `map.find(..).is_none()` guard), so `name`
+        // could only be a vector-only own key, which neither shape below can
+        // hold:
+        //
+        // - `props_deferred`: the vector is empty and every own key is a map
+        //   descriptor (a boilerplate-presized instance, an object literal). It
+        //   also implies Ordinary — `define_fresh` refuses every other kind —
+        //   so no exotic can reach this arm.
+        // - a dense Array whose vector holds at most the creation's `length`
+        //   entry and whose `named_version` is still 0: no string-keyed define
+        //   or delete has happened since (an array-length write is in place and
+        //   does not advance it). A spilled array clears `array_dense` and
+        //   declines.
+        self.builder
+            .ins()
+            .brif(ok, walk, &[cell.into()], map_gate, &[]);
+        self.builder.switch_to_block(map_gate);
+        self.builder.seal_block(map_gate);
+        let deferred = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, props_deferred) as i32),
+        );
+        let deferred_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, deferred, 0);
+        let dense_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, dense, 0);
+        let own_len = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(crux::object::PROPS_LEN_OFFSET as i32),
+        );
+        let vector_short =
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, own_len, 1);
+        let no_named = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, named_version, 0);
+        let array_ok = self.builder.ins().band(dense_ok, vector_short);
+        let array_ok = self.builder.ins().band(array_ok, no_named);
+        let own_free = self.builder.ins().bor(deferred_ok, array_ok);
+        self.builder.ins().brif(own_free, map_cell, &[], miss, &[]);
+        self.builder.switch_to_block(map_cell);
+        self.builder.seal_block(map_cell);
+        let map_handle = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ptr,
+            Offset32::new(std::mem::offset_of!(crux::JsObject, map) as i32),
+        );
+        let has_map = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, map_handle, 0);
+        self.builder.ins().brif(has_map, map_keyed, &[], miss, &[]);
+        self.builder.switch_to_block(map_keyed);
+        self.builder.seal_block(map_keyed);
+        let map_data = self
+            .builder
+            .ins()
+            .iadd_imm_s(map_handle, crux::heap::GCBOX_DATA_OFFSET as i64);
+        let map_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            map_data,
+            Offset32::new(crux::map::MAP_ID_OFFSET as i32),
+        );
+        let map_cells = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            ctx,
+            Offset32::new(std::mem::offset_of!(JitCallContext, member_chain_map_cells) as i32),
+        );
+        let map_cell_ptr = crate::cells::member_chain_map_cell_addr(
+            &mut self.builder,
+            map_cells,
+            map_id,
+            name_imm,
+        );
+        let map_cell_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            map_cell_ptr,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, id) as i32),
+        );
+        let map_cell_name = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            map_cell_ptr,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, name) as i32),
+        );
+        let map_cell_count = self.builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            map_cell_ptr,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, link_count) as i32),
+        );
+        let map_cell_name = self.builder.ins().uextend(types::I64, map_cell_name);
+        let map_id_ok = self.builder.ins().icmp(IntCC::Equal, map_cell_id, map_id);
+        let map_name_ok = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, map_cell_name, name_imm);
+        let map_count_ok = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, map_cell_count, 1);
+        let map_ok = self.builder.ins().band(map_id_ok, map_name_ok);
+        let map_ok = self.builder.ins().band(map_ok, map_count_ok);
+        self.builder
+            .ins()
+            .brif(map_ok, walk, &[map_cell_ptr.into()], miss, &[]);
         self.builder.switch_to_block(walk);
         self.builder.seal_block(walk);
+        let cell = self.builder.block_params(walk)[0];
+        let cell_link_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, links) as i32),
+        );
+        let cell_link_gen = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cell,
+            Offset32::new(std::mem::offset_of!(MemberChainCell, links) as i32 + 8),
+        );
         // The first (and only) link: the receiver's [[Prototype]] must still be
         // the object whose own property the cell recorded.
         let proto = self.builder.ins().load(

@@ -1446,3 +1446,41 @@ is the per-step `compiler.rs::emit_chain_cell_probe`.
   the helper census (`JIT_HELPER_STATS`) or `SLAG_OPT=0` to separate the lanes,
   and remember helper counts scale with the corpus runner's `reps` batching
   (`slag-perf-measurement`).
+
+### 35.1 The map-keyed arm and its two gates
+
+The map-keyed chain cell (`member_chain_map_cells`) serves a receiver the
+identity cell cannot: one resolution shared by every instance of a shape. Both
+probes try it after the identity cell declines, and both land on the same
+link/value tail (the cell pointer is a block param in Cranelift; the tail reads
+`link_count`/`links` from it).
+
+Its soundness is a *structural* proof that the receiver owns no `name`, because a
+compiled hit cannot re-run `has_own_property_atom`:
+
+1. `resolve_chain_cell` records a map cell only for a name the receiver's map does
+   **not** describe (`map.find(&key).is_none()`). Without that guard a
+   described-but-unwritten hole — absent on the recording instance, so it resolved
+   up the chain — gets recorded, and an instance that *did* write the field then
+   reads the prototype's value over its own.
+2. The receiver admits only two shapes, either of which rules out a vector-only
+   own key:
+   - `props_deferred` — vector empty, every own key is a map descriptor. This also
+     **implies Ordinary** (`define_fresh` refuses every other kind), which is why
+     no kind mirror is needed: a Proxy cannot reach this gate.
+   - `array_dense != 0 && PROPS_LEN_OFFSET <= 1 && named_version == 0` — a dense
+     Array holds only the creation's `length` vector entry, and no string-keyed
+     define or delete has happened since. **Arrays measure `named_version == 0`,
+     not 1**: the creation's `length` define does not advance it and an
+     array-length write is in place. Guessing `1` declines every array and looks
+     exactly like an inert arm — check the helper census, not the source.
+
+`PROPS_LEN_OFFSET` is `crux::object::PROPS_LEN_OFFSET`, the offset of the `Props`
+length mirror (see `slag-object-layout`); the per-step lane must also route
+dense/typed receivers *to* the map gate rather than its old straight-to-`miss`
+decline, or arrays never reach it in that tier.
+
+Two measurement notes: the array rows are 1-3 ms, so judge them isolated and
+interleaved (min-of-9) or not at all; and an `opt bail`-free body means the opt
+lane is in play — `SLAG_OPT=0` is how you tell whether the per-step lane has the
+same arm.

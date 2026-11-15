@@ -442,33 +442,38 @@ its own); **C** makes a register-held heap value sound; **D5** is the one call
 lane left; **F1** is the oracle the read/arith work needs. The B0 probe (§1.3)
 retires most of Phases B and E *as scoped*.
 
-**The chain probe now lives in both tiers (landed 2026-11-15, later).** Two
-emitter-side bugs, not a layout cut, were holding the three buckets:
-`opt_lower`'s probe keyed the **identity** table with a map id (so it never hit)
-and admitted only dense Arrays; and nothing warmed the identity cell for a
-receiver the map-keyed arm served, so a fresh instance's reads fell to the helper
-forever. Fixing both, plus the `named_version == 0` generation escape, takes
-`set_churn` 70.5 → 46.4 ms, `proto_method_call` 3.7 → 2.2, `map_churn` 43.4 →
-36.3, `map_get` 4.1 → 3.6, and the corpus `GetMemberName` traffic 83.3 M → 52.2 M
-(`.notes/perf.md` has the table and the three record gates).
+**The map-keyed chain arm landed without a layout cut (2026-11-15, later).** The
+plan had scoped a `kind_is_ordinary` mirror plus a properties-length mirror. Only
+the length was needed: the kind discriminator falls out of `props_deferred`
+(which `define_fresh` sets only for Ordinary objects, so no exotic — a Proxy most
+of all — can reach the deferred gate), and the array gate is
+`array_dense != 0 && PROPS_LEN_OFFSET <= 1 && named_version == 0`. Both probes now
+read `Agent::member_chain_map_cells` after the identity cell declines, gated on
+one of those two shapes plus the new recording precondition
+(`resolve_chain_cell` records a map cell only for a name the map does NOT
+describe). Results: `array_at` -42%, `array_push` -38%, `push_pop` -33%,
+`array_reverse` -28%, `array_indexof` -27%, `array_includes` -22%,
+`construct_churn` -8%; corpus `GetMemberName` traffic 52.2 M → 27.9 M.
 
-**What is left of the map-keyed chain probe is `construct_churn` alone.** Its
-receiver is fresh every iteration and owns `x`/`y`, so no identity cell can serve
-it and the map-keyed compiled probe needs the `kind_is_ordinary` discriminator
-(a Proxy shares the canonical empty map with a plain object, and a Proxy with no
-named property has `named_version == 0`, so neither the map id nor the version
-gate excludes it). The rest of the scoped cut stands, and it now buys one row
-(3.5 M declines, ~1 ns each) instead of three — the same `JsObject` layout
-owes the `slag-object-layout` protocol (size class first: the payload is 424 B
-inside the 448-byte arena class, so 8 B of headroom before a class change).
+The length mirror is `Props` (`RefCell<SmallProps>` + a `Cell<u32>` outside the
+cell) whose `borrow_mut` guard refreshes it on drop, so the maintenance is
+structural. The payload is 432 B inside the 448-byte arena class — the last byte
+of headroom (`.notes/perf.md` has the table and the gates).
 
-Two negative results are banked. Extending the *identity* probe to function
-receivers (the `f.apply` shape, 7.0 M calls) measured `calls/apply_call` **6.5%
-slower** with the probe on (`SLAG_CHAIN_PROBE`, one binary, min-of-9) and was
-reverted: that row's reads go through `Step::CallApply` rather than a named read,
-so the extension only added decline work. Recording the identity cell
-unconditionally from the map arm measured `--jitless` `set_churn` +10% and
-`push_pop` +9% — the write has to be gated on a compiled reader existing.
+**What is left** is `calls/apply_call` 7.0 M (the `Step::CallApply` shape: the
+banked negative was extending the *identity* probe to function receivers; a
+fused intrinsic-style callee check in the step's own lowering is the untried
+shape), `opcost/prim_prop` 4.4 M (a primitive string's `length`, whose native
+length is not a fixed-offset field), the string-concat pairs ~3.5 M
+(`BinarySlow` more than the read), and `construct_churn`'s 875 k (each new
+instance's cold first read — inherent, since a receiver read once can never use
+a per-receiver cell).
+
+One negative result stays banked: extending the *identity* probe to function
+receivers (the `f.apply` shape) measured `calls/apply_call` **6.5% slower**
+(`SLAG_CHAIN_PROBE`, one binary, min-of-9) and was reverted — that row's reads go
+through `Step::CallApply`, not a named read, so the extension only added decline
+work.
 
 **A0, function-object creation (~340 ns each).** The measured dominant term in
 the corpus's two largest rows (§1.4): three closures per body cost ~1 µs of

@@ -7106,7 +7106,21 @@ impl Vm {
                         // not own `name` (has_own_property_atom), so only
                         // the recording instance's own-absence (the entry
                         // guard above) plus the shared map are baked in.
-                        if let Some(map) = object.map.get() {
+                        //
+                        // Only for a name the map does NOT describe. A
+                        // compiled hit cannot re-check own-name absence (that
+                        // is a vector scan), so it rules it out structurally:
+                        // "the map does not describe `name`" plus "the
+                        // receiver's own keys are all map descriptors" (both
+                        // gates in the emitters) is the same proof. Without
+                        // this guard a described-but-UNWRITTEN hole — absent
+                        // on the recording instance, so it resolved up the
+                        // chain — would be recorded here, and an instance that
+                        // did write that field would read the prototype's
+                        // value over its own.
+                        if let Some(map) = object.map.get()
+                            && map.find(&key).is_none()
+                        {
                             let map_index = Self::member_map_cell_index(map.id(), name);
                             agent.member_chain_map_cells[map_index] = MemberChainCell {
                                 id: map.id(),

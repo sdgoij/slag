@@ -104,6 +104,37 @@ Corpus `GetMemberName` traffic 83.3 M to 52.2 M. `construct_churn` is the one ro
 
 A measurement trap this arc paid for: **helper counts are not comparable across binaries when the row got faster.** `run_corpus` sizes `reps` from a timing floor, so a faster row runs *more* `bench()` calls and can show a *higher* helper total (`array_at` +9%, `array_includes` +17% while its per-read traffic fell). Read the counts per iteration (divide by the row's `bench` calls) or only for rows whose speed did not move.
 
+### The map-keyed arm, without the layout cut (2026-11-15, later still)
+
+The plan had scoped a `JsObject` layout change for the remaining buckets (a kind mirror plus a properties-length mirror). The kind mirror turned out to be unnecessary — the soundness proof falls out of two behaviours already in the tree — and only the length needed a real field.
+
+**The arm.** After the identity cell declines, both probes now read the MAP-keyed chain cell (`Agent::member_chain_map_cells`, `Vm::member_map_cell_index`) and land on the same link/value tail. Its soundness rests on the receiver owning no `name`, proven structurally instead of scanned:
+
+- the cell is only recorded for a name the receiver's map does NOT describe (new guard in `resolve_chain_cell`: `map.find(&key).is_none()`). Without it a described-but-unwritten hole — absent on the recording instance, so it resolved up the chain — would be recorded, and an instance that did write that field would read the prototype's value over its own;
+- so `name` could only be a vector-only own key, which neither admitted shape can hold:
+  * `props_deferred` — the vector is empty and every own key is a map descriptor (a boilerplate-presized instance, an object literal, a filled class instance). It also implies **Ordinary**, because `define_fresh` refuses every other kind, which is what makes the kind mirror unnecessary: no exotic (a Proxy most of all) can reach this arm;
+  * a dense Array whose vector holds at most the creation's `length` entry and whose `named_version` is still 0 — no string-keyed define or delete has happened since, and an array-length write is in place and advances nothing. A spilled array clears `array_dense` and declines.
+
+**The length mirror.** `properties.len()` was the one unaddressable input (`RefCell`'s payload offset is not guaranteed). It is now a `Props` wrapper — `RefCell<SmallProps>` plus a `Cell<u32>` mirror **outside** the cell — whose `borrow_mut` returns a guard that refreshes the mirror on drop. That makes the discipline structural rather than a rule to remember: a mutation reached through `borrow_mut` cannot forget it. The payload goes 424 → 432 B, which is exactly the old padding (with the 16-byte `GcHeader`, 448 — the same arena class), so the mirror is free and the guard test now pins 432 as the last byte of headroom.
+
+**Results** (isolated, interleaved, min-of-9, both sides built the same way):
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `opcost/array_at` | 1.9 | 1.1 | -42% |
+| `opcost/array_push` | 2.2 | 1.4 | -38% |
+| `arrays/push_pop` | 2.9 | 2.0 | -33% |
+| `opcost/array_reverse` | 3.0 | 2.1 | -28% |
+| `opcost/array_indexof` | 3.0 | 2.2 | -27% |
+| `opcost/array_includes` | 3.3 | 2.6 | -22% |
+| `calls/construct_churn` | 63.1 | 58.1 | -8% |
+| `arrays/typed_array` | 19.4 | 18.3 | -6% |
+| `objects/proto_read`, `objects/own_read`, `control/nested_loops` | | | +1.5 / +0.6 / +1.6 (layout noise) |
+
+Corpus `GetMemberName` traffic: 83.3 M at the start of the session, 52.2 M after the identity cut, **27.9 M** now. What is left is `calls/apply_call` 7.0 M (the `Step::CallApply` shape, the banked negative), `opcost/prim_prop` 4.4 M (a primitive string's `.length`, whose native length is not a fixed-offset field), the string-concat pairs ~3.5 M, and `construct_churn` 875 k — the cold first read of each new instance, which is inherent.
+
+**A gate trap.** The first version of the array gate used `named_version == 1` ("only `length` was ever defined"). Arrays measure `named_version == 0`: the creation's `length` define does not advance it, and an array-length write is in place. The `1` declined every array, so the arm looked inert until the census said so.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

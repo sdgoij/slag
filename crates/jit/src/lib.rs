@@ -6638,6 +6638,43 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_chain_probe_declines_once_an_array_owns_the_name() {
+        // The map-keyed arm serves a dense Array's method reads (its own keys can
+        // only be `length`), and `a.at = fn` is the shape that must stop it: the
+        // define is a vector-only own name, so the array gate (`named_version ==
+        // 0`) declines and the read returns the own function. Expected:
+        // 50 * 1 + 50 * 7 = 400.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(a, n) { var s = 0; for (var i = 0; i < n; i++) { if (i === 50) { a.at = function () { return 7; }; } s += a.at(0); } return s; }\n\
+                     f([1, 2, 3], 100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(400.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
+    fn installed_jit_array_method_reads_match_the_interpreter() {
+        // The array gate serves a dense Array's prototype-method reads from the
+        // map-keyed chain cell. A held array read once per iteration, and a
+        // fresh row appended each iteration, both have to agree with the
+        // interpreter — including after the array spills its vector.
+        let (value, compiled) = with_jit_agent(|agent| {
+            agent
+                .run_script(
+                    "function f(n) { var a = []; var s = 0; for (var i = 0; i < n; i++) { a.push(i & 7); s += a.at(0) + a.indexOf(i & 7); } return s + a.length; }\n\
+                     f(100);",
+                )
+                .expect("runs")
+        });
+        assert_eq!(value.as_number(), Some(442.0));
+        assert!(compiled >= 1, "{compiled} bodies");
+    }
+
+    #[test]
     fn installed_jit_member_probe_misses_on_mid_run_mutation() {
         // The compiled `GetMemberName` probe validates the value cell
         // against the receiver's LIVE generation: the `o.f = 2` store at

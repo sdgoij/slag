@@ -90,6 +90,25 @@ pub(crate) fn member_chain_cell_addr(
     builder.ins().iadd(cells, index_bytes)
 }
 
+/// The map-keyed prototype-chain cell for `(map id, name)`, mirroring
+/// `Vm::member_map_cell_index`. Note the STRIDE: the table is
+/// `Agent::member_chain_map_cells`, an array of `MemberChainCell` — not the
+/// `MemberMapCell` table `member_map_cell_addr` addresses, whose cells are a
+/// different size. Both slot arithmetic and stride must match the runtime.
+pub(crate) fn member_chain_map_cell_addr(
+    builder: &mut FunctionBuilder,
+    cells: Value,
+    map_id: Value,
+    name_imm: Value,
+) -> Value {
+    let slot = builder.ins().bxor(map_id, name_imm);
+    let slot = builder.ins().band_imm_u(slot, (MEMBER_CELLS - 1) as i64);
+    let index_bytes = builder
+        .ins()
+        .imul_imm_s(slot, std::mem::size_of::<MemberChainCell>() as i64);
+    builder.ins().iadd(cells, index_bytes)
+}
+
 /// Whether `cell` holds `(live_id, name)` at the receiver's `live_gen` — the
 /// cell's id, name and generation must all match, so a hit means the own data
 /// property is unchanged since the cell was recorded.

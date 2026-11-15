@@ -88,3 +88,34 @@ rows, even when an isolated allocation microbench says the win is large:
 The payload init's stores overlap the surrounding latency. Judge this area on
 the creation loop (or corpus rows), never on the helper in isolation, and
 prefer changes that remove *stores* over changes that remove delay.
+
+## 6. Making a length addressable: the `Props` mirror
+
+The compiled member probes need `properties.len() == 0` as a machine test ("this
+receiver's own keys cannot shadow the chain"). The right test is
+`SmallProps::len`, but it lives inside `RefCell<SmallProps>`, and `RefCell`'s
+payload offset is not guaranteed — so there is no `offset_of!` for it, and the
+plan of record treated that as a reason to shrink the problem.
+
+The workable end state is a wrapper: `Props { inner: RefCell<SmallProps>, len:
+Cell<u32> }` with `borrow()`/`borrow_mut()` where the mutation guard derefs to
+`SmallProps` and refreshes `len` **on drop**, and
+`pub const PROPS_LEN_OFFSET = offset_of!(JsObject, properties) + offset_of!(Props,
+len)`. Two properties of that shape are what make it safe to expose:
+
+- **The maintenance is structural, not a list of sites.** There are ~18
+  `properties.borrow_mut()` call sites; a bare `Cell<u8>` field on `JsObject`
+  would need all of them (and every future one) to remember, and a missed one is
+  a *silent* wrong value, not a compile error. The Drop guard cannot be missed.
+- **`u32`, saturating.** `u32::try_from(len).unwrap_or(u32::MAX)` only turns "very
+  long" into "non-empty", which is the conservative answer for a `== 0` test.
+
+Cost: the payload goes 424 → 432 B. With the 16-byte `GcHeader` that is 448 — the
+same arena class — so the mirror is free, and 432 is the **last** byte of
+headroom (see the guard test, which now pins 432). Measured on unaffected rows:
++0.6 / +1.5 / +1.6% (cross-binary layout noise), with the array rows it exists for
+moving -22 to -42%.
+
+A caveat worth knowing before trusting a `named_version`-based gate instead:
+array `length` defines do **not** advance `named_version` and array-length writes
+are in place, so a fresh array reads `named_version == 0` — not 1.

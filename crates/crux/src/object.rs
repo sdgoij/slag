@@ -238,6 +238,112 @@ const INLINE_PROPS: usize = 2;
 /// all follow this constant.
 pub const INLINE_FIELDS: usize = 8;
 
+/// The own-property vector plus a lock-free mirror of its length.
+///
+/// The mirror exists for the compiled member probes, which need "this
+/// receiver's own string-keyed properties cannot shadow the chain" as a
+/// machine-readable test (`len() == 0`). The length itself lives inside a
+/// `RefCell` payload, whose offset is not guaranteed, so there is no
+/// `offset_of!` for it — hence a mirror beside the cell.
+///
+/// It is refreshed by the guard [`Props::borrow_mut`] returns, so no mutation
+/// site can forget it: the discipline that keeps a mirror honest is structural
+/// rather than a rule to remember. A mutation through `borrow_mut` that leaves
+/// the length unchanged still pays one store, which is noise beside the define
+/// it is part of.
+pub struct Props {
+    inner: RefCell<SmallProps>,
+    len: Cell<u32>,
+}
+
+/// The mutation guard for [`Props`]: derefs to the vector and refreshes the
+/// length mirror when dropped.
+pub struct PropsMut<'a> {
+    inner: RefMut<'a, SmallProps>,
+    len: &'a Cell<u32>,
+}
+
+impl Clone for Props {
+    fn clone(&self) -> Self {
+        let inner = self.inner.borrow().clone();
+        Self {
+            inner: RefCell::new(inner),
+            len: self.len.clone(),
+        }
+    }
+}
+
+impl Props {
+    pub fn new() -> Self {
+        Self {
+            inner: RefCell::new(SmallProps::new()),
+            len: Cell::new(0),
+        }
+    }
+
+    pub fn borrow(&self) -> Ref<'_, SmallProps> {
+        self.inner.borrow()
+    }
+
+    pub fn try_borrow(&self) -> Result<Ref<'_, SmallProps>, std::cell::BorrowError> {
+        self.inner.try_borrow()
+    }
+
+    pub fn borrow_mut(&self) -> PropsMut<'_> {
+        PropsMut {
+            inner: self.inner.borrow_mut(),
+            len: &self.len,
+        }
+    }
+
+    /// The mirrored length: exact for any object small enough to be a `u32`
+    /// property vector, saturating above (a saturating mirror can only ever
+    /// report "non-empty", which is the conservative answer).
+    pub fn len(&self) -> u32 {
+        self.len.get()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for Props {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for PropsMut<'_> {
+    type Target = SmallProps;
+
+    fn deref(&self) -> &SmallProps {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PropsMut<'_> {
+    fn deref_mut(&mut self) -> &mut SmallProps {
+        &mut self.inner
+    }
+}
+
+impl Drop for PropsMut<'_> {
+    fn drop(&mut self) {
+        self.len
+            .set(u32::try_from(self.inner.len()).unwrap_or(u32::MAX));
+    }
+}
+
+impl Trace for Props {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        // `RefCell`'s trace skips a cell that is mutably borrowed
+        // mid-collection (per-allocation `--gc-stress`), which the guard keeps
+        // working because the borrow is the same `RefMut`.
+        self.inner.trace(visit);
+    }
+}
+
 impl Default for SmallProps {
     fn default() -> Self {
         Self::new()
@@ -1141,7 +1247,7 @@ pub struct JsObject {
     pub store_chain_clean: Cell<u64>,
     /// Own properties in insertion order (the [[OwnPropertyKeys]] string
     /// order for ordinary objects).
-    pub properties: RefCell<SmallProps>,
+    pub properties: Props,
     /// The Option-3 vector-free state: when set, `properties` is EMPTY and
     /// NOT authoritative — every own property is a map descriptor (with the
     /// descriptor's own attrs, ordinal < `INLINE_FIELDS`) whose value is
@@ -1204,6 +1310,13 @@ pub struct JsObject {
     /// of this file).
     realm: Cell<u32>,
 }
+
+/// The byte offset of the mirrored own-property length inside the object, for
+/// the compiled chain probe's "the receiver can own no `name`" gate
+/// (`[`Props::len`] == 0`). `pub` because the `props` field's payload is a
+/// `RefCell`.
+pub const PROPS_LEN_OFFSET: usize =
+    std::mem::offset_of!(JsObject, properties) + std::mem::offset_of!(Props, len);
 
 impl JsObject {
     /// How many internal fields this object carries
@@ -1415,7 +1528,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1474,10 +1587,7 @@ impl JsObject {
                 std::ptr::addr_of_mut!((*this).store_chain_clean),
                 Cell::new(0),
             );
-            std::ptr::write(
-                std::ptr::addr_of_mut!((*this).properties),
-                RefCell::new(SmallProps::new()),
-            );
+            std::ptr::write(std::ptr::addr_of_mut!((*this).properties), Props::new());
             std::ptr::write(
                 std::ptr::addr_of_mut!((*this).props_deferred),
                 Cell::new(false),
@@ -1842,7 +1952,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1871,7 +1981,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -1950,10 +2060,7 @@ impl JsObject {
                     std::ptr::addr_of_mut!((*this).store_chain_clean),
                     Cell::new(0),
                 );
-                std::ptr::write(
-                    std::ptr::addr_of_mut!((*this).properties),
-                    RefCell::new(SmallProps::new()),
-                );
+                std::ptr::write(std::ptr::addr_of_mut!((*this).properties), Props::new());
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*this).props_deferred),
                     Cell::new(false),
@@ -2117,7 +2224,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -2157,7 +2264,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -2192,7 +2299,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -2308,7 +2415,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -2370,7 +2477,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -2476,7 +2583,7 @@ impl JsObject {
             named_version: Cell::new(0),
             store_chain_clean: Cell::new(0),
             is_prototype: Cell::new(false),
-            properties: RefCell::new(SmallProps::new()),
+            properties: Props::new(),
             props_deferred: Cell::new(false),
             property_index: RefCell::new(None),
             private_elements: RefCell::new(Vec::new()),
@@ -6210,6 +6317,50 @@ mod tests {
     }
 
     #[test]
+    fn the_properties_length_mirror_tracks_the_vector() {
+        // The compiled chain probe's "this receiver can own no `name`" gate reads
+        // the mirrored length from machine code, so it has to follow every
+        // structural mutation — including the spill (`INLINE_PROPS` exceeded) and
+        // a materialize that rebuilds the vector.
+        let object = JsObject::ordinary_object_create(None);
+        assert_eq!(object.properties.len(), 0);
+        for i in 0..5u32 {
+            let key = JsString::from_utf8(&format!("k{i}"));
+            assert!(
+                object
+                    .define_property(
+                        &key,
+                        &PropertyDescriptor {
+                            value: Some(Value::Number(i as f64)),
+                            writable: Some(true),
+                            get: None,
+                            set: None,
+                            enumerable: Some(true),
+                            configurable: Some(true),
+                        },
+                    )
+                    .expect("defines")
+            );
+            assert_eq!(
+                object.properties.len() as usize,
+                object.properties.borrow().len(),
+                "mirror after {i} defines"
+            );
+        }
+        let gone = JsString::from_utf8("k1");
+        assert!(
+            object
+                .delete_key(&PropertyKey::from_js_string(&gone))
+                .expect("deletes")
+        );
+        assert_eq!(
+            object.properties.len() as usize,
+            object.properties.borrow().len(),
+            "mirror after a delete"
+        );
+    }
+
+    #[test]
     fn a_named_own_property_always_advances_the_named_version() {
         // The compiled member probes read `named_version == 0` as a
         // generation-free proof that the receiver owns no string-keyed property
@@ -6258,12 +6409,12 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn the_internal_field_slot_costs_no_arena_bytes() {
-        // The realm field is the payload's last addition; on the audit
-        // baseline's layout the payload is 424 B. With the 16-byte `GcHeader`
-        // that is 440, which rounds to the arena's 448-byte class. A field
-        // that pushed the payload past 432 would move every object up a class,
-        // which is what this guards.
-        assert_eq!(std::mem::size_of::<JsObject>(), 424);
+        // The `Props` length mirror is the payload's last addition: 432 B
+        // exactly, which is the old layout's padding. With the 16-byte
+        // `GcHeader` that is 448 — the arena's 448-byte class — so the mirror
+        // is free, and it is the LAST byte of headroom: any further field moves
+        // every object up a class.
+        assert_eq!(std::mem::size_of::<JsObject>(), 432);
     }
 
     #[test]
