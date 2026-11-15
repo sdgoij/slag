@@ -9344,6 +9344,64 @@ run(); run(); run(); run(); run(); run(); run(); run(); run();";
     }
 
     #[test]
+    fn installed_jit_lifted_named_read_inlines() {
+        // A named member read inside a fused loop body (`s += o.n`) is the
+        // register lane's `LeafOp::GetMemberName`. It used to refuse as an
+        // opaque `RunRegBody`, which kept every such loop on the per-step tier
+        // (six corpus rows). The lifted body must lower through the opt path,
+        // match the interpreter, and serve the read from the member-value cell
+        // rather than the `get_member_name` helper.
+        static READ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn counting_read(ctx: *mut c_void, object: u64, name: u64) -> u64 {
+            READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (runtime::jit::JIT_SLOW_PATHS.get_member_name)(ctx, object, name)
+        }
+        let mut helpers = runtime_helpers();
+        helpers.get_member_name = Some(counting_read);
+
+        let source = "function f(a, n) {\n\
+                        var s = 0;\n\
+                        for (var i = 0; i < n; i++) { s += a[i & 255].n; }\n\
+                        return s;\n\
+                      }\n\
+                      var a = [];\n\
+                      for (var j = 0; j < 256; j++) { a.push({ n: 1 }); }\n\
+                      f(a, 100000);";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled, opt_bodies) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(value, interp, "the named read must match the interpreter");
+        assert!(compiled >= 1, "{compiled} bodies must compile");
+        assert!(
+            opt_bodies >= 1,
+            "the fused for body must lower through the opt path (got {opt_bodies})"
+        );
+
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new_with_opt(helpers).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let counted = agent.run_script(source).expect("jit runs");
+        agent.jit_hook = None;
+        assert_eq!(counted, interp, "the counted run must agree");
+        let reads = READ_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            reads < 100,
+            "the lifted loop must inline the named read ({reads} get_member_name calls)"
+        );
+    }
+
+    #[test]
     fn installed_jit_lifted_literal_creates_match_the_interpreter() {
         // I6-0a: a straight-line body creating an array and an object literal
         // (the fused `ArrayFast`/`ObjectFast` creates) lifts to

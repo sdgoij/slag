@@ -2410,6 +2410,11 @@ fn emit_leaf_op(
                 Imm::Int(index as i32),
             )
         }
+        // acc = acc.name — the same inline member-value cell probe the
+        // `Step::GetMemberName` and `LeafOp::GetMemberNameLocal` arms use. This
+        // is the shape a `x.length`/`o.field` read takes inside a fused loop
+        // body, so refusing it kept every such body on the per-step tier.
+        LeafOp::GetMemberName { name } => emit_named_read(builder, block, acc, *name),
         LeafOp::BinAccPop { op } => {
             let left = spill.pop().ok_or(Unsupported::Stack)?;
             bin(builder, binary_op(*op)?, left, acc)
@@ -2417,7 +2422,8 @@ fn emit_leaf_op(
         // The remaining leaf ops (the member/frame-vector stores, the `UpdateAcc`
         // BigInt case, the Route-B int form, and the context/per-iteration reads)
         // need their own slice; refuse so the body keeps the per-step path.
-        _ => return Err(Unsupported::Step("RunRegBody")),
+        // Name the refusing op: a family this coarse cannot be sized.
+        _ => return Err(Unsupported::Step(leaf_op_name(op))),
     })
 }
 
@@ -2820,6 +2826,57 @@ fn step_name(step: &Step) -> &'static str {
 /// e.g. `ArrayFast` from `ArrayFast { count: 3 }`.
 fn variant_name(debug: &str) -> &str {
     debug.split(['(', '{', ' ']).next().unwrap_or(debug)
+}
+
+/// The name of a refused leaf op, for [`Unsupported::Step`]. The register-body
+/// family used to refuse as one opaque `"RunRegBody"`, which says nothing
+/// about which op is missing and is exactly the bucket `JIT_DUMP_STEPS` cannot
+/// size.
+fn leaf_op_name(op: &LeafOp) -> &'static str {
+    match op {
+        LeafOp::LoadReg { .. } => "leaf:LoadReg",
+        LeafOp::LoadContext { .. } => "leaf:LoadContext",
+        LeafOp::LoadPerIter { .. } => "leaf:LoadPerIter",
+        LeafOp::LoadCounter => "leaf:LoadCounter",
+        LeafOp::LoadConst(..) => "leaf:LoadConst",
+        LeafOp::BinReg { .. } => "leaf:BinReg",
+        LeafOp::BuilderAppend { .. } => "leaf:BuilderAppend",
+        LeafOp::BinContext { .. } => "leaf:BinContext",
+        LeafOp::BinPerIter { .. } => "leaf:BinPerIter",
+        LeafOp::BinImm { .. } => "leaf:BinImm",
+        LeafOp::BinConst { .. } => "leaf:BinConst",
+        LeafOp::BinImmLocal { .. } => "leaf:BinImmLocal",
+        LeafOp::BinCtxReg { .. } => "leaf:BinCtxReg",
+        LeafOp::StoreReg { .. } => "leaf:StoreReg",
+        LeafOp::StoreMemberName { .. } => "leaf:StoreMemberName",
+        LeafOp::StoreMemberNameLocal { .. } => "leaf:StoreMemberNameLocal",
+        LeafOp::CompoundMemberNameLocal { .. } => "leaf:CompoundMemberNameLocal",
+        LeafOp::StoreMemberComputed { .. } => "leaf:StoreMemberComputed",
+        LeafOp::StoreMemberComputedSlot { .. } => "leaf:StoreMemberComputedSlot",
+        LeafOp::StoreMemberComputedLocal { .. } => "leaf:StoreMemberComputedLocal",
+        LeafOp::CompoundMemberComputedLocal { .. } => "leaf:CompoundMemberComputedLocal",
+        LeafOp::UpdateMemberComputedLocal { .. } => "leaf:UpdateMemberComputedLocal",
+        LeafOp::UpdateReg { .. } => "leaf:UpdateReg",
+        LeafOp::GetMemberName { .. } => "leaf:GetMemberName",
+        LeafOp::GetMemberComputed { .. } => "leaf:GetMemberComputed",
+        LeafOp::GetMemberNameLocal { .. } => "leaf:GetMemberNameLocal",
+        LeafOp::GetMemberComputedLocal { .. } => "leaf:GetMemberComputedLocal",
+        LeafOp::PushAcc => "leaf:PushAcc",
+        LeafOp::PushReg { .. } => "leaf:PushReg",
+        LeafOp::CallFastSlot { .. } => "leaf:CallFastSlot",
+        LeafOp::CallFast { .. } => "leaf:CallFast",
+        LeafOp::CallFastIdent { .. } => "leaf:CallFastIdent",
+        LeafOp::BinAccPop { .. } => "leaf:BinAccPop",
+        LeafOp::UpdateAcc { .. } => "leaf:UpdateAcc",
+        LeafOp::BinLeftReg { .. } => "leaf:BinLeftReg",
+        LeafOp::BinStoreReg { .. } => "leaf:BinStoreReg",
+        LeafOp::BinStoreNum { .. } => "leaf:BinStoreNum",
+        LeafOp::BinStoreInt { .. } => "leaf:BinStoreInt",
+        LeafOp::BinRemConst { .. } => "leaf:BinRemConst",
+        LeafOp::ReturnAcc => "leaf:ReturnAcc",
+        LeafOp::Jump(_) => "leaf:Jump",
+        LeafOp::JumpIfFalsy(_) => "leaf:JumpIfFalsy",
+    }
 }
 
 /// The distinct step *variants* that actually block the lift in `body`, sorted —

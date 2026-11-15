@@ -93,6 +93,7 @@ The morning revision listed these as future work. They are in the tree:
 | closure phase instrument | `function::phases`, `SLAG_CLOSURE_PHASES` | per-phase TSC cycles per closure, overhead-calibrated; §4 A0 |
 | `Int`-op operand check | `opt_lower.rs` (`opt:int-operand`) | a wrapping `i32` op over `Value`-word operands refuses instead of `iadd`ing tag bits |
 | counter entry re-typing | `pass/loop_counter.rs` | the pass proves a counter whose increment the register lane already emitted as `IntAdd`/`IntSub`, and re-types its entry constant, so the header parameter joins `Int` instead of `Number` and the whole body stops bailing at `opt:int-operand` |
+| register-body named read | `opt/lift/mod.rs` (`LeafOp::GetMemberName`) | an `x.name` read whose object is already in the accumulator (a chained read like `a[i].n`) now lifts to the same member-value cell probe the `Step` form uses; each refused leaf op is named through `leaf_op_name` instead of the opaque `RunRegBody` |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
 
@@ -110,6 +111,20 @@ Isolated, interleaved, min-of-15 in one session: `warm_store` 41.3 to 24.1 ms,
 `compound_assign` 49.9 to 30.9, `opcost/array_includes` -25%, `opcost/set_has`
 -9%, `calls/method_call` -4%, `builtins/async_churn` +2.6% (inside the row's
 noise; its hot loop is promise machinery, not the counter).
+
+The named-read lift closes the other half of the same story. The register body's
+`LeafOp::GetMemberName` (a read whose object is already in the accumulator, so
+`a[i].n` and not the fused `a.n` form) was one of the leaf ops the lift answered
+with the same opaque `RunRegBody` refusal, and it blocked six of the seven rows
+that still refused the tier. It now emits the identical member-value cell probe
+the `Step::GetMemberName` arm uses. Every remaining refusal is named through
+`leaf_op_name`, because `RunRegBody` cannot be sized: after this cut the only
+register-body blocker left in the corpus is `leaf:BinRemConst`
+(`calls/recursive_fib`). Isolated, interleaved, min-of-15: `opcost/prim_prop`
+1.73 to 1.16 ms, `objects/many_objects_read` 23.0 to 18.7, `opcost/array_slice`
+-4 to -13%. `strings/split_join`, `opcost/array_to_sorted` and
+`builtins/json_roundtrip` also lift now but are dominated by allocation and JSON
+work, so their deltas sit inside a 5-20% run-to-run band and are not claimed.
 
 ### 1.3 The B0 census: what the rest of Phase B is worth
 
