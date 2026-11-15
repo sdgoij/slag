@@ -37,19 +37,13 @@ confidence-threshold = 0.9
 private = { ignore = true }
 allow = [
     "MIT",
-    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "Zlib",
-    "0BSD",
-    "CC0-1.0",
     "Unicode-3.0",
-    "MPL-2.0",
-    "NCSA",
-    "OpenSSL",
     "BSL-1.0",
     "Unlicense",
 ]
@@ -66,6 +60,22 @@ multiple-versions = "warn"
 # in the graph takes a wildcard version from a registry; `sources` is what pins
 # where a dependency may come from.
 wildcards = "allow"
+# Two duplicates are pinned by upstream requirements and skipped by exact version,
+# so a new version of either crate still reports:
+#
+# - `shlex`: `cc` takes `^2` and `bindgen` takes `^1`. The only bindgen release
+#   on `^2` is 0.73, and the `raylib` feature reaches bindgen through
+#   `raylib-sys`, whose newest release (6.0.0) requires `bindgen ^0.72.1` as an
+#   unconditional build-dependency. Build dependencies cannot be optional, so
+#   raylib-sys's own `nobindgen` feature does not drop it either.
+# - `hashbrown`: `gimli 0.33`, Cranelift's unwind dependency, requires `^0.16`,
+#   while Cranelift itself and `indexmap` take `^0.17`.
+#
+# Both lines can go the moment those crates widen their requirements.
+skip = [
+    { name = "shlex", version = "=1.3.0" },
+    { name = "hashbrown", version = "=0.16.1" },
+]
 
 [sources]
 unknown-registry = "deny"
