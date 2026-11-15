@@ -37,12 +37,14 @@ roughly a quarter of it. Quote one or the other, never a mix.
 
 ## 2026-11-15: two register-lane refusals closed
 
-Two cuts, each one a refusal that had been silently costing whole rows:
+Three cuts. The first two are refusals that had been silently costing whole rows; the third is a probe removed from the closure path.
 
 - **The loop counter's entry constant** (`pass/loop_counter.rs`). The register-body lane emits `IntAdd`/`IntSub` for a counter its int plan proved, but the entry constant (often shared, as in `s = 0`) was still a `Number`, so `normalize_param_types` typed the loop parameter `Number` and `opt_lower` refused the body at `opt:int-operand`. Six rows ran the per-step tier on this alone.
 - **The register body's accumulator named read** (`opt/lift/mod.rs`, `LeafOp::GetMemberName`), the other half of the `RunRegBody` blanket refusal, which also blocked six rows. Refused leaf ops are now named individually (`leaf_op_name`); the only register-body blocker left in the corpus is one row's `leaf:BinRemConst`.
 
 Same-session, interleaved, min-of-15 isolated: `objects/warm_store` 41.3 to 24.1 ms and `objects/compound_assign` 49.9 to 30.9 (both bodies now lower through the tier), `opcost/prim_prop` 1.73 to 1.16, `objects/many_objects_read` 23.0 to 18.7. Corpus total, whole-corpus A/B over five alternating rounds against the pre-cut tree: **2623.5 to 2534.4 ms (-3.4%)**, 81/81 identical results.
+
+- **The per-iteration chain** (`function.rs`). A closure creation looked its own fresh record up again after registering it, only to install the creation site's per-iteration chain. Carrying the chain into `register_function` removes that probe: 3347.7 to 2501.0 TSC cycles per closure on a 3-captured-closures loop, and -5.7% on that loop (min-of-15, one aligned binary pair). It must be installed after `shared_compiled_body`, because the compile reads it and the compiled body is shared per site.
 
 Two things this arc re-confirmed about measuring here. A whole-corpus single pass per side is not an instrument: rows whose generated IR was *identical* moved by 30-40% between the two binaries, so the per-row isolated, many-round protocol is what decides a row. And `JIT_DUMP_IR` diffs are the way to establish which rows a tier change can even touch: `python` diffing the dump over all 81 rows (heap addresses stripped) named exactly six rows for each cut, which is what made the layout swings on the other 75 identifiable as noise.
 

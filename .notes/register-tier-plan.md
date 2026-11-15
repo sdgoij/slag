@@ -96,6 +96,7 @@ The morning revision listed these as future work. They are in the tree:
 | register-body named read | `opt/lift/mod.rs` (`LeafOp::GetMemberName`) | an `x.name` read whose object is already in the accumulator (a chained read like `a[i].n`) now lifts to the same member-value cell probe the `Step` form uses; each refused leaf op is named through `leaf_op_name` instead of the opaque `RunRegBody` |
 | CSE + LICM | `pass/cse.rs`, `pass/licm.rs` | in the pipeline |
 | coarse typer (F3, partial) | `pass/guard.rs`, `Op::GuardType` | `Number` only, retire-don't-deopt |
+| per-iteration chain on the record | `function.rs` (`register_function`) | the chain install moved inside registration, so a closure creation no longer pays a second `ecma_functions` probe (a random access into a table holding one record per live function) after the insert. It must stay AFTER `shared_compiled_body`: `compile_body` reads the chain into the compiler and the compiled body is shared per site, so setting it in the record literal bakes the first closure's chain into every later one (`installed_jit_per_iteration_head_inside_another_loop` returns the wrong bindings) |
 
 The counter re-typing closes a refusal that had been hiding behind a green
 sweep: `loop_counter` only recognised an `Op::Add`/`Op::Sub` increment, while
@@ -125,6 +126,21 @@ register-body blocker left in the corpus is `leaf:BinRemConst`
 -4 to -13%. `strings/split_join`, `opcost/array_to_sorted` and
 `builtins/json_roundtrip` also lift now but are dominated by allocation and JSON
 work, so their deltas sit inside a 5-20% run-to-run band and are not claimed.
+
+A third cut takes the closure path itself. `instantiate_function_with_source`
+installed the per-iteration chain by looking the fresh record up again after
+registration; carrying it into `register_function` removes that probe. The
+closure-phase counter (`SLAG_CLOSURE_PHASES` on a 3-captured-closures-per-iteration
+loop) reads total 3347.7 to 2501.0 cycles per closure, with the `tail` phase
+(87.5 cycles) going to zero, and the same closure-shaped loop measures -6.2% and
+-5.7% (min-of-15, two windows, one binary pair built with
+`-C llvm-args=-align-all-functions=5`). The two rows it should move most,
+`head-let` and `evaluation-order`, read +0.4% and +2.1% at min-of-25 rounds: their
+own spread at this shape is +-5-15%, so the closure-path counter and the
+ablation loop are the evidence, not the rows. That gap is itself the finding, and
+it says the biggest row is no longer bound by closure-creation instructions but by
+something adjacent (allocation and collection), which is where the next census
+should start.
 
 ### 1.3 The B0 census: what the rest of Phase B is worth
 

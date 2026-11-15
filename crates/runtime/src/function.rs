@@ -1072,18 +1072,14 @@ pub fn instantiate_function_with_source(
             source_info,
             None,
             outer_chain,
+            per_iteration_chain,
             named_expression,
         )?
     };
-    {
-        let _phase = phases::enter(phases::TAIL);
-        if !per_iteration_chain.is_empty()
-            && let Some(function) = value.as_function()
-            && let Some(mut data) = agent.ecma_function_mut(&function.id())
-        {
-            data.per_iteration_chain = per_iteration_chain;
-        }
-    }
+    // The chain rides on the record now, so what is left of the caller's tail
+    // is the return itself; the phase stays so the instrument's shape and the
+    // per-phase table keep meaning.
+    let _tail = phases::enter(phases::TAIL);
     Ok(value)
 }
 
@@ -1571,6 +1567,7 @@ pub fn instantiate_method(
         source_info,
         None,
         Vec::new().into(),
+        PerIterationChain::default(),
         false,
     )
 }
@@ -1612,6 +1609,7 @@ pub fn instantiate_accessor(
         source_info,
         None,
         Vec::new().into(),
+        PerIterationChain::default(),
         false,
     )
 }
@@ -1686,6 +1684,7 @@ fn instantiate_class_constructor_with(
         source_info,
         None,
         Vec::new().into(),
+        PerIterationChain::default(),
         false,
     )?;
     if default_derived
@@ -1808,6 +1807,11 @@ fn register_function(
     source_info: Option<std::rc::Rc<SourceInfo>>,
     strict: Option<bool>,
     outer_chain: OuterChain,
+    // The per-iteration head layouts at the creation site. Carried by the
+    // record itself: installing it after the insert meant a second
+    // `ecma_functions` probe (a random access into a table with one entry per
+    // live function) on every closure creation.
+    per_iteration_chain: PerIterationChain,
     named_expression: bool,
 ) -> Result<Value, JsError> {
     // `strict` overrides the body-directive check (CreateDynamicFunction
@@ -1871,6 +1875,7 @@ fn register_function(
         leaf_inline: false,
         construct_inline: false,
         outer_chain,
+        // Installed after the shared compile (see below).
         per_iteration_chain: Vec::new().into(),
         named_expression,
         // Plain ordinary functions defer MakeConstructor: the own
@@ -1917,6 +1922,11 @@ fn register_function(
     };
     let this_writes = entry.this_writes;
     data.set_compiled(entry.compiled);
+    // The chain is per creation site and is read by the call machinery, not by
+    // the shared compile above (which is keyed by the body, so every closure
+    // from the site compiles once) — install it here rather than in a second
+    // `ecma_functions` probe after the record is registered.
+    data.per_iteration_chain = per_iteration_chain;
     {
         let _phase = phases::enter(phases::REGISTER);
         agent.register_ecma_function(function.id(), data);
@@ -2216,6 +2226,7 @@ pub fn instantiate_function_from_source(
         source_info,
         Some(strict),
         Vec::new().into(),
+        PerIterationChain::default(),
         false,
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
