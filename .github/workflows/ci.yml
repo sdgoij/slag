@@ -482,9 +482,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
-      # `rustup show` installs the repo's pinned toolchain; the build itself runs
-      # under Deno's own `rust-toolchain.toml` (1.95.0), which rustup installs on
-      # demand when cargo first runs inside `deno/`.
+      # `rustup show` installs the repo's pinned toolchain, and `build-deno.py`
+      # hands that same channel down to the checkout's cargo runs: Deno's own
+      # `rust-toolchain.toml` pins an older release than the engine's minimum.
       - name: Install the pinned toolchain
         run: rustup show
       - name: Build Deno against the bridge

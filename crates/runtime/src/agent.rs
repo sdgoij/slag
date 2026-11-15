@@ -1286,7 +1286,7 @@ impl AgentRoots {
             });
         }
         // GC-4 WeakRef: a dead target clears the entry (deref → undefined).
-        for (_, target) in self.weak_ref_targets.borrow_mut().iter_mut() {
+        for target in self.weak_ref_targets.borrow_mut().values_mut() {
             if let Some(target_box) = value_box_addr(target)
                 && is_dead(target_box.addr())
             {
@@ -1729,7 +1729,7 @@ impl Trace for AgentRoots {
             for value in self.wasm_global_objects.borrow().values() {
                 value.trace(visit);
             }
-            for (_, (value, _)) in self.wasm_host_functions.borrow().iter() {
+            for (value, _) in self.wasm_host_functions.borrow().values() {
                 value.trace(visit);
             }
             for value in self.wasm_tag_objects.borrow().values() {

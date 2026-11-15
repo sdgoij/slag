@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-cranelift-codegen = "=0.134.3"
-cranelift-control = "=0.134.3"
-cranelift-frontend = "=0.134.3"
-cranelift-native = "=0.134.3"
+cranelift-codegen = "=0.137.1"
+cranelift-control = "=0.137.1"
+cranelift-frontend = "=0.137.1"
+cranelift-native = "=0.137.1"
 region = "4"
 target-lexicon = "0.13"
 

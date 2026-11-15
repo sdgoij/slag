@@ -19,15 +19,16 @@ own ``.cargo/local-build.toml``, so the checkout's sources are never edited.
 
 The checkout's ``Cargo.lock`` is reconciled once, on the first run. Slag's
 dependency graph needs newer patch versions than the lock holds (it pulls
-cranelift 0.134 alongside the checkout's 0.117, and unicode-normalization
+cranelift 0.137 alongside the checkout's 0.117, and unicode-normalization
 0.1.25), and cargo will not move locked versions on its own. The full reconcile
 also bumps ``locked-tripwire`` -- a crates.io trap that ``compile_error!``s in
 every published version except the stub the lock pins -- so this script pins it
 back afterwards. The reconcile logs every lock entry it moved, and the build
 itself runs with ``--locked``, so nothing resolves beyond the reconciled lock.
 
-Requires: git, a Rust toolchain (Deno's rust-toolchain.toml pins one), and
-network access for the initial clone and the crate downloads.
+Requires: git, a Rust toolchain (the workspace's pin is handed down to the
+checkout, see ``pinned_channel``), and network access for the initial clone and
+the crate downloads.
 """
 
 from __future__ import annotations
@@ -72,10 +73,27 @@ def capture(command: list[str]) -> str:
     ).stdout.strip()
 
 
+def pinned_channel() -> str:
+    """The workspace's Rust channel, which has to win over the checkout's own.
+
+    Rustup resolves a toolchain from the nearest ``rust-toolchain.toml``, so a
+    cargo run inside the checkout would build the engine with Deno's pin. That
+    pin trails the engine's minimum (1.95 against the 1.97 Cranelift 0.137
+    requires), and resolution fails before anything compiles, so the workspace
+    channel is passed down as an override.
+    """
+    text = (REPO_ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    match = re.search(r'^channel\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if match is None:
+        die("no channel in the workspace rust-toolchain.toml")
+    return match.group(1)
+
+
 def cargo(deno_dir: Path, config: Path, args: list[str]) -> None:
     command = [CARGO, "--config", str(config), *args]
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=pinned_channel())
     try:
-        subprocess.run(command, cwd=deno_dir, check=True)
+        subprocess.run(command, cwd=deno_dir, check=True, env=env)
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)
 
@@ -204,14 +222,27 @@ def align_engine_requirement(deno_dir: Path, version: str) -> tuple[Path, str] |
     return path, text
 
 
+def pinned_cranelift() -> str:
+    """The engine's pinned Cranelift version, from the JIT crate's manifest."""
+    text = (REPO_ROOT / "crates" / "jit" / "Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'^cranelift-codegen = "=?([0-9.]+)"', text, re.MULTILINE)
+    if match is None:
+        die("no cranelift-codegen pin in crates/jit/Cargo.toml")
+    return match.group(1)
+
+
 def lock_needs_reconcile(lock_path: Path, version: str) -> bool:
     """Whether the lock still resolves `v8` from the registry, or at another
-    version than the bridge's.
+    version than the bridge's, or pins a Cranelift other than the engine's.
 
     A patched `v8` is a path dependency, so its lock entry has no `source`
     line; a registry one has `source = "registry+..."`. A path entry left at
     the previous bridge version would make `--locked` fail, because the facade
     now requires this one.
+
+    The engine's `=x.y.z` Cranelift pin fails `--locked` the same way after an
+    upgrade, and a checkout that already carries a reconciled lock is never
+    re-examined by the `v8` check above, so the pin is compared too.
     """
     if not lock_path.is_file():
         return True
@@ -224,7 +255,10 @@ def lock_needs_reconcile(lock_path: Path, version: str) -> bool:
     if match is None or "source = " in match.group(1):
         return True
     locked = re.search(r'^version = "([^"]+)"', match.group(1), re.MULTILINE)
-    return locked is None or locked.group(1) != version
+    if locked is None or locked.group(1) != version:
+        return True
+    locked_cranelift = lock_versions(lock_path).get("cranelift-codegen", "").split(",")
+    return pinned_cranelift() not in locked_cranelift
 
 
 def lock_versions(lock_path: Path) -> dict[str, str]:

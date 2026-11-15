@@ -5597,9 +5597,9 @@ impl Builder<'_> {
                             ));
                         }
                         let mut pairs = Vec::with_capacity(entries.len() / 2);
-                        for pair in entries.chunks_exact(2) {
-                            let key = self.materialize(pair[0])?;
-                            let value = self.materialize(pair[1])?;
+                        for [key, value] in entries.as_chunks::<2>().0 {
+                            let key = self.materialize(*key)?;
+                            let value = self.materialize(*value)?;
                             pairs.push(Some((key, value)));
                         }
                         if *kind == KEYED_MAP {

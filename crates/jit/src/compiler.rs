@@ -431,7 +431,7 @@ pub(crate) enum Unsupported {
 }
 
 /// The arithmetic ops the JIT inlines for two numbers. `Rem` and `Exp` are
-/// NOT here: cranelift 0.134 has no `frem`/`fpow` instructions, and a formula
+/// NOT here: cranelift 0.137 has no `frem`/`fpow` instructions, and a formula
 /// reimplementation would not match Rust's `%`/`powf` bit for bit, so those
 /// route through `binary_slow`.
 #[derive(Clone, Copy)]
@@ -6257,7 +6257,7 @@ impl<'a> Lowerer<'a> {
         self.builder.ins().band(is_heap, is_fn)
     }
 
-    /// I8 bool → I64 0/1 (cranelift 0.134's `bint` is `uextend`).
+    /// I8 bool → I64 0/1 (cranelift 0.137's `bint` is `uextend`).
     fn bint(&mut self, cond: ClifValue) -> ClifValue {
         self.builder.ins().uextend(types::I64, cond)
     }

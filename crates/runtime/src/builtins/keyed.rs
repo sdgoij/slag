@@ -308,9 +308,7 @@ impl crate::agent::MapCollection {
     }
 
     fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
+        self.entries.fill(None);
         self.index.clear();
         self.collided = false;
     }
@@ -409,9 +407,7 @@ impl crate::agent::SetCollection {
     }
 
     fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
+        self.entries.fill(None);
         self.index.clear();
         self.collided = false;
     }

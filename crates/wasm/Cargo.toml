@@ -33,9 +33,9 @@ byteblock = { path = "../byteblock" }
 # inside `region` with errors that never name Slag: without the dependency in
 # the graph, the `compile_error!` in `src/lib.rs` is what the build reports.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-cranelift-codegen = { version = "=0.134.3", optional = true }
-cranelift-control = { version = "=0.134.3", optional = true }
-cranelift-frontend = { version = "=0.134.3", optional = true }
-cranelift-native = { version = "=0.134.3", optional = true }
+cranelift-codegen = { version = "=0.137.1", optional = true }
+cranelift-control = { version = "=0.137.1", optional = true }
+cranelift-frontend = { version = "=0.137.1", optional = true }
+cranelift-native = { version = "=0.137.1", optional = true }
 region = { version = "4", optional = true }
 target-lexicon = { version = "0.13", optional = true }

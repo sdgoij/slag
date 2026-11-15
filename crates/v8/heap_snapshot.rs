@@ -619,7 +619,7 @@ mod tests {
                 as u64;
 
             // Every edge points at the start of a node record.
-            for edge in edges.chunks_exact(3) {
+            for edge in edges.as_chunks::<3>().0 {
                 let to_node = edge[2];
                 assert!(to_node % stride as u64 == 0, "edge target {to_node}");
                 assert!(to_node < nodes.len() as u64, "edge target {to_node}");
