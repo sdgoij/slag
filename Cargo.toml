@@ -22,6 +22,9 @@ members = [
     "crates/test262",
     "crates/slagc",
     "crates/inspector",
+    # Developer automation (`cargo run -p xtask -- build`); deliberately not a
+    # default member, so a plain `cargo build` does not grow a tool binary.
+    "crates/xtask",
 ]
 
 # A bare `cargo build`/`cargo test` at the root builds these; `crates/jsc`

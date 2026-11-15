@@ -1,17 +1,16 @@
 # Task entry points for building, testing and developing.
 #
-# `just` on its own lists everything. The recipes call the tracked scripts rather
-# than reimplementing them: tools/build.sh owns the content-addressed binary
-# cache, tools/build-deno.py owns the host build, and .github/workflows/ci.yml is
-# the source of truth for what a gate is.
+# `just` on its own lists everything. The recipes call the tracked tools rather
+# than reimplementing them: `cargo run -p xtask -- build` owns the
+# content-addressed binary cache, tools/build-deno.py owns the host build, and
+# .github/workflows/ci.yml is the source of truth for what a gate is.
 
 set shell := ["sh", "-cu"]
 
-# The recipes are POSIX sh and the scripts under tools/ are bash. On Windows
-# `bash` on PATH is the WSL launcher in System32, which cannot run them, so each
-# script call names Git's bash outright instead of letting the script's
-# `#!/usr/bin/env bash` resolve it — and instead of relying on `sh` either.
-# SLAG_BASH overrides the location when Git lives somewhere else.
+# The recipes are POSIX sh; the cache build is `crates/xtask`. The four QuickJS
+# scripts are still bash, and on Windows `bash` on PATH is the WSL launcher in
+# System32, which cannot run them, so those calls name Git's bash outright.
+# SLAG_BASH overrides the location when Git is installed somewhere else.
 bash_bin := if os() == "windows" {
     env("SLAG_BASH", "C:/Program Files/Git/bin/bash.exe")
 } else {
@@ -75,27 +74,27 @@ test-wasm-free:
 
 # Release binaries through the tree-keyed cache: `just build -p cli --debug`.
 build *args:
-    "{{bash_bin}}" tools/build.sh {{args}}
+    cargo run --quiet -p xtask -- build {{args}}
 
 # The CLI binaries (slag and leak).
 build-cli:
-    "{{bash_bin}}" tools/build.sh -p cli
+    cargo run --quiet -p xtask -- build -p cli
 
 # The test262 runner (sweep).
 build-sweep:
-    "{{bash_bin}}" tools/build.sh -p test262
+    cargo run --quiet -p xtask -- build -p test262
 
 # The WebAssembly runner (wasmtest).
 build-wasmtest:
-    "{{bash_bin}}" tools/build.sh -p wasmtest
+    cargo run --quiet -p xtask -- build -p wasmtest
 
 # The cache key and toolchain this tree would build under.
 cache-key:
-    "{{bash_bin}}" tools/build.sh --print-key
+    cargo run --quiet -p xtask -- build --print-key
 
 # JIT against interpreter on the CLI micro-suite.
 bench:
-    "{{bash_bin}}" tools/build.sh -p cli
+    cargo run --quiet -p xtask -- build -p cli
     target/release/slag --jit-bench
 
 # Cross-engine corpus against node; see tools/corpus/README.md.
@@ -104,17 +103,17 @@ corpus *args:
 
 # Run a script on the release binary: `just run scratch/foo.js`.
 run *args:
-    "{{bash_bin}}" tools/build.sh -p cli
+    cargo run --quiet -p xtask -- build -p cli
     target/release/slag {{args}}
 
 # test262 area sweep: `just sweep language`, or built-ins, annexB, intl402.
 sweep area="language" *args:
-    "{{bash_bin}}" tools/build.sh -p test262
+    cargo run --quiet -p xtask -- build -p test262
     target/release/sweep {{area}} --batch 32 --timeout {{sweep_timeout}} --recheck-timeout {{sweep_timeout}} {{args}}
 
 # The GC-stress gate for per-allocation collection, matching the gc-stress job.
 gc-stress:
-    "{{bash_bin}}" tools/build.sh -p test262
+    cargo run --quiet -p xtask -- build -p test262
     target/release/sweep built-ins --filter "*Array*" --sample 4 --gc-stress --gc-verify --timeout {{sweep_timeout}} --recheck-timeout {{sweep_timeout}}
     target/release/sweep language --filter "*array*" --sample 4 --gc-stress --gc-verify --timeout {{sweep_timeout}} --recheck-timeout {{sweep_timeout}}
 
@@ -123,7 +122,7 @@ gc-stress:
 # cache key. A single line so the loop's variables stay in one shell, and it keeps
 # CI's "every suite runs, fail at the end" behaviour.
 wasm-sweep:
-    "{{bash_bin}}" tools/build.sh -p wasmtest && { s=0; target/release/wasmtest run --strict waspec/test/core/*.wast || s=1; for suite in exceptions simd relaxed-simd bulk-memory memory64 multi-memory gc; do target/release/wasmtest run --strict "waspec/test/core/$suite" || s=1; done; target/release/wasmtest jsapi waspec/test/js-api || s=1; exit $s; }
+    cargo run --quiet -p xtask -- build -p wasmtest && { s=0; target/release/wasmtest run --strict waspec/test/core/*.wast || s=1; for suite in exceptions simd relaxed-simd bulk-memory memory64 multi-memory gc; do target/release/wasmtest run --strict "waspec/test/core/$suite" || s=1; done; target/release/wasmtest jsapi waspec/test/js-api || s=1; exit $s; }
 
 # Build the browser demo module into docs/slag.wasm (gitignored).
 demo:

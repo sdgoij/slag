@@ -1,6 +1,6 @@
 ---
 name: slag-binary-freshness
-description: Verify a target/*.exe was built from the current source before trusting its output. Load before running any Slag binary (slag.exe, sweep.exe, leak.exe, examples) after source edits, git checkouts/stashes/resets, or when behavior contradicts the code you are reading (e.g. an error message that does not exist in crates/). Covers the tools/build.sh content-addressed binary cache, mapping each binary to its producing package, and mtime/cargo checks.
+description: Verify a target/*.exe was built from the current source before trusting its output. Load before running any Slag binary (slag.exe, sweep.exe, leak.exe, examples) after source edits, git checkouts/stashes/resets, or when behavior contradicts the code you are reading (e.g. an error message that does not exist in crates/). Covers the xtask (`cargo run -p xtask -- build`) content-addressed binary cache, mapping each binary to its producing package, and mtime/cargo checks.
 ---
 
 # Slag binary freshness
@@ -30,8 +30,9 @@ Do not assume `cargo build -p slag` rebuilt the CLI.
 
 ## Use the build cache, not a bare cargo build
 
-`tools/build.sh` builds `slag`/`leak` (`cli`), `sweep` (`test262`) and
-`wasmtest` (`wasmtest`) and caches the binaries under `target/build-cache`.
+`cargo run -p xtask -- build` builds `slag`/`leak` (`cli`), `sweep` (`test262`)
+and `wasmtest` (`wasmtest`) and caches the binaries under `target/build-cache`.
+It lives in `crates/xtask`; the flags below are its own.
 
 - The key is the **content of the working tree**, not the commit: `git add -A`
   on a throwaway index (`target/.build-cache-index`) followed by `git write-tree`,
@@ -52,7 +53,7 @@ Do not assume `cargo build -p slag` rebuilt the CLI.
 - A hit is content-equivalent to a fresh build, so it is safe to trust. If a hit
   still contradicts the source, inspect `target/build-cache/<entry>/meta.txt`
   (tree, HEAD, rustc, date) and rebuild with `--force`; if that fixes it, the key
-  is missing an input and the script needs fixing.
+  is missing an input and the tool needs fixing.
 - `--no-cache` bypasses the cache. Entries are ~60 MB each; delete
   `target/build-cache` to reclaim the space. `SLAG_BUILD_CACHE` relocates it;
   keep the cache per-checkout, since binaries embed the building path.
@@ -60,7 +61,7 @@ Do not assume `cargo build -p slag` rebuilt the CLI.
 ## Never leave an artifact built from source you have since reverted
 
 The cache key is the tree content, so a dirty entry is *correct for that content*.
-The hazard is the fixed-name copy: `tools/build.sh` writes
+The hazard is the fixed-name copy: the build task writes
 `target/<profile>/{slag,sweep,leak,wasmtest}.exe`, and nothing rewrites them when
 the tree moves. Build an experiment, revert it, and `target/release/sweep.exe`
 keeps running the experiment — a gate run then reports the experiment's failures
@@ -72,7 +73,7 @@ source refuses that lift (`refuses_update_context_slot` pins it).
 So, when abandoning an experiment:
 
 1. Delete the binaries built from it — rebuild from the reverted tree
-   (`./tools/build.sh`) rather than leaving the old copies.
+   (`cargo run -p xtask -- build`) rather than leaving the old copies.
 2. Delete its cache entry: `target/build-cache/<entry>` holds the artifacts and a
    `meta.txt` whose `state dirty` (or a `tree`/`head` that no longer matches) is
    the tell. Leaving it wastes ~60 MB and invites a future `--force` mix-up.

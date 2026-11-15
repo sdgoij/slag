@@ -1,6 +1,7 @@
 # Build cache: reuse binaries across tree states
 
-**Status: implemented** as `tools/build.sh` (2026-10-20). Measured on a Windows
+**Status: implemented** as `cargo run -p xtask -- build` (`crates/xtask`; it was
+`tools/build.sh` until 2026-11-15). Measured on a Windows
 x86-64 host with the release profile from the workspace `Cargo.toml`
 (`lto = "thin"`, `codegen-units = 1`).
 
@@ -25,7 +26,7 @@ compiled tree frequently matches **no commit**. A commit hash would be wrong in
 both directions: a miss for a tree that is exactly a previous build, and a hit
 for a dirty tree whose sources differ from the commit.
 
-`tools/build.sh` snapshots the working tree instead:
+The build task snapshots the working tree instead:
 
 ```sh
 GIT_INDEX_FILE=target/.build-cache-index git add -A
@@ -67,7 +68,7 @@ invocations on purpose — selecting all three in one invocation unifies their
 features and changes the binaries from what CI publishes.
 
 Entries are partial by design. Building `-p cli` at tree T stores `slag` and
-`leak`; a later `tools/build.sh` at the same T misses (it wants `sweep` and
+`leak`; a later build at the same T misses (it wants `sweep` and
 `wasmtest` too), cargo's fingerprints are still valid so nothing recompiles, and
 the merge stores the union. A hit requires every requested binary, never a
 subset.
