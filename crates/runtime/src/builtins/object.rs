@@ -1370,7 +1370,7 @@ fn set_prototype_of(
     }
     let proto = match proto_value.kind() {
         ValueKind::Object(obj) => Some(obj),
-        ValueKind::Function(f) => Some(f.object),
+        ValueKind::Function(f) => Some(f.object_handle()),
         ValueKind::Null => None,
         _ => {
             return Err(JsError::new(

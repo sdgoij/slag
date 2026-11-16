@@ -389,6 +389,15 @@ impl<T: Trace> GcBox<T> {
 /// are fixed, so the offset is a stable ABI constant.
 pub const GCBOX_DATA_OFFSET: usize = std::mem::offset_of!(GcBox<crate::Value>, data);
 
+/// The payload offset of a `JsObject` box and of a `Function` box: they must
+/// agree, because a function's payload begins with its `JsObject` and
+/// [`Function::object_handle`](crate::function::Function::object_handle) builds
+/// an object handle naming the same box.
+pub(crate) const JSOBJECT_BOX_DATA_OFFSET: usize =
+    std::mem::offset_of!(GcBox<crate::object::JsObject>, data);
+pub(crate) const FUNCTION_BOX_DATA_OFFSET: usize =
+    std::mem::offset_of!(GcBox<crate::function::Function>, data);
+
 /// The `flags` bit meaning "allocated since the last collection" (A1), at the
 /// box's offset 0. The JIT reads it to decide whether an inline heap store
 /// needs the A2 write barrier: a young container cannot hold an old->young

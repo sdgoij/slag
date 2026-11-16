@@ -3804,7 +3804,7 @@ pub const GLOBAL_CELLS: usize = 256;
 /// call step — keeps their records live: the compiled hit path's env lane
 /// re-derives a leaf's closure env through this cache on every call (G15), so
 /// a table smaller than the site's callee count sends each call to the
-/// `ecma_functions` HashMap instead. Boxed so the Agent's hot-field cache
+/// `ecma_functions` table instead. Boxed so the Agent's hot-field cache
 /// footprint stays small (the Cut 27 lesson: an inline copy regressed the leaf
 /// path).
 pub(crate) const LEAF_CACHE: usize = 256;
@@ -3910,7 +3910,7 @@ pub(crate) const SAME_STACK_CACHE: usize = 256;
 pub(crate) const BUILTIN_HANDLER_CELLS: usize = 128;
 
 /// A cached leaf-inline record: everything the inline call path reads off
-/// the `ecma_functions` record, captured so the per-call HashMap lookup is
+/// the `ecma_functions` record, captured so the per-call table lookup is
 /// skipped on a hit.
 #[derive(Clone)]
 pub(crate) struct LeafEntry {
@@ -3921,7 +3921,7 @@ pub(crate) struct LeafEntry {
     pub environment: Option<EnvRef>,
     /// The certified base-constructor leaf verdict (Cut 35 slice 15): the
     /// `Construct` step shares the leaf cache, so a construct-inlineable
-    /// callee skips the `ecma_functions` HashMap lookup it paid per
+    /// callee skips the `ecma_functions` table lookup it paid per
     /// construct.
     pub construct_inline: bool,
 }
@@ -6551,12 +6551,11 @@ impl Vm {
                 Some(object)
             }
             ValueKind::Function(function) => {
-                let object = &function.object;
                 if matches!(
-                    object.kind,
+                    function.object.kind,
                     crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
                 ) {
-                    Some(*object)
+                    Some(function.object_handle())
                 } else {
                     None
                 }
@@ -6584,12 +6583,11 @@ impl Vm {
                 Some(object)
             }
             ValueKind::Function(function) => {
-                let object = &function.object;
                 if matches!(
-                    object.kind,
+                    function.object.kind,
                     crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
                 ) {
-                    Some(*object)
+                    Some(function.object_handle())
                 } else {
                     None
                 }
@@ -7315,7 +7313,7 @@ impl Vm {
         };
         let receiver = match object.kind() {
             ValueKind::Object(obj) => obj,
-            ValueKind::Function(f) => f.object,
+            ValueKind::Function(f) => f.object_handle(),
             _ => return Ok(false),
         };
         if !matches!(receiver.kind, crux::object::ObjectKind::Ordinary) {
@@ -7452,9 +7450,8 @@ impl Vm {
                 Some(object)
             }
             ValueKind::Function(function) => {
-                let object = &function.object;
-                if matches!(object.kind, crux::object::ObjectKind::Ordinary) {
-                    Some(*object)
+                if matches!(function.object.kind, crux::object::ObjectKind::Ordinary) {
+                    Some(function.object_handle())
                 } else {
                     None
                 }
@@ -11569,7 +11566,7 @@ impl Vm {
         };
         let home_object = match home.kind() {
             ValueKind::Object(obj) => obj,
-            ValueKind::Function(f) => f.object,
+            ValueKind::Function(f) => f.object_handle(),
             _ => return Ok(Value::Undefined),
         };
         Ok(home_object
@@ -15205,7 +15202,7 @@ impl Vm {
             && agent.realm_count.get() == 1
             // Cut 33/34: the record-derived eligibility and the per-call
             // data (ir, strictness, closure env) come from a direct-mapped
-            // cache, skipping the `ecma_functions` HashMap lookup on a hit.
+            // cache, skipping the `ecma_functions` table lookup on a hit.
             && let Some(entry) = agent.leaf_lookup(function.id())
         {
             match leaf_cache {

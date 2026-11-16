@@ -222,13 +222,21 @@ impl fmt::Debug for FunctionKind {
 }
 
 /// A function object. Equality is identity (like `Symbol` and `JsObject`).
+///
+/// The object part is inline and first: one arena allocation carries the
+/// function and its `JsObject` instead of two. `#[repr(C)]` makes the box's
+/// payload begin with the `JsObject`, and the heap's box header is fixed, so a
+/// `Handle<JsObject>` built from this box's address
+/// ([`Function::object_handle`]) reads exactly the field below — the same
+/// arrangement `same_value` already assumes ("a Function value and its
+/// underlying object are the same allocation").
+#[repr(C)]
 pub struct Function {
+    /// The object part: [[Prototype]], [[Extensible]], and own properties.
+    /// MUST stay the first field: see the type's note.
+    pub object: JsObject,
     id: u64,
     pub name: Option<JsString>,
-    /// The object part: [[Prototype]], [[Extensible]], and own properties.
-    /// Held as a handle so the object is also usable as a prototype link and
-    /// `JsObject::handle()` recovers it.
-    pub object: Handle<JsObject>,
     pub kind: FunctionKind,
     /// Strong back-reference to the owning handle so `this`-receiver
     /// operations (accessor invocation, own-property creation on `set`)
@@ -261,6 +269,13 @@ pub struct Function {
     /// table.
     resolver: Cell<Option<ResolverRecord>>,
 }
+
+// The object handle built from a function box reads the payload as a
+// `JsObject`, so the two payloads must sit at the same offset in their boxes
+// (true while the header is fixed and both alignments are equal).
+const _: () =
+    assert!(crate::heap::JSOBJECT_BOX_DATA_OFFSET == crate::heap::FUNCTION_BOX_DATA_OFFSET);
+const _: () = assert!(std::mem::offset_of!(Function, object) == 0);
 
 /// What a resolving function carries: the [[AlreadyResolved]] slot its pair
 /// shares, the Promise Record the pair settles, and which arm it is
@@ -424,23 +439,52 @@ impl Function {
         name: Option<JsString>,
         prototype: Option<Handle<JsObject>>,
     ) -> Handle<Function> {
-        let function = Handle::new(Self {
-            id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
-            name,
-            object: JsObject::ordinary_object_create(prototype),
-            kind: FunctionKind::EcmaScript,
-            self_handle: Cell::new(None),
-            environment: Cell::new(None),
-            home_object: Cell::new(None),
-            resolver: Cell::new(None),
+        Self::allocate(name, FunctionKind::EcmaScript, prototype)
+    }
+
+    /// Allocate a function box: the inline object part plus the function's own
+    /// slots in one arena slot (see the type's note). `link_self_handle`
+    /// installs the self-references afterwards, once the box address exists.
+    fn allocate(
+        name: Option<JsString>,
+        kind: FunctionKind,
+        prototype: Option<Handle<JsObject>>,
+    ) -> Handle<Function> {
+        // Resolved before the heap borrow: a first use of this prototype
+        // allocates the canonical empty map, which `new_in_place` forbids.
+        let map = crate::map::canonical_empty_map(prototype);
+        let id = NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed);
+        let function = Handle::new_in_place(|ptr: *mut Self| {
+            // SAFETY: the slot is uninitialized; `init_ordinary` writes every
+            // `JsObject` field and the writes below cover the rest of `Self`.
+            unsafe {
+                JsObject::init_ordinary(std::ptr::addr_of_mut!((*ptr).object), prototype, map);
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).id), id);
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).name), name);
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).kind), kind);
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).self_handle), Cell::new(None));
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).environment), Cell::new(None));
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).home_object), Cell::new(None));
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).resolver), Cell::new(None));
+            }
         });
-        function.self_handle.set(Some(function));
-        function.object.function_self.set(Some(function));
+        Self::link_self_handle(&function);
         function
     }
 
     fn link_self_handle(function: &Handle<Function>) {
         function.self_handle.set(Some(*function));
+        let object = function.object_handle();
+        JsObject::link_self_handle(&object);
+        function.object.function_self.set(Some(*function));
+    }
+
+    /// The object part's handle: the same box, read as a `JsObject` (see the
+    /// type's note). Always available — the object is this box's payload.
+    pub fn object_handle(&self) -> Handle<JsObject> {
+        // SAFETY: `object` is the box payload's first field and the two box
+        // payload offsets are asserted equal at the top of this file.
+        unsafe { Handle::<JsObject>::from_payload(&self.object) }
     }
 
     /// The function as a language value, recovering the original handle.
@@ -460,21 +504,14 @@ impl Function {
         construct: Option<NativeCtor>,
         prototype: Option<Handle<JsObject>>,
     ) -> Result<Handle<Function>, JsError> {
-        let function = Handle::new(Self {
-            id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
-            name: name.clone(),
-            object: JsObject::ordinary_object_create(prototype),
-            kind: FunctionKind::Builtin {
+        let function = Self::allocate(
+            name.clone(),
+            FunctionKind::Builtin {
                 call: Some(call),
                 construct,
             },
-            self_handle: Cell::new(None),
-            environment: Cell::new(None),
-            home_object: Cell::new(None),
-            resolver: Cell::new(None),
-        });
-        Self::link_self_handle(&function);
-        function.object.function_self.set(Some(function));
+            prototype,
+        );
         function.define_property(
             &JsString::from_utf8("length"),
             &PropertyDescriptor {
@@ -517,22 +554,15 @@ impl Function {
                 "Cannot bind a non-callable value".into(),
             ));
         }
-        let function = Handle::new(Self {
-            id: NEXT_FUNCTION_ID.fetch_add(1, Ordering::Relaxed),
-            name: None,
-            object: JsObject::ordinary_object_create(prototype),
-            kind: FunctionKind::Bound {
+        let function = Self::allocate(
+            None,
+            FunctionKind::Bound {
                 target,
                 bound_this,
                 bound_args,
             },
-            self_handle: Cell::new(None),
-            environment: Cell::new(None),
-            home_object: Cell::new(None),
-            resolver: Cell::new(None),
-        });
-        Self::link_self_handle(&function);
-        function.object.function_self.set(Some(function));
+            prototype,
+        );
         Ok(function)
     }
 

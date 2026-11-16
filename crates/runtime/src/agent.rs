@@ -186,12 +186,15 @@ impl std::hash::Hasher for IdentityHasher {
 
 /// An id-keyed state map: the key is an object's or a function's identity — a
 /// sequential `u64` from the id counter — so the default SipHash is pure
-/// overhead on every lookup. The same reasoning (and the same hasher) already
-/// backs `ecma_functions`, which is on the function-call path.
+/// overhead on every lookup.
 ///
 /// Do NOT use this for a key that is not already well distributed: a map whose
 /// key is a raw `f64::to_bits()` (numbers below 1 have low bits clear) needs
 /// real mixing, which `IdentityHasher` does not do.
+///
+/// The function-record table (`ecma_functions`) is NOT one of these: it is a
+/// dense slab indexed by the id (`crate::function::FunctionTable`), because
+/// every closure creation inserts into it.
 pub type IdMap<V> =
     std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<IdentityHasher>>;
 
@@ -940,12 +943,12 @@ pub(crate) struct AgentRoots {
     pub(crate) atom_string_cells: Box<[crate::ir::AtomStringCell; crate::ir::ATOM_STRING_CELLS]>,
     /// The leaf-inline cache (Cut 34): function id → the record data
     /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
-    /// leaf call skips the `ecma_functions` HashMap lookup. Boxed per the
+    /// leaf call skips the `ecma_functions` table lookup. Boxed per the
     /// Cut 27 lesson.
     pub(crate) leaf_cache: RefCell<Box<[LeafCacheCell; crate::ir::LEAF_CACHE]>>,
     /// The same-stack record cache: function id → what `try_push_inline_call`
     /// reads out of the `ecma_functions` record, so a hot recursive or plain
-    /// call skips the HashMap lookup. Boxed per the Cut 27 lesson.
+    /// call skips the table lookup. Boxed per the Cut 27 lesson.
     pub(crate) same_stack_cache: RefCell<Box<[SameStackCell; crate::ir::SAME_STACK_CACHE]>>,
     /// The enumerable-key cache: object id → its enumerable own string keys as
     /// ready-made values, so `Object.keys` on a stable object allocates only
@@ -1146,7 +1149,7 @@ pub(crate) struct AgentRoots {
     /// hand out a guard. Hold one only while fields are copied out: a guard
     /// held across an allocation aborts that collection, and one held across
     /// an insert into the same table panics.
-    pub(crate) ecma_functions: RefCell<IdMap<crate::function::EcmaFunction>>,
+    pub(crate) ecma_functions: RefCell<crate::function::FunctionTable>,
 }
 
 impl AgentRoots {
@@ -1409,7 +1412,7 @@ impl AgentRoots {
             shadow_realms: RefCell::new(std::collections::HashMap::default()),
             shadow_wrapped: RefCell::new(std::collections::HashMap::default()),
             shadow_handlers: RefCell::new(std::collections::HashMap::default()),
-            ecma_functions: RefCell::new(IdMap::default()),
+            ecma_functions: RefCell::new(crate::function::FunctionTable::default()),
             map_data: RefCell::new(IdMap::default()),
             set_data: RefCell::new(IdMap::default()),
             weak_map_data: RefCell::new(IdMap::default()),
@@ -2732,7 +2735,7 @@ impl Agent {
         self.debug_attached.set(attached);
         self.roots.compiled_bodies.borrow_mut().clear();
         self.roots.script_bodies.borrow_mut().clear();
-        let ids: Vec<u64> = self.roots.ecma_functions.borrow().keys().copied().collect();
+        let ids: Vec<u64> = self.roots.ecma_functions.borrow().keys().collect();
         for id in ids {
             crate::function::recompile_record(self, id)?;
         }
@@ -3059,7 +3062,7 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn with_ecma_functions<T>(
         &self,
-        read: impl FnOnce(&IdMap<crate::function::EcmaFunction>) -> T,
+        read: impl FnOnce(&crate::function::FunctionTable) -> T,
     ) -> T {
         read(&self.roots.ecma_functions.borrow())
     }
@@ -3437,7 +3440,7 @@ impl Agent {
     }
 
     /// The leaf-inline record for `id` (Cut 34): a direct-mapped cache over
-    /// the `ecma_functions` map, so a hot leaf call skips the HashMap lookup.
+    /// the `ecma_functions` map, so a hot leaf call skips the table lookup.
     /// A miss resolves from the map and caches the entry (only for a
     /// leaf-inlineable function); function ids are never reused, so a hit
     /// needs no generation check.
@@ -4812,7 +4815,7 @@ mod tests {
                         .as_ref()
                         .is_some_and(|name| name.to_string_lossy() == "f")
                 })
-                .map(|(id, _)| *id)
+                .map(|(id, _)| id)
                 .expect("f is a registered function")
         };
         let record_body = |agent: &Agent, id: u64| {

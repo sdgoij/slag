@@ -475,6 +475,73 @@ Where the win is, in order:
 
 The first two are worth maybe 40% of the path (~70 ms on `head-let`); none of the three is reachable by trimming a phase. Benchmark: `head-let` (507.8 ms) plus `scratch/probe/closure_create.js` (per closure ~600 ns, against node's 0.58 ns — node elides the allocation entirely, so parity needs escape analysis, not this arc).
 
+**The first two landed (2026-11-16, later). Measured −3.3% on the corpus and
+−16% on `head-let`, not the ~40% the estimate guessed.** Both cuts are in; the
+estimate was optimistic for the phase list it was drawn from (the instrumented
+closure path fell 11%).
+
+- **One allocation for a closure.** `Function` is now `#[repr(C)]` with its
+  `JsObject` as the first field, allocated in place by `Function::allocate`, so
+  the function box and its object part are one arena slot (~560 B, was 448 + 112
+  in two slots). The object part is reachable as a `Handle<JsObject>` because the
+  box payload *begins with* the `JsObject`: `Function::object_handle` builds it
+  with `Handle::from_payload`, and the two box payload offsets are asserted
+  equal at compile time in `function.rs` (a header change breaks the assert, not
+  the program). `self_handle`/`function_self` are set to that handle, so
+  `same_value`'s cross-kind compare now short-circuits on `ptr_eq` (same box).
+  `JsObject::init_ordinary` and `JsObject::link_self_handle` became `pub(crate)`
+  for the in-place writer.
+- **The record table is an id-indexed slab.** `Agent::ecma_functions` is a
+  `FunctionTable`: a directory of 256-record `MaybeUninit` chunks (bitmap +
+  live count), freed when a chunk empties and recycled through an eight-entry
+  buffer free list. Ids are still permanent (nothing reuses one), so a flat
+  `Vec` would have grown with every closure; the directory is the only part that
+  grows with the id space (peak id / 256 × 8 B).
+- **The JIT read the old layout as a field.** `cells::chain_object_ptr` loaded
+  `offset_of!(crux::Function, object)` and added `GCBOX_DATA_OFFSET`; with an
+  inline object that load is garbage — the release binary segfaulted in
+  `head-let` while every debug test passed. It now returns the payload address
+  for both an Object and a Function (the object part *is* the payload), which
+  also drops the load, the add and the `select` from every chain probe.
+  `Heap::for_each_live_box`/`GcAny::is::<JsObject>` now see a function box as
+  `Function`, not as two boxes (the v8 heap snapshot follows that).
+
+Measured (interleaved same session, control binary rebuilt from the untouched
+commit through `xtask build`'s cache; `SLAG_CLOSURE_PHASES` for the phase table).
+The `function_new` row is the one-allocation step against its own parent; the
+`register`/`props`/`total` rows are the slab step against the one-allocation
+build.
+
+| probe | before | after | delta |
+|---|---:|---:|---:|
+| `function_new` (cycles/closure) | 455.5 / 474.0 / 504.3 | 326.1 / 329.7 / 339.3 | **−30%** |
+| `register` (cycles/closure, +slab step) | 214.5 / 222.5 / 221.6 | 130.2 / 119.0 / 122.7 | **−45%** |
+| `props` (cycles/closure, +slab step) | 328.7 / 344.3 / 331.1 | 163.8 / 158.9 / 163.3 | **−51%** (mechanism unexplained; reproducible across two builds and six runs) |
+| `total` (cycles/closure, +slab step) | 2501.8 / 2602.9 / 2535.0 | 2268.9 / 2213.5 / 2245.7 | **−11%** |
+| `head-let` (ms, min of 5) | 526.9 | 441.1 | **−16%** (medians 533.3 → 450.8) |
+| `evaluation-order` (ms, min of 4) | 270.5 | 257.4 | −4.8% (medians 278.6 → 267.0) |
+| 1M-closure probe (ms, min of 5) | 520.9 | 389.8 | **−25%** (medians 542.8 → 416.7) |
+| `calls/method_call` (ms, median of 8) | — | — | +1% (the slab's directory→chunk chain), `calls/*` otherwise flat |
+| corpus, sum of per-row minima | 2507.4 | 2424.9 | −3.3% |
+| corpus without the two closure rows | 1632.8 | 1638.6 | +0.4% (noise) |
+
+Accept: `cargo test --workspace` (53/53 binaries), clippy `-D warnings`, corpus
+differential exact in jit, jitless and `--gc-stress` (81/81 rows), `sweep all`
+48,633/48,633 and `sweep intl402` 3,365/3,365. Run the sweeps with `--accurate`:
+the default full-parallel run reports load-induced hangs on 5-15 s fixtures
+(`TypedArray/prototype/copyWithin/coerced-values-end-detached.js` in one pass,
+`Script_-_Gurmukhi.js` in another) that pass on re-run. The slab's creation win
+is real (1M probe, five separated pairs) and its call-path cost is one
+dependent load (measured as a wash on the corpus); the next cut is the third
+item below.
+
+**The closure-path counter is the instrument for this arc, not the rows.**
+`head-let` alone spans 441-495 ms within the final binary across five
+interleaved runs, so a single row reading is not evidence either way; the 1M
+closure probe is `scratch/probe/closure_create.js` with the loop bound raised to
+`1000000` — the 100k original is inside the noise (33-48 ms across runs of one
+binary).
+
 **The map-keyed chain arm landed without a layout cut (2026-11-15, later).** The
 plan had scoped a `kind_is_ordinary` mirror plus a properties-length mirror. Only
 the length was needed: the kind discriminator falls out of `props_deferred`

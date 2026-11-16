@@ -151,7 +151,7 @@ pub fn to_property_descriptor(value: &Value) -> Result<PropertyDescriptor, JsErr
     let obj = if let Some(obj) = value.as_object() {
         obj
     } else if let Some(function) = value.as_function() {
-        function.object
+        function.object_handle()
     } else {
         return Err(JsError::new(
             ErrorKind::TypeError,

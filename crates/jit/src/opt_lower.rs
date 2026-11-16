@@ -4592,11 +4592,10 @@ fn emit_chain_probe(
     builder.switch_to_block(entry);
     let name_imm = builder.ins().iconst(types::I64, name as i64);
     // The receiver's `JsObject` pointer: an Object's own box, or a Function's
-    // OBJECT PART (a separate box — `f.apply`/`f.call` is the shape, and
-    // `Vm::chain_object` keys those resolutions by the object part). Branched,
-    // not `select`ed: a speculative load of the function's field costs an extra
-    // dependent cache line on every ordinary-object read (measured 30% on
-    // `proto_read`).
+    // object part — which is the function box's payload (`Function` puts its
+    // `JsObject` first), so both are the same address. `f.apply`/`f.call` is
+    // the shape, and `Vm::chain_object` keys those resolutions by the object
+    // part.
     let ptr_fn_gate = builder.create_block();
     let ptr_fn = builder.create_block();
     let ptr_join = builder.create_block();

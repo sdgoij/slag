@@ -2520,7 +2520,7 @@ impl Context {
         let agent = self.agent_mut();
         match crate::context::to_object(agent, &value.0)?.kind() {
             ValueKind::Object(obj) => Ok(JsObject(obj)),
-            ValueKind::Function(f) => Ok(JsObject(f.object)),
+            ValueKind::Function(f) => Ok(JsObject(f.object_handle())),
             _ => unreachable!("ToObject always returns an object or function"),
         }
     }

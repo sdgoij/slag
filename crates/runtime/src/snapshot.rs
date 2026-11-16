@@ -1538,7 +1538,7 @@ fn visit(
                         }
                     }
                 }
-                for child in children(agent, &function.object)? {
+                for child in children(agent, &function.object_handle())? {
                     visit(agent, realm, externals, host, child, objects, serials)?;
                 }
             }
@@ -2295,7 +2295,7 @@ fn class_of_home(agent: &Agent, home: Value) -> Option<(Value, Handle<JsObject>)
             if !is_class_constructor(agent, &class_function) {
                 return None;
             }
-            Some((home, class_function.object))
+            Some((home, class_function.object_handle()))
         }
         ValueKind::Object(object) => {
             let constructor = object
@@ -3587,9 +3587,12 @@ fn write_function(
         }
     }
     write_units(body, source.as_slice());
-    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    write_u32(
+        body,
+        prototype_serial(realm, &function.object_handle(), serials)?,
+    );
     body.push(u8::from(function.object.extensible.get()));
-    write_properties(realm, &function.object, serials, body)?;
+    write_properties(realm, &function.object_handle(), serials, body)?;
     Ok(())
 }
 
@@ -3633,9 +3636,12 @@ fn write_class_method(
         body,
         home.map_or(NO_REF, |home| serial_in(realm, serials, home)),
     );
-    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    write_u32(
+        body,
+        prototype_serial(realm, &function.object_handle(), serials)?,
+    );
     body.push(u8::from(function.object.extensible.get()));
-    write_properties(realm, &function.object, serials, body)?;
+    write_properties(realm, &function.object_handle(), serials, body)?;
     Ok(())
 }
 
@@ -3671,9 +3677,12 @@ fn write_host_callback(
     // The construct bit: whether the host's function had a [[Construct]], which
     // the restore builds it with again.
     body.push(u8::from(construct));
-    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    write_u32(
+        body,
+        prototype_serial(realm, &function.object_handle(), serials)?,
+    );
     body.push(u8::from(function.object.extensible.get()));
-    write_properties(realm, &function.object, serials, body)?;
+    write_properties(realm, &function.object_handle(), serials, body)?;
     Ok(())
 }
 
@@ -3709,9 +3718,12 @@ fn write_bound_function(
     for argument in bound_args {
         write_u32(body, serial_in(realm, serials, *argument));
     }
-    write_u32(body, prototype_serial(realm, &function.object, serials)?);
+    write_u32(
+        body,
+        prototype_serial(realm, &function.object_handle(), serials)?,
+    );
     body.push(u8::from(function.object.extensible.get()));
-    write_properties(realm, &function.object, serials, body)?;
+    write_properties(realm, &function.object_handle(), serials, body)?;
     Ok(())
 }
 
@@ -5217,7 +5229,7 @@ impl Builder<'_> {
                 // filling them now is what makes the two one function rather than
                 // a function and a copy of it.
                 self.settle_envs()?;
-                let object = function.object;
+                let object = function.object_handle();
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);
@@ -5810,7 +5822,7 @@ impl Builder<'_> {
                         ))
                     })?;
                 self.remember(index, Built::Value(Value::Function(function)));
-                let object = function.object;
+                let object = function.object_handle();
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);
@@ -5830,7 +5842,7 @@ impl Builder<'_> {
                 // `prototype`: the record's own properties are the whole object
                 // part, and there is no lazy materialization to disarm.
                 self.remember(index, Built::Value(Value::Function(function)));
-                let object = function.object;
+                let object = function.object_handle();
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);
@@ -5849,7 +5861,7 @@ impl Builder<'_> {
                 // so nothing defers its `prototype` — the record's own
                 // properties are the whole object part.
                 self.remember(index, Built::Value(Value::Function(function)));
-                let object = function.object;
+                let object = function.object_handle();
                 define_properties(self, object, properties)?;
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);
@@ -6443,7 +6455,7 @@ impl Builder<'_> {
                 // an instance method — which is why a member whose class's prototype
                 // was replaced is not carried this way at all (see `class_member`).
                 let holder = match home_value.as_ref().map(|value| value.kind()) {
-                    Some(ValueKind::Function(class_function)) => class_function.object,
+                    Some(ValueKind::Function(class_function)) => class_function.object_handle(),
                     _ => *self.class_prototypes.get(&class).ok_or_else(|| {
                         DecodeError::UnrebuildableFunction(
                             "its class's own evaluation kept no prototype to read it from".into(),
@@ -6850,7 +6862,7 @@ mod tests {
             .expect("a function")
             .into_value();
         let object = match function.kind() {
-            ValueKind::Function(function) => function.object,
+            ValueKind::Function(function) => function.object_handle(),
             other => panic!("a function, not {other:?}"),
         };
         object
@@ -9487,7 +9499,9 @@ mod tests {
         holder
             .as_object()
             .expect("an object")
-            .set_prototype_of(Some(function.as_function().expect("a function").object))
+            .set_prototype_of(Some(
+                function.as_function().expect("a function").object_handle(),
+            ))
             .expect("link");
 
         let pair = array_with(&realm, &[holder, function]);

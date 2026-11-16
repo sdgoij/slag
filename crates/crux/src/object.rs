@@ -1543,7 +1543,7 @@ impl JsObject {
     /// Every field is written with `ptr::write` — a plain assignment would
     /// drop the slot's stale value first. Must mirror
     /// `basic_object_create_with_map`'s field set exactly.
-    unsafe fn init_ordinary(
+    pub(crate) unsafe fn init_ordinary(
         this: *mut Self,
         prototype: Option<Handle<JsObject>>,
         map: Handle<Map>,
@@ -1609,7 +1609,7 @@ impl JsObject {
         }
     }
 
-    fn link_self_handle(object: &Handle<JsObject>) {
+    pub(crate) fn link_self_handle(object: &Handle<JsObject>) {
         object.self_handle.set(Some(*object));
     }
 

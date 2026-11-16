@@ -1903,10 +1903,10 @@ impl<'a> Lowerer<'a> {
         let fn_entry = self.builder.create_block();
         // A FUNCTION receiver is served too: `f.apply`/`f.call` is the shape
         // (`Vm::chain_object` keys those resolutions by the function's OBJECT
-        // PART), and that call form's loop lives in this tier. The pointer is a
-        // block parameter so the object edge passes its own through the branch;
-        // a `select` over both pointers instead cost `proto_read` 30%, because
-        // the speculative load touches another cache line on every object read.
+        // PART). The pointer is a block parameter so the object edge passes its
+        // own through the branch; the function box's payload IS its object part
+        // (`Function` puts its `JsObject` first), so both edges pass the same
+        // address and no field load sits on the read path.
         let gated = self.builder.create_block();
         self.builder.append_block_param(gated, types::I64);
         let obj_ptr_direct = crate::cells::object_data_ptr(&mut self.builder, object);

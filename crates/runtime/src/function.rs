@@ -421,6 +421,301 @@ impl Trace for EcmaFunction {
     }
 }
 
+/// The per-agent table of function records, indexed by function id.
+///
+/// Function ids are sequential ([`NEXT_FUNCTION_ID`]) but never reused, so a
+/// flat `Vec` indexed by id would grow with every closure the program ever
+/// created (~77 MB at 300k ids, measured). The table is instead a two-level
+/// slab: a directory of fixed-size chunks, each a slot array plus a live
+/// bitmap. An empty chunk is released, so the live footprint tracks the live
+/// records, while a lookup stays two index operations — no hash, no rehash,
+/// and no growth step (the hash map's rehash accounted for a measured ~20% of
+/// `register`).
+///
+/// Slots are `MaybeUninit`: a fresh chunk writes only its bitmap, so a
+/// create pays one record write and nothing per empty slot (an
+/// `Option<EcmaFunction>` array would write a whole zeroed record per slot).
+#[derive(Default)]
+pub(crate) struct FunctionTable {
+    chunks: Vec<Option<Box<FunctionChunk>>>,
+    /// Emptied chunk buffers, reused by the next insert that needs one. Ids
+    /// are never reused, so a new id never lands in an emptied chunk's range,
+    /// and returning the buffer to the allocator would cost ~256 creations a
+    /// fresh ~53 KB allocation (measurable in `register`, which is why the
+    /// table is a slab and not a `Vec` of boxed chunks either). The `Box` is
+    /// the same allocation the directory holds, so it is moved, never copied.
+    #[allow(clippy::vec_box)]
+    spare: Vec<Box<FunctionChunk>>,
+}
+
+/// Records per chunk. A chunk is ~53 KB (256 records of ~208 bytes), so a
+/// burst between two collections (the allocation budget is 1024) keeps only a
+/// handful of chunks live.
+const FUNCTION_CHUNK_BITS: usize = 8;
+const FUNCTION_CHUNK_LEN: usize = 1 << FUNCTION_CHUNK_BITS;
+const FUNCTION_CHUNK_MASK: u64 = (FUNCTION_CHUNK_LEN - 1) as u64;
+
+struct FunctionChunk {
+    /// Initialized exactly where `live` has the bit set.
+    slots: Box<[std::mem::MaybeUninit<EcmaFunction>]>,
+    live: [u64; FUNCTION_CHUNK_LEN / 64],
+    count: u32,
+}
+
+impl FunctionChunk {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(FUNCTION_CHUNK_LEN);
+        slots.resize_with(FUNCTION_CHUNK_LEN, std::mem::MaybeUninit::uninit);
+        Self {
+            slots: slots.into_boxed_slice(),
+            live: [0; FUNCTION_CHUNK_LEN / 64],
+            count: 0,
+        }
+    }
+
+    #[inline]
+    fn is_live(&self, slot: usize) -> bool {
+        self.live[slot / 64] & (1 << (slot % 64)) != 0
+    }
+
+    #[inline]
+    fn get(&self, slot: usize) -> Option<&EcmaFunction> {
+        // SAFETY: the live bit is set exactly for slots `insert` wrote and
+        // `remove` has not read back.
+        self.is_live(slot)
+            .then(|| unsafe { self.slots[slot].assume_init_ref() })
+    }
+
+    #[inline]
+    fn get_mut(&mut self, slot: usize) -> Option<&mut EcmaFunction> {
+        // SAFETY: as `get`.
+        self.is_live(slot)
+            .then(|| unsafe { self.slots[slot].assume_init_mut() })
+    }
+
+    fn insert(&mut self, slot: usize, data: EcmaFunction) -> Option<EcmaFunction> {
+        if self.is_live(slot) {
+            // SAFETY: a live slot holds an initialized record.
+            let old = unsafe { self.slots[slot].assume_init_mut() };
+            return Some(std::mem::replace(old, data));
+        }
+        self.slots[slot].write(data);
+        self.live[slot / 64] |= 1 << (slot % 64);
+        self.count += 1;
+        None
+    }
+
+    fn remove(&mut self, slot: usize) -> Option<EcmaFunction> {
+        if !self.is_live(slot) {
+            return None;
+        }
+        self.live[slot / 64] &= !(1 << (slot % 64));
+        self.count -= 1;
+        // SAFETY: the bit said initialized; clearing it hands ownership out
+        // and leaves the slot unread until the next `insert` writes it.
+        Some(unsafe { self.slots[slot].assume_init_read() })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &EcmaFunction)> + '_ {
+        (0..FUNCTION_CHUNK_LEN).filter_map(move |slot| self.get(slot).map(|data| (slot, data)))
+    }
+}
+
+impl Drop for FunctionChunk {
+    fn drop(&mut self) {
+        // `MaybeUninit` slots are not dropped for us, and the table's own drop
+        // (an agent teardown) may still hold live records. A chunk released by
+        // `remove` is empty, so this loop usually finds nothing.
+        for slot in 0..FUNCTION_CHUNK_LEN {
+            if self.is_live(slot) {
+                // SAFETY: the bit said initialized and this chunk is going away.
+                unsafe { self.slots[slot].assume_init_drop() };
+            }
+        }
+    }
+}
+
+impl FunctionTable {
+    #[inline]
+    fn split(id: u64) -> (usize, usize) {
+        (
+            (id >> FUNCTION_CHUNK_BITS) as usize,
+            (id & FUNCTION_CHUNK_MASK) as usize,
+        )
+    }
+
+    pub(crate) fn get(&self, id: &u64) -> Option<&EcmaFunction> {
+        let (index, slot) = Self::split(*id);
+        self.chunks.get(index)?.as_deref()?.get(slot)
+    }
+
+    pub(crate) fn get_mut(&mut self, id: &u64) -> Option<&mut EcmaFunction> {
+        let (index, slot) = Self::split(*id);
+        self.chunks.get_mut(index)?.as_mut()?.get_mut(slot)
+    }
+
+    pub(crate) fn insert(&mut self, id: u64, data: EcmaFunction) -> Option<EcmaFunction> {
+        let (index, slot) = Self::split(id);
+        if index >= self.chunks.len() {
+            self.chunks.resize_with(index + 1, || None);
+        }
+        if self.chunks[index].is_none() {
+            let chunk = self
+                .spare
+                .pop()
+                .unwrap_or_else(|| Box::new(FunctionChunk::new()));
+            self.chunks[index] = Some(chunk);
+        }
+        self.chunks[index]
+            .as_mut()
+            .expect("the chunk was just filled")
+            .insert(slot, data)
+    }
+
+    pub(crate) fn remove(&mut self, id: &u64) -> Option<EcmaFunction> {
+        let (index, slot) = Self::split(*id);
+        let chunk = self.chunks.get_mut(index)?.as_mut()?;
+        let removed = chunk.remove(slot);
+        if removed.is_some()
+            && chunk.count == 0
+            && let Some(chunk) = self.chunks[index].take()
+        {
+            // Bounded: a burst of ids that all die between collections must
+            // not pin an unbounded set of 53 KB buffers.
+            if self.spare.len() < 8 {
+                self.spare.push(chunk);
+            }
+        }
+        removed
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, &EcmaFunction)> + '_ {
+        self.chunks.iter().enumerate().flat_map(|(index, chunk)| {
+            let base = (index as u64) << FUNCTION_CHUNK_BITS;
+            chunk.iter().flat_map(move |chunk| {
+                chunk
+                    .iter()
+                    .map(move |(slot, data)| (base + slot as u64, data))
+            })
+        })
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = u64> + '_ {
+        self.iter().map(|(id, _)| id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &EcmaFunction> + '_ {
+        self.iter().map(|(_, data)| data)
+    }
+}
+
+impl Trace for FunctionTable {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        for (_, data) in self.iter() {
+            data.trace(visit);
+        }
+    }
+}
+
+#[cfg(test)]
+mod function_table_tests {
+    use super::*;
+
+    /// A registered record to move between tables (the table owns records, so
+    /// every check below inserts and removes real ones).
+    fn record(agent: &mut crate::Agent) -> EcmaFunction {
+        agent
+            .run_script("(function named() { return 1; })();")
+            .expect("a closure still runs");
+        let id = agent
+            .roots
+            .ecma_functions
+            .borrow()
+            .keys()
+            .next()
+            .expect("the script registers a function");
+        agent
+            .ecma_function(&id)
+            .expect("the record is registered")
+            .clone()
+    }
+
+    #[test]
+    fn an_id_indexes_its_slot_and_a_second_insert_returns_the_old_record() {
+        let mut agent = crate::Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let first = record(&mut agent);
+        let mut table = FunctionTable::default();
+
+        assert!(table.get(&7).is_none(), "an untouched id is absent");
+        assert!(table.insert(7, first).is_none());
+        assert!(table.get(&7).is_some());
+        assert!(table.get(&8).is_none(), "a neighbour is not served");
+
+        let second = record(&mut agent);
+        assert!(
+            table.insert(7, second).is_some(),
+            "a live id returns its old record"
+        );
+        assert!(table.get(&7).is_some());
+
+        assert!(table.remove(&7).is_some(), "a live id removes");
+        assert!(table.get(&7).is_none());
+        assert!(table.remove(&7).is_none(), "a second remove is a no-op");
+    }
+
+    #[test]
+    fn a_chunk_is_released_when_its_last_record_goes() {
+        let mut agent = crate::Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let data = record(&mut agent);
+        let mut table = FunctionTable::default();
+        // Two ids in the same chunk, far from the first chunk the realm used.
+        let base = 1u64 << 24;
+        let other = base + 3;
+        let chunk = (base >> FUNCTION_CHUNK_BITS) as usize;
+
+        table.insert(base, data.clone());
+        table.insert(other, data);
+        assert_eq!(table.chunks.len(), chunk + 1);
+        assert!(table.chunks[chunk].is_some());
+
+        assert!(table.remove(&base).is_some());
+        assert!(
+            table.chunks[chunk].is_some(),
+            "a chunk with a live record stays"
+        );
+        assert!(table.remove(&other).is_some());
+        assert!(
+            table.chunks[chunk].is_none(),
+            "an empty chunk releases its storage"
+        );
+
+        // The directory entry is reusable by a later id in the same range.
+        table.insert(other, record(&mut agent));
+        assert!(table.get(&other).is_some());
+    }
+
+    #[test]
+    fn iteration_visits_live_ids_in_chunk_order() {
+        let mut agent = crate::Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let data = record(&mut agent);
+        let mut table = FunctionTable::default();
+        for id in [5u64, 300, 7000] {
+            table.insert(id, data.clone());
+        }
+        let ids: Vec<u64> = table.keys().collect();
+        assert_eq!(ids, vec![5, 300, 7000]);
+
+        table.remove(&300);
+        let ids: Vec<u64> = table.keys().collect();
+        assert_eq!(ids, vec![5, 7000], "a removed id is not yielded");
+        assert_eq!(table.values().count(), 2);
+    }
+}
+
 /// Record the compiled step IR and the immutable leaf/construct inline
 /// verdicts derived from it (Cut 33): `do_call_fast` and `Step::Construct`
 /// read the cached bools instead of re-walking the ir/flag checks on every
@@ -3814,7 +4109,7 @@ pub(crate) fn construct_this_object(
         // and reads the cell mirrors use `object.id()`), NOT the Function
         // record id — keying on the wrong id would orphan the construct's
         // oracle read from every warm-store front.
-        let object = function.object;
+        let object = function.object_handle();
         let id = object.id();
         let name = prototype_atom();
         let index = (id as usize ^ name as usize) & (crate::ir::MEMBER_CELLS - 1);

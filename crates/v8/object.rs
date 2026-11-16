@@ -833,7 +833,7 @@ impl<'s> LocalHandle<'s, Object> {
 fn object_of(value: &EngineValue) -> Option<Handle<JsObject>> {
     match value.kind() {
         ValueKind::Object(object) => Some(object),
-        ValueKind::Function(function) => Some(function.object),
+        ValueKind::Function(function) => Some(function.object_handle()),
         _ => None,
     }
 }

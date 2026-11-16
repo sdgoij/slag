@@ -63,25 +63,13 @@ pub(crate) fn is_chain_receiver(builder: &mut FunctionBuilder, value: Value) -> 
 }
 
 /// The `JsObject` data pointer behind a chain receiver: an Object value's own
-/// box, or a Function value's object part (a separate box reached through
-/// `Function::object`). Valid only where [`is_chain_receiver`] holds — a
-/// non-receiver's payload is not a box at all.
+/// box, or a Function value's object part. A function's `JsObject` is the
+/// FIRST field of its box payload (`#[repr(C)]`, `Function`), so both are the
+/// payload address itself — the box layout decides this, not a load. Valid
+/// only where [`is_chain_receiver`] holds — a non-receiver's payload is not a
+/// box at all.
 pub(crate) fn chain_object_ptr(builder: &mut FunctionBuilder, value: Value) -> Value {
-    let direct = object_data_ptr(builder, value);
-    // For a Function, `direct` addresses the `Function` payload. The load is
-    // speculative (an Object's box is far larger than this offset, so it stays
-    // in-bounds) and `select` picks the right pointer.
-    let object_part = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        direct,
-        Offset32::new(std::mem::offset_of!(crux::function::Function, object) as i32),
-    );
-    let via_function = builder
-        .ins()
-        .iadd_imm_s(object_part, crux::heap::GCBOX_DATA_OFFSET as i64);
-    let function = is_function(builder, value);
-    builder.ins().select(function, via_function, direct)
+    object_data_ptr(builder, value)
 }
 
 /// The address of the member-value cell for `(object_id, name_imm)`, mirroring

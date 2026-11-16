@@ -1328,7 +1328,7 @@ fn private_object(obj: &Value) -> Option<Handle<crux::object::JsObject>> {
     if let Some(obj) = obj.as_object() {
         Some(obj)
     } else {
-        obj.as_function().map(|f| f.object)
+        obj.as_function().map(|f| f.object_handle())
     }
 }
 
@@ -1419,7 +1419,7 @@ pub fn get_super_base(agent: &Agent) -> Result<Value, JsError> {
     // constructor (a Function); instance members use the class prototype.
     let home_object = match home.kind() {
         ValueKind::Object(obj) => obj,
-        ValueKind::Function(f) => f.object,
+        ValueKind::Function(f) => f.object_handle(),
         _ => return Ok(Value::Undefined),
     };
     Ok(home_object

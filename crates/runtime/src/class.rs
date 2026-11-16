@@ -278,7 +278,7 @@ fn resolve_heritage(agent: &mut Agent, superclass: Option<Value>) -> Result<Heri
                 // A callable prototype (Function.prototype) is still an
                 // ordinary object for prototype purposes.
                 ValueKind::Function(proto) => Ok(Heritage {
-                    proto_parent: Some(proto.object),
+                    proto_parent: Some(proto.object_handle()),
                     super_constructor: Some(superclass),
                 }),
                 ValueKind::Null => Ok(Heritage {
@@ -390,7 +390,7 @@ fn build_class(
     if let Some(super_ctor) = &super_constructor {
         let super_object = match super_ctor.kind() {
             ValueKind::Object(object) => object,
-            ValueKind::Function(function) => function.object,
+            ValueKind::Function(function) => function.object_handle(),
             _ => {
                 return Err(JsError::new(
                     ErrorKind::TypeError,
@@ -1447,7 +1447,7 @@ fn home_object(home: &Value) -> Option<Handle<crux::object::JsObject>> {
     if let Some(obj) = home.as_object() {
         Some(obj)
     } else {
-        home.as_function().map(|f| f.object)
+        home.as_function().map(|f| f.object_handle())
     }
 }
 

@@ -428,7 +428,7 @@ pub fn install(realm: &Handle<Realm>) -> Result<(), JsError> {
         ("imports", "%WebAssembly.Module.imports%", 1),
         ("customSections", "%WebAssembly.Module.customSections%", 2),
     ] {
-        define_method(&module_ctor.object, realm, name, key, length)?;
+        define_method(&module_ctor.object_handle(), realm, name, key, length)?;
     }
 
     // Prototype methods.
