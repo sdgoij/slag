@@ -3427,7 +3427,12 @@ fn render_console_value(
             Some(description) => Ok(format!("Symbol({})", description.to_string_lossy())),
             None => Ok("Symbol()".to_string()),
         },
-        ValueKind::Function(function) => function_display_name(&function),
+        ValueKind::Function(function) => {
+            // The console reads the own `name`, which a deferred function has
+            // not defined yet.
+            crate::function::ensure_function_properties(agent, &function)?;
+            function_display_name(&function)
+        }
         ValueKind::Object(object) => {
             if path.contains(&object.id()) {
                 return Ok("[Circular]".to_string());

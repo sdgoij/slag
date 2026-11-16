@@ -7313,7 +7313,13 @@ impl Vm {
         };
         let receiver = match object.kind() {
             ValueKind::Object(obj) => obj,
-            ValueKind::Function(f) => f.object_handle(),
+            ValueKind::Function(f) => {
+                // A structural store is an observation: a deferred function
+                // defines its boilerplate own properties first, so the new key
+                // lands after them (own-key order is observable).
+                crate::function::ensure_function_properties(agent, &f)?;
+                f.object_handle()
+            }
             _ => return Ok(false),
         };
         if !matches!(receiver.kind, crux::object::ObjectKind::Ordinary) {
@@ -7325,7 +7331,7 @@ impl Vm {
         // otherwise create a w/e/c property instead of updating the fixed
         // spec descriptor in place (the existing check after this then sees
         // the property and falls back to the in-place update path).
-        crate::function::maybe_materialize_prototype_of_object(agent, &receiver, &property_key)?;
+        crate::function::maybe_materialize_deferred_own(agent, &receiver, &property_key)?;
         // An existing property: the in-place update path handles it. For a
         // map-shaped object (the map describes the key) the field state is
         // the authoritative own-property signal — the field is written iff

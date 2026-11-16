@@ -258,6 +258,10 @@ pub type PerIterationChain = CaptureChain<(Vec<crux::AtomId>, usize)>;
 /// registered per function object.
 #[derive(Debug, Clone)]
 pub struct EcmaFunction {
+    /// The creation site's display name. The own `name` property materializes
+    /// from the closure box (`Function::name`), which SetFunctionName updates
+    /// while the boilerplate properties are deferred; this copy is for
+    /// diagnostics and a creation-site identity, not the property value.
     pub name: Option<JsString>,
     /// Cut 64: the site's params, shared across every closure from the same
     /// declaration site (`shared_params`, keyed by the shared body `Rc`)
@@ -1075,6 +1079,12 @@ fn function_name_is_placeholder(function: &Value) -> Result<bool, JsError> {
     let ValueKind::Function(function) = function.kind() else {
         return Ok(false);
     };
+    // A deferred function has no own `name` yet; the pending name is the box's
+    // (`define_function_name` updates it in place), and `""`/absent is the
+    // placeholder.
+    if function.props_pending() {
+        return Ok(function.name.as_ref().is_none_or(|name| name.is_empty()));
+    }
     let own = function
         .object
         .get_own_property_key(&crux::property::PropertyKey::from_utf8("name"))?;
@@ -1089,9 +1099,22 @@ fn function_name_is_placeholder(function: &Value) -> Result<bool, JsError> {
 }
 
 fn define_function_name(function: &Value, name_value: Value) -> Result<(), JsError> {
-    let ValueKind::Function(function) = function.kind() else {
+    let ValueKind::Function(mut function) = function.kind() else {
         return Ok(());
     };
+    if function.props_pending() {
+        // The own `name` is deferred: record the name on the box and let the
+        // materialization write it as the property. The box's `name` is a
+        // traced edge that may hold a rope pointing at young boxes, so an old
+        // box needs the whole-payload barrier.
+        if let Some(text) = name_value.as_string() {
+            crux::heap::write_barrier_box(&*function);
+            function.name = Some(text.as_ref().clone());
+            // The record's copy is what a snapshot re-parses, and it is the
+            // display name a stack trace would name.
+        }
+        return Ok(());
+    }
     function.define_property(
         &JsString::from_utf8("name"),
         &PropertyDescriptor {
@@ -1184,27 +1207,122 @@ pub(crate) fn ensure_function_prototype(
     Ok(())
 }
 
-/// Materialize the pending `prototype` of an ECMAScript function given its
-/// object part (a function's object part carries the `function_self`
-/// back-reference). Returns whether a function was materialized.
-fn ensure_prototype_of_object_part(
+/// Materialize a plain ordinary function's or arrow's deferred boilerplate own
+/// properties: SetFunctionLength + SetFunctionName plus (for a sloppy ordinary
+/// function) AddRestrictedFunctionProperties — the trio `register_function`
+/// used to run for every closure. The values derive from the record (`params`,
+/// strictness and kind flags) and the box (`name`, which SetFunctionName
+/// updates while the properties are still pending), so creation only stores
+/// them. A no-op when nothing is pending.
+pub(crate) fn ensure_function_properties(
     agent: &mut Agent,
-    obj: &crux::object::JsObject,
-) -> Result<bool, JsError> {
-    let Some(function) = obj.function_self.get() else {
-        return Ok(false);
+    function: &Handle<Function>,
+) -> Result<(), JsError> {
+    if !function.props_pending() {
+        return Ok(());
+    }
+    // Copied out in one borrow: the adoption below allocates (the name box,
+    // the empty string's box) and must not run with the record table borrowed.
+    let Some((restricted, params)) = agent.ecma_function(&function.id()).map(|data| {
+        (
+            !data.strict && !data.is_method && !data.is_async && !data.is_generator,
+            data.params.clone(),
+        )
+    }) else {
+        // A function box with no record (a host-made one) has nothing to
+        // materialize from; leave the flag alone rather than guessing.
+        return Ok(());
     };
-    ensure_function_prototype(agent, &function)?;
-    Ok(true)
+    let name = function.name.clone();
+    if !set_function_properties_batched(agent, function, &params, name.as_ref(), restricted) {
+        define_function_boilerplate(function, &params, name.as_ref(), restricted)?;
+    }
+    // The object may have been read before this (the compiled chain probe
+    // re-validates against the receiver's generation), and own properties just
+    // appeared, so the mutation bump is the invalidation those cells need.
+    function.object.bump_generation();
+    function.set_props_pending(false);
+    Ok(())
 }
 
-/// The lazy-`prototype` read barrier for an own-property observation of
-/// `key` on `obj` (the object part of a language value): when the key names
-/// the pending `prototype` property of an ECMAScript function, materialize
-/// it first. A cheap miss — the key compare (String keys only), a
-/// `function_self` read, and the pending-flag check — so it can sit on the
-/// shared property paths. Returns whether anything was materialized.
-pub(crate) fn maybe_materialize_prototype_of_object(
+/// Define the boilerplate own properties structurally: the fallback when the
+/// pre-forked shape cannot be adopted (the object is no longer the fresh empty
+/// shape, e.g. a host defined something on it). Same descriptors the batch
+/// writes: `length`/`name` writable:false enumerable:false configurable:true,
+/// `caller`/`arguments` all false.
+fn define_function_boilerplate(
+    function: &Handle<Function>,
+    params: &[BindingElement],
+    name: Option<&JsString>,
+    restricted: bool,
+) -> Result<(), JsError> {
+    let length = PropertyDescriptor {
+        value: Some(Value::Number(function_length(params) as f64)),
+        writable: Some(false),
+        get: None,
+        set: None,
+        enumerable: Some(false),
+        configurable: Some(true),
+    };
+    let name = PropertyDescriptor {
+        value: Some(Value::String(Handle::new(match name {
+            Some(text) => text.clone(),
+            None => JsString::from_utf8(""),
+        }))),
+        writable: Some(false),
+        get: None,
+        set: None,
+        enumerable: Some(false),
+        configurable: Some(true),
+    };
+    let restricted_property = |value: Value| PropertyDescriptor {
+        value: Some(value),
+        writable: Some(false),
+        get: None,
+        set: None,
+        enumerable: Some(false),
+        configurable: Some(false),
+    };
+    let mut properties = vec![("length", length), ("name", name)];
+    if restricted {
+        properties.push(("caller", restricted_property(Value::Undefined)));
+        properties.push(("arguments", restricted_property(Value::Undefined)));
+    }
+    for (key, descriptor) in properties {
+        let key = PropertyKey::from_utf8(key);
+        if !function.object.define_property_key(&key, &descriptor)? {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Cannot define a function's own properties".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Materialize the deferred boilerplate own properties of a function's object
+/// part before an operation that ADDS an own property to it. The boilerplate
+/// must keep its creation-order position ahead of the new key (own-key order is
+/// observable), and a write of one of those names must not create a fresh
+/// property in place of the pending one. A no-op for anything that is not a
+/// function's object part, and for a function whose properties are defined.
+pub(crate) fn ensure_deferred_before_structural(
+    agent: &mut Agent,
+    obj: &crux::object::JsObject,
+) -> Result<(), JsError> {
+    if let Some(function) = obj.function_self.get() {
+        ensure_function_properties(agent, &function)?;
+    }
+    Ok(())
+}
+
+/// The lazy-own-property barrier for an own-property observation of `key` on
+/// `obj` (the object part of a language value): when the key names a property
+/// the engine keeps deferred — `prototype`, or the boilerplate
+/// `length`/`name`/`caller`/`arguments` — materialize it first. A cheap miss:
+/// the key compare (String keys only) against five interned atoms, then one
+/// `function_self` read. Returns whether anything was materialized.
+pub(crate) fn maybe_materialize_deferred_own(
     agent: &mut Agent,
     obj: &crux::object::JsObject,
     key: &crux::property::PropertyKey,
@@ -1212,44 +1330,62 @@ pub(crate) fn maybe_materialize_prototype_of_object(
     let crux::property::PropertyKey::String(id) = key else {
         return Ok(false);
     };
-    if *id != prototype_atom() {
+    let is_prototype = *id == prototype_atom();
+    if !is_prototype && !function_prop_atoms().contains(id) {
         return Ok(false);
     }
-    ensure_prototype_of_object_part(agent, obj)
+    let Some(function) = obj.function_self.get() else {
+        return Ok(false);
+    };
+    if is_prototype {
+        ensure_function_prototype(agent, &function)?;
+    } else {
+        ensure_function_properties(agent, &function)?;
+    }
+    Ok(true)
 }
 
-/// The lazy-`prototype` read barrier over a language value: like
-/// `maybe_materialize_prototype_of_object`, resolving the function from a
-/// `Value` (a `ValueKind::Function`, or an Object that is a function's
-/// object part).
-pub(crate) fn maybe_materialize_prototype_value(
+/// The keyed barrier over a language value: like
+/// [`maybe_materialize_deferred_own`], resolving the function from a `Value` (a
+/// `ValueKind::Function`, or an Object that is a function's object part).
+pub(crate) fn maybe_materialize_deferred_value(
     agent: &mut Agent,
     value: &Value,
     key: &crux::property::PropertyKey,
 ) -> Result<bool, JsError> {
     match value.kind() {
         ValueKind::Function(function) => {
-            maybe_materialize_prototype_of_object(agent, &function.object, key)
+            maybe_materialize_deferred_own(agent, &function.object, key)
         }
-        ValueKind::Object(obj) => maybe_materialize_prototype_of_object(agent, &obj, key),
+        ValueKind::Object(obj) => maybe_materialize_deferred_own(agent, &obj, key),
         _ => Ok(false),
     }
 }
 
-/// The keyless form of the barrier: materialize any pending function
-/// `prototype` from a language value — the all-own-key enumeration and
-/// integrity-level ops (ownKeys, getOwnPropertyNames, freeze/seal) observe
-/// every own key, so they need it regardless of which key is addressed.
+/// The keyless form of the barrier: materialize every deferred own property of
+/// a function value — the all-own-key enumeration and integrity-level ops
+/// (ownKeys, getOwnPropertyNames, freeze/seal/isFrozen) observe the whole own
+/// key set, so they need it regardless of which key is addressed.
 ///
 /// Host-facing: a host enumerating own keys has to cross the same barrier, and
 /// this is the only way across.
-pub fn materialize_pending_prototype_value(
-    agent: &mut Agent,
-    value: &Value,
-) -> Result<bool, JsError> {
+pub fn materialize_deferred_own_value(agent: &mut Agent, value: &Value) -> Result<bool, JsError> {
     match value.kind() {
-        ValueKind::Function(function) => ensure_prototype_of_object_part(agent, &function.object),
-        ValueKind::Object(obj) => ensure_prototype_of_object_part(agent, &obj),
+        ValueKind::Function(function) => {
+            // The boilerplate comes first: creation order is `length`, `name`,
+            // [`caller`, `arguments`], `prototype`.
+            ensure_function_properties(agent, &function)?;
+            ensure_function_prototype(agent, &function)?;
+            Ok(true)
+        }
+        ValueKind::Object(obj) => {
+            let Some(function) = obj.function_self.get() else {
+                return Ok(false);
+            };
+            ensure_function_properties(agent, &function)?;
+            ensure_function_prototype(agent, &function)?;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -2246,9 +2382,23 @@ fn register_function(
     // (spec 10.2.4: own caller/arguments are created only for ordinary
     // non-method functions).
     let restricted = !strict && !kind.is_method && !kind.is_async && !kind.is_generator;
+    // Plain ordinary functions and arrows DEFER the four boilerplate own
+    // properties: the same set whose MakeConstructor is deferred below, whose
+    // values all derive from the record. The first own-property observation
+    // materializes them (`ensure_function_properties`), so a closure that is
+    // only created, stored and called never pays for them.
+    let deferred = !kind.is_generator && !kind.is_method && !kind.is_async;
     {
         let _phase = phases::enter(phases::PROPS);
-        if !set_function_properties_batched(agent, &function, &params, name.as_ref(), restricted) {
+        if deferred {
+            function.set_props_pending(true);
+        } else if !set_function_properties_batched(
+            agent,
+            &function,
+            &params,
+            name.as_ref(),
+            restricted,
+        ) {
             set_function_properties(&function, &params, name.as_ref())?;
             if restricted {
                 for name in ["caller", "arguments"] {
@@ -4080,6 +4230,22 @@ fn prototype_atom() -> crux::AtomId {
     use std::sync::OnceLock;
     static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
     *ATOM.get_or_init(|| crux::string::intern_utf8("prototype"))
+}
+
+/// The four atoms of the deferred boilerplate own properties, interned once:
+/// the keyed observation barrier compares against them on the function-receiver
+/// property paths.
+fn function_prop_atoms() -> &'static [crux::AtomId; 4] {
+    use std::sync::OnceLock;
+    static ATOMS: OnceLock<[crux::AtomId; 4]> = OnceLock::new();
+    ATOMS.get_or_init(|| {
+        [
+            crux::string::intern_utf8("length"),
+            crux::string::intern_utf8("name"),
+            crux::string::intern_utf8("caller"),
+            crux::string::intern_utf8("arguments"),
+        ]
+    })
 }
 
 /// OrdinaryCreateFromConstructor (spec 10.2.4): the `this` object of a base

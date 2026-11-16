@@ -735,7 +735,11 @@ fn bind(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     let bound = Function::bound_function_create(target, this_arg, bound_args.clone(), proto)?;
 
     // SetFunctionLength (spec steps 4-7): always an own `length`, computed
-    // from the target's when it is a Number.
+    // from the target's when it is a Number. A deferred target has no own
+    // `length` yet, so the HasOwnProperty below would answer false.
+    if let ValueKind::Function(function) = target.kind() {
+        crate::function::ensure_function_properties(agent, &function)?;
+    }
     let mut length = 0.0;
     let has_length = match target.kind() {
         ValueKind::Function(f) => f.has_own_property(&JsString::from_utf8("length"))?,

@@ -542,6 +542,66 @@ closure probe is `scratch/probe/closure_create.js` with the loop bound raised to
 `1000000` — the 100k original is inside the noise (33-48 ms across runs of one
 binary).
 
+**The third item landed (2026-11-16, later): the boilerplate own properties are
+deferred.** A plain ordinary function or arrow is born with no own properties;
+`length`/`name`[/`caller`/`arguments`] materialize on the first own-property
+observation. `Function::props_pending` on the closure box is the state (a
+`Cell<bool>`, read by the property funnels and by the compiled chain probe),
+`ensure_function_properties` is the materializer (the same pre-forked-shape
+adoption the eager path used, with a structural fallback for a non-fresh
+object), and the values derive from the record's `params`/strictness/kind plus
+the box's `name` — which is why SetFunctionName can rename a pending function
+without materializing it (it writes the box and lets the property come later).
+
+What the change owes, and where the sweep found it:
+
+- **Every own-property observation.** The keyed barrier
+  (`maybe_materialize_deferred_own`) is the old `prototype` hook generalized to
+  five atoms; the keyless form (`materialize_deferred_own_value`) covers
+  own-key enumeration and integrity level. A *keyed* get/has on any other key
+  needs nothing: absent boilerplate does not change another key's resolution
+  or its chain walk.
+- **Every structural operation, whatever the key.** A create/define/set that
+  adds an own property must materialize first, or the boilerplate lands after
+  the new key — own-key order is observable. The fast paths that bypassed the
+  funnel were the bug source: `fast_fresh_store`, `put_value`,
+  `Reflect.set`/`Reflect.defineProperty`, `Object.defineProperty`,
+  `Object.assign`'s fresh-destination adoption.
+- **Direct own-property reads.** `Function.prototype.bind`'s
+  `HasOwnProperty(target, "length")` and ShadowRealm's `CopyNameAndLength`
+  read the descriptor without the funnel; the latter was the one fixture the
+  sweep caught (`ShadowRealm/WrappedFunction/length.js`). The console's
+  name render is the same shape.
+- **The compiled chain probe must decline a pending receiver.** A deferred
+  function's map is the empty one, so a map-keyed resolution learned on a
+  `{}`-shaped receiver could have been served for `f.name`; the probe's
+  function edge now loads `props_pending` and falls to the helper. The
+  identity cell is safe by construction (nothing is recorded for a pending
+  function's boilerplate), but materialization also bumps the receiver's
+  generation so no stale cell can survive it.
+- **Snapshots.** The walk holds no mutable agent, so a `Record::Function`
+  carries the deferral plus the pending name instead of synthesizing the
+  properties; the restore materializes from the re-parsed record before
+  `define_properties` and before extensibility is applied.
+
+Measured (same-session interleaved pairs, control built from the parent commit
+through the build cache; `SLAG_CLOSURE_PHASES` for the phase table):
+
+| probe | before | after | delta |
+|---|---:|---:|---:|
+| `props` (cycles/closure) | 297.0 / 223.8 / 182.0 | 41.5 / 39.2 / 41.3 | **−85%** |
+| closure path total (cycles/closure) | 2629.2 / 2684.6 / 2239.5 | 2368.5 / 2210.1 / 2396.9 | −10% (medians) |
+| 1M-closure probe (ms, 9 pairs) | 432.6 / 533.4 / 452.2 / 399.5 / 422.5 / 422.8 / 401.2 / 417.0 | 351.0 / 384.2 / 372.5 / 353.7 / 379.6 / 387.1 / 351.7 / 378.3 | **−12%** min, every pair separated |
+| `head-let` (ms, min of 5) | 453.3 | 440.8 | −2.8% (medians 482.2 → 448.6, −7.0%) |
+| `evaluation-order` (ms, min of 4) | 247.1 | 249.3 | medians 266.8 → 255.7, −4.2% |
+| corpus, sum of per-row minima | 2410.8 | 2360.6 | −2.1% |
+| corpus without the two closure rows | 1643.9 | 1643.0 | −0.1% (noise) |
+
+Accept: `cargo test --workspace` (53/53), clippy `-D warnings`, corpus
+differential exact in jit, jitless and `--gc-stress` and identical to the
+parent build (81/81 rows), `sweep all --accurate` 48,633/48,633 and
+`sweep intl402 --accurate` 3,365/3,365.
+
 **The map-keyed chain arm landed without a layout cut (2026-11-15, later).** The
 plan had scoped a `kind_is_ordinary` mirror plus a properties-length mirror. Only
 the length was needed: the kind discriminator falls out of `props_deferred`

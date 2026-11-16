@@ -4612,7 +4612,13 @@ fn emit_chain_probe(
     builder.seal_block(ptr_fn);
     builder.switch_to_block(ptr_fn);
     let fn_ptr = crate::cells::chain_object_ptr(builder, object);
-    builder.ins().jump(ptr_join, &[fn_ptr.into()]);
+    // A deferred function has no own `length`/`name` yet, so a chain
+    // resolution recorded for it would answer the prototype's (e.g.
+    // `Function.prototype.name`). Decline; the helper materializes first.
+    let ready = crate::cells::function_own_props_ready(builder, fn_ptr);
+    builder
+        .ins()
+        .brif(ready, ptr_join, &[fn_ptr.into()], miss, &[]);
     builder.seal_block(ptr_join);
     builder.switch_to_block(ptr_join);
     let obj_ptr = builder.block_params(ptr_join)[0];

@@ -493,6 +493,13 @@ fn wrapped_function_create(
 fn copy_name_and_length(agent: &mut Agent, target: &Value) -> Result<(f64, String), JsError> {
     let object = crate::context::as_object(target)
         .ok_or_else(|| type_error("wrapped target is not an object"))?;
+    // The HasOwnProperty below reads the descriptor directly, so a deferred
+    // function's boilerplate must materialize first (it owns `length`).
+    crate::function::maybe_materialize_deferred_own(
+        agent,
+        &object,
+        &crux::property::PropertyKey::from_utf8("length"),
+    )?;
     let mut length = 0.0;
     if object
         .get_own_property(&JsString::from_utf8("length"))?

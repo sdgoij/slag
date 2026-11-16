@@ -25,7 +25,7 @@ use crux::value::Value as EngineValue;
 use crux::value::ValueKind;
 use runtime::api;
 use runtime::builtins::keyed::MapIterationKind;
-use slag::objects::{ensure_deferred_namespace_evaluation, materialize_pending_prototype_value};
+use slag::objects::{ensure_deferred_namespace_evaluation, materialize_deferred_own_value};
 
 /// A descriptor that defines a new own data property with every attribute set,
 /// which is `CreateDataProperty` (spec 7.3.5) — every attribute, so nothing a
@@ -897,7 +897,7 @@ fn names_of_objects<'a>(
     for (visited, object) in objects.iter().enumerate() {
         let keys = match realm.with_agent(|agent| {
             if visited == 0 {
-                materialize_pending_prototype_value(agent, value)?;
+                materialize_deferred_own_value(agent, value)?;
             }
             ensure_deferred_namespace_evaluation(agent, object)?;
             object.own_property_keys()

@@ -9,7 +9,7 @@
 
 /// Materialize a function's pending `prototype`, which every own-key
 /// enumeration has to see.
-pub use runtime::function::materialize_pending_prototype_value;
+pub use runtime::function::materialize_deferred_own_value;
 
 /// Evaluate a deferred module namespace, whose `[[OwnPropertyKeys]]` triggers
 /// its module.

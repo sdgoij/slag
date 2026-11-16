@@ -268,6 +268,13 @@ pub struct Function {
     /// record is the promise object's own payload, so a dispatch needs no side
     /// table.
     resolver: Cell<Option<ResolverRecord>>,
+    /// Whether the boilerplate own properties (`length`, `name`, and for a
+    /// sloppy ordinary function `caller`/`arguments`) are still deferred. Set
+    /// by `runtime::function::register_function` for a plain ordinary function
+    /// or arrow; the property funnels materialize them on the first own-property
+    /// observation and the JIT's chain probe declines the receiver while it is
+    /// set. `pub` so the compiled probe can read it by offset.
+    pub props_pending: Cell<bool>,
 }
 
 // The object handle built from a function box reads the payload as a
@@ -400,6 +407,17 @@ impl Function {
         self.environment.set(environment);
     }
 
+    /// Whether the boilerplate own properties are still deferred (see the
+    /// `props_pending` field).
+    pub fn props_pending(&self) -> bool {
+        self.props_pending.get()
+    }
+
+    /// Set or clear the deferral flag (see the `props_pending` field).
+    pub fn set_props_pending(&self, pending: bool) {
+        self.props_pending.set(pending);
+    }
+
     /// Record the closure's [[HomeObject]] as this box's GC edge (see the
     /// field's note). The runtime calls it from `make_method`.
     pub fn set_home_object_edge(&self, home_object: Option<crate::heap::GcAny>) {
@@ -466,6 +484,10 @@ impl Function {
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).environment), Cell::new(None));
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).home_object), Cell::new(None));
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).resolver), Cell::new(None));
+                std::ptr::write(
+                    std::ptr::addr_of_mut!((*ptr).props_pending),
+                    Cell::new(false),
+                );
             }
         });
         Self::link_self_handle(&function);

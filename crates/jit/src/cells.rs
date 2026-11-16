@@ -72,6 +72,27 @@ pub(crate) fn chain_object_ptr(builder: &mut FunctionBuilder, value: Value) -> V
     object_data_ptr(builder, value)
 }
 
+/// Whether a function receiver's own properties are all defined: false while
+/// its boilerplate `length`/`name`[/`caller`/`arguments`] are deferred (`the
+/// Function::props_pending` flag). A chain probe must decline a deferred
+/// function — its own data properties are not part of the chain the probe
+/// recorded, and the helper materializes them before answering.
+///
+/// `function_ptr` is a Function's payload (its object part); call only on the
+/// `is_function` edge.
+pub(crate) fn function_own_props_ready(
+    builder: &mut FunctionBuilder,
+    function_ptr: Value,
+) -> Value {
+    let pending = builder.ins().load(
+        types::I8,
+        MemFlagsData::new(),
+        function_ptr,
+        Offset32::new(std::mem::offset_of!(crux::function::Function, props_pending) as i32),
+    );
+    builder.ins().icmp_imm_u(IntCC::Equal, pending, 0)
+}
+
 /// The address of the member-value cell for `(object_id, name_imm)`, mirroring
 /// `Vm::member_cell_index` (`(id ^ atom) & (MEMBER_CELLS - 1)`).
 pub(crate) fn member_value_cell_addr(

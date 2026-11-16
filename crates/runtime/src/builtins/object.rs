@@ -442,7 +442,7 @@ fn own_keys_of(agent: &mut Agent, value: &Value, want_symbols: bool) -> Result<V
     // name form must materialize it first (the symbol form cannot see
     // it).
     if !want_symbols {
-        crate::function::materialize_pending_prototype_value(agent, value)?;
+        crate::function::materialize_deferred_own_value(agent, value)?;
     }
     let keys = obj.own_property_keys()?;
     let count = keys
@@ -516,7 +516,7 @@ pub fn set_integrity_level(
     // loop must see (freeze/seal set its [[Configurable]] false too) — and
     // it must be materialized BEFORE preventExtensions, which would block
     // the define.
-    crate::function::materialize_pending_prototype_value(agent, value)?;
+    crate::function::materialize_deferred_own_value(agent, value)?;
     // spec steps 1-2: prevent extensions first; a false status returns false.
     if !obj.prevent_extensions()? {
         return Ok(false);
@@ -611,7 +611,7 @@ fn object_define_properties(
     })?;
     // Defining `prototype` on a pending function must materialize it first
     // (the define below would otherwise create a fresh w/e/c property).
-    crate::function::materialize_pending_prototype_value(agent, object)?;
+    crate::function::materialize_deferred_own_value(agent, object)?;
     for key in props_obj.own_property_keys()? {
         let Some(prop) = props_obj.get_own_property_key(&key)? else {
             continue;
@@ -870,7 +870,7 @@ fn prototype_has_own_property(
     // A deferred namespace's [[HasProperty]] triggers its module's
     // evaluation for non-symbol-like keys (import-defer).
     crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-    crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
+    crate::function::maybe_materialize_deferred_own(agent, &obj, &key)?;
     let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
         // [[HasProperty]] reads the descriptor, whose value comes
         // from the live binding: an uninitialized export throws a
@@ -993,7 +993,10 @@ fn object_define_property(agent: &mut Agent, args: &[Value]) -> Result<Value, Js
     // A deferred namespace's [[DefineOwnProperty]] triggers its
     // module's evaluation for non-symbol-like keys (import-defer).
     crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-    crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
+    crate::function::maybe_materialize_deferred_own(agent, &obj, &key)?;
+    // A define ADDS an own property when the key is new, and a deferred
+    // function must place it after its boilerplate.
+    crate::function::ensure_deferred_before_structural(agent, &obj)?;
     let mut desc = crux::property::to_property_descriptor(&arg(args, 2))?;
     // ArraySetLength coerces an object [[Value]] twice (ToUint32 and
     // ToNumber, spec 10.4.2.4 steps 3-4) before the descriptor
@@ -1139,7 +1142,7 @@ pub fn own_property_descriptor(
     // A deferred namespace's [[GetOwnProperty]] triggers for
     // non-symbol-like keys (import-defer).
     crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, key)?;
-    crate::function::maybe_materialize_prototype_of_object(agent, &obj, key)?;
+    crate::function::maybe_materialize_deferred_own(agent, &obj, key)?;
     let Some(prop) = obj.get_own_property_key(key)? else {
         return Ok(Value::Undefined);
     };
@@ -1162,7 +1165,7 @@ fn object_get_own_property_descriptors(
     let object = to_object(agent, &arg(args, 0))?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
-    crate::function::materialize_pending_prototype_value(agent, &arg(args, 0))?;
+    crate::function::materialize_deferred_own_value(agent, &arg(args, 0))?;
     let realm = agent.current_realm()?;
     let result = JsObject::ordinary_object_create(
         realm
@@ -1191,7 +1194,7 @@ fn object_has_own(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
     let key = crate::context::to_property_key(agent, &arg(args, 1))?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
-    crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
+    crate::function::maybe_materialize_deferred_own(agent, &obj, &key)?;
     let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
         // The descriptor reads the live binding: an uninitialized
         // export throws a ReferenceError (spec 9.4.6.4 step 4).
@@ -1457,7 +1460,7 @@ fn define_legacy_accessor(
     }
     // steps 3-4: the descriptor and the property key.
     let key = crate::context::to_property_key(agent, &arg(args, 0))?;
-    crate::function::maybe_materialize_prototype_of_object(agent, &obj, &key)?;
+    crate::function::maybe_materialize_deferred_own(agent, &obj, &key)?;
     let desc = if getter {
         PropertyDescriptor::accessor(Some(accessor), None)
     } else {
@@ -1564,6 +1567,11 @@ fn object_assign(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
             "assign target is not an object".into(),
         )
     })?;
+    // A function target holds its own properties on its object part, so its
+    // deferred boilerplate must be in place before anything is copied onto it
+    // (the fresh-destination fast path below would otherwise adopt the source's
+    // shape in place of it).
+    crate::function::ensure_deferred_before_structural(agent, &target)?;
     for source_value in &args[1..] {
         if matches!(source_value.kind(), ValueKind::Null | ValueKind::Undefined) {
             continue;

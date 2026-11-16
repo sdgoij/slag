@@ -1921,7 +1921,13 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(fn_entry);
         self.builder.seal_block(fn_entry);
         let fn_ptr = crate::cells::chain_object_ptr(&mut self.builder, object);
-        self.builder.ins().jump(gated, &[fn_ptr.into()]);
+        // A deferred function has no own `length`/`name` yet, so a chain
+        // resolution recorded for it would answer the prototype's (e.g.
+        // `Function.prototype.name`). Decline; the helper materializes first.
+        let ready = crate::cells::function_own_props_ready(&mut self.builder, fn_ptr);
+        self.builder
+            .ins()
+            .brif(ready, gated, &[fn_ptr.into()], miss, &[]);
         self.builder.switch_to_block(gated);
         self.builder.seal_block(gated);
         let ptr = self.builder.block_params(gated)[0];

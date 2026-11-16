@@ -2569,7 +2569,7 @@ pub fn has_property_with_deferred_trigger(
         crate::module::ensure_deferred_namespace_evaluation_key(agent, obj, key)?;
         // A function's pending `prototype` is an own property (`'prototype'
         // in f` is true from the moment the function exists).
-        crate::function::maybe_materialize_prototype_of_object(agent, obj, key)?;
+        crate::function::maybe_materialize_deferred_own(agent, obj, key)?;
         if obj.has_own_property_key(key)? {
             return Ok(true);
         }

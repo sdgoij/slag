@@ -529,7 +529,9 @@ enum Record {
     /// is strict, the environment chain it closed over, its [[HomeObject]] when
     /// the grammar is a method, the class an arrow's private names belong to when
     /// the grammar is an arrow, the private names a class declared when the
-    /// grammar is a class, and its object part.
+    /// grammar is a class, its object part, and — when its boilerplate own
+    /// properties (`length`/`name`[/`caller`/`arguments`]) were still deferred —
+    /// the flag plus the pending name those properties are built from.
     Function {
         grammar: Grammar,
         source: Vec<u16>,
@@ -542,6 +544,9 @@ enum Record {
         private_names: Vec<(Vec<u16>, u64)>,
         proto: u32,
         extensible: bool,
+        /// The own-property deferral and the pending name (see the module note).
+        deferred: bool,
+        pending_name: Option<Vec<u16>>,
         properties: Vec<StoredProperty>,
     },
     /// A bind exotic: the target, the bound `this`, and the bound arguments,
@@ -3592,6 +3597,21 @@ fn write_function(
         prototype_serial(realm, &function.object_handle(), serials)?,
     );
     body.push(u8::from(function.object.extensible.get()));
+    // A deferred function has no boilerplate own properties yet, and the walk
+    // holds no mutable agent to materialize them, so the record carries the
+    // deferral and the pending name instead: the restore rebuilds the same
+    // state and the first observation materializes them.
+    let deferred = function.props_pending();
+    body.push(u8::from(deferred));
+    if deferred {
+        match &function.name {
+            Some(name) => {
+                body.push(1);
+                write_units(body, name.as_slice());
+            }
+            None => body.push(0),
+        }
+    }
     write_properties(realm, &function.object_handle(), serials, body)?;
     Ok(())
 }
@@ -4218,6 +4238,12 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
             let source = reader.units().ok_or(DecodeError::Truncated)?;
             let proto = reader.u32().ok_or(DecodeError::Truncated)?;
             let extensible = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let deferred = reader.u8().ok_or(DecodeError::Truncated)? != 0;
+            let pending_name = if deferred && reader.u8().ok_or(DecodeError::Truncated)? != 0 {
+                Some(reader.units().ok_or(DecodeError::Truncated)?)
+            } else {
+                None
+            };
             let properties = read_properties(reader)?;
             Ok(Record::Function {
                 grammar,
@@ -4231,6 +4257,8 @@ fn read_record(reader: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 private_names,
                 proto,
                 extensible,
+                deferred,
+                pending_name,
                 properties,
             })
         }
@@ -5158,6 +5186,8 @@ impl Builder<'_> {
                 private_names,
                 proto,
                 extensible,
+                deferred,
+                pending_name,
                 properties,
             } => {
                 // An environment is carried for the two grammars the restore
@@ -5230,9 +5260,39 @@ impl Builder<'_> {
                 // a function and a copy of it.
                 self.settle_envs()?;
                 let object = function.object_handle();
+                // The own-property deferral is carried as state. A deferred
+                // record defined nothing on the encoder's side and carries no
+                // boilerplate properties, so the restore installs the pending
+                // name and materializes them here — before the record's own
+                // properties and before extensibility, which a materialize
+                // needs still open. A materialized record defines them from its
+                // property list below, so its flag must be cleared or the first
+                // observation would define them a second time.
+                if *deferred {
+                    {
+                        let mut boxed = function;
+                        crux::heap::write_barrier_box(&*boxed);
+                        boxed.name = pending_name
+                            .as_ref()
+                            .map(|units| JsString::from_utf16(units));
+                        boxed.set_props_pending(true);
+                    }
+                    crate::function::ensure_function_properties(self.agent, &function).map_err(
+                        |_| {
+                            DecodeError::UnrebuildableFunction(
+                                "its own properties could not be defined".into(),
+                            )
+                        },
+                    )?;
+                }
                 define_properties(self, object, properties)?;
+                if !*deferred {
+                    function.set_props_pending(false);
+                }
                 // Extensibility last, for the reason `Record::Object` states.
                 object.extensible.set(*extensible);
+                let object = function.object_handle();
+                define_properties(self, object, properties)?;
                 // An own `prototype` in the record means the writing realm had
                 // materialized the deferred one; clearing the flag keeps the
                 // first later observation from making a second over it. With no

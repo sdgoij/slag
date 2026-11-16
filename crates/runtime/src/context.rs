@@ -781,7 +781,7 @@ pub fn get_property_key(
             // function property funnels here when the member cells miss —
             // user `f.prototype`, `instanceof`, species paths, the construct
             // fallback).
-            crate::function::maybe_materialize_prototype_of_object(agent, &f.object, key)?;
+            crate::function::maybe_materialize_deferred_own(agent, &f.object, key)?;
             if let Some(getter) = find_ecma_accessor(agent, &f.object, key, AccessorKind::Get)? {
                 return crate::function::call_callback(agent, &getter, receiver, &[]);
             }
@@ -1021,7 +1021,12 @@ pub fn put_value(agent: &mut Agent, reference: &Reference, value: Value) -> Resu
             // otherwise create a fresh w/e/c property instead of updating the
             // fixed spec descriptor (writable, non-enumerable,
             // non-configurable) in place.
-            crate::function::maybe_materialize_prototype_value(agent, base, key)?;
+            crate::function::maybe_materialize_deferred_value(agent, base, key)?;
+            // A write may CREATE an own property, which a deferred function
+            // must place after its boilerplate (own-key order is observable).
+            if let ValueKind::Function(function) = base.kind() {
+                crate::function::ensure_function_properties(agent, &function)?;
+            }
             let receiver = get_this_value(reference);
             let base = if matches!(base.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
                 *base
@@ -1106,11 +1111,11 @@ pub fn delete_property_or_throw(agent: &mut Agent, reference: &Reference) -> Res
                     // Lazy `prototype`: deleting a pending function's own
                     // `prototype` must see the non-configurable property (so
                     // the delete reports false, not the absent-property true).
-                    crate::function::maybe_materialize_prototype_of_object(agent, &obj, key)?;
+                    crate::function::maybe_materialize_deferred_own(agent, &obj, key)?;
                     obj.delete_key(key)?
                 }
                 ValueKind::Function(f) => {
-                    crate::function::maybe_materialize_prototype_of_object(agent, &f.object, key)?;
+                    crate::function::maybe_materialize_deferred_own(agent, &f.object, key)?;
                     f.object.delete_key(key)?
                 }
                 _ => true,
