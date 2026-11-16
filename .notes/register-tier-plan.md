@@ -454,6 +454,27 @@ its own); **C** makes a register-held heap value sound; **D5** is the one call
 lane left; **F1** is the oracle the read/arith work needs. The B0 probe (§1.3)
 retires most of Phases B and E *as scoped*.
 
+**A0 profiled (2026-11-16).** Current state of the rows that dominate the gap: `head-let` 507.8 ms against node's 76.4 (**431 ms** of the corpus gap), `evaluation-order` 289.5 against 37.9 (252 ms), `completion-values` 179.1 against 100.9 (78 ms). `SLAG_CLOSURE_PHASES=1` on `head-let` (2.1 M closures) reports 2645 units per closure:
+
+| phase | /call | | phase | /call |
+|---|---:|---|---|---:|
+| `function_new` | 534 | | `record` | 77 |
+| `props` | 323 | | `params` | 74 |
+| `register` | 224 | | `source_info` | 68 |
+| `body` | 155 | | `patterns` | 53 |
+| *inside `register_function`, between phases* | ~390 | | `strict` / `context` / `realm` | 43 / 40 / 37 |
+| `compile` | 88 | | `overhead` | 36 |
+
+What the profile **rules out**, so nobody re-derives it: collapsing the four per-site cache lookups (`body` + `params` + `source_info` + `strict` = 340 units, 13%) into one entry saves at most ~3% of the closure path, because each is already a thread-local hash hit and the entry would still hash. `props` is already one shape-fork adoption (`set_function_properties_batched` → `adopt_vector_free_fields`), not four sequential defines; an anonymous closure's `name` is the shared empty string. And the record table is real but second-order: `--gc-stress`, which keeps `ecma_functions` small, moves `register` 340 → 270 and the total 2675 → 2374 (−11%).
+
+Where the win is, in order:
+
+- **`function_new` is two arena allocations** (`Function` box + `JsObject::ordinary_object_create`) plus the environment edge. One allocation — the function's `JsObject` inline in its box, or a dedicated closure allocation — is the single biggest item and is mechanical.
+- **`register` moves a ~200-byte `EcmaFunction` into a `HashMap` per closure.** Function ids are sequential (`NEXT_FUNCTION_ID`), so a slab indexed by id with a free list removes both the hash and the rehash; that is also the gc-stress delta going away.
+- **Lazy `length`/`name`/`caller`/`arguments`** (V8's shape) removes four keys from every closure's map and most of `props`. `prototype_pending` + `ensure_function_prototype` is the existing precedent for "materialize on first observation", so the pattern is established — but it is a semantic change and belongs in its own commit with a full sweep.
+
+The first two are worth maybe 40% of the path (~70 ms on `head-let`); none of the three is reachable by trimming a phase. Benchmark: `head-let` (507.8 ms) plus `scratch/probe/closure_create.js` (per closure ~600 ns, against node's 0.58 ns — node elides the allocation entirely, so parity needs escape analysis, not this arc).
+
 **The map-keyed chain arm landed without a layout cut (2026-11-15, later).** The
 plan had scoped a `kind_is_ordinary` mirror plus a properties-length mirror. Only
 the length was needed: the kind discriminator falls out of `props_deferred`
