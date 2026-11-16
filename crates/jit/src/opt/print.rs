@@ -88,6 +88,13 @@ fn imm_suffix(imm: &Imm) -> String {
             format!(" slot{slot} cursor({},{})", cursor.0, cursor.1)
         }
         Imm::U64(v) => format!(" {v:#x}"),
+        Imm::RegResume { step, op, counter } => {
+            if *counter == u32::MAX {
+                format!(" step{step}:op{op}")
+            } else {
+                format!(" step{step}:op{op} cnt{counter}")
+            }
+        }
     }
 }
 

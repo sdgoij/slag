@@ -382,6 +382,11 @@ pub const SLOT_RUN_KEY_OFFSET: usize = std::mem::offset_of!(crate::ir::SlotRun, 
 pub const SLOT_RUN_CURSOR_OFFSET: usize = std::mem::offset_of!(crate::ir::SlotRun, cursor);
 pub const SLOT_RUN_LEN_OFFSET: usize = std::mem::offset_of!(crate::ir::SlotRun, len);
 pub const VM_IP_OFFSET: usize = std::mem::offset_of!(Vm, ip);
+/// The fused loop's counter (`Vm::loop_counter`, a raw `f64`). A compiled
+/// counter loop keeps it in a register and never writes the field, so a guard
+/// that deopts mid-loop must restore it — the interpreter's
+/// `fast_loop_inc`/`fast_loop_test` read the field, not a frame slot.
+pub const VM_LOOP_COUNTER_OFFSET: usize = std::mem::offset_of!(Vm, loop_counter);
 /// G19: the pending `switch` discriminant (a raw `Value` `u64`) and its
 /// presence flag — the compiled `SwitchDisc`/`SwitchTest` read and write them
 /// in machine code.
@@ -570,6 +575,12 @@ pub struct JitCallContext {
     /// Cut 58: the step index to resume at (0 = a fresh run — the entry
     /// uses the stack parameter's working base).
     pub resume_ip: usize,
+    /// A guard inside a fused register body records the op its program resumes
+    /// at, as `op + 1` (0 = none). `run_jit_body` transfers it to
+    /// `Vm::reg_resume` on a `DISPATCH_DEOPT`; the interpreter's `RunRegBody`
+    /// handler pops the mirrored accumulator and continues from that op. The
+    /// machine code never reads it, and a fresh ctx starts at 0.
+    pub reg_resume: u64,
     /// Cut 58: the working-stack pointer the entry should use on a resume
     /// (the restored region base plus the pushed-resume-value offset).
     pub resume_sp: u64,
@@ -2666,6 +2677,7 @@ fn certified_lane_inline(
         global_bits,
         resume_kind: 0,
         resume_ip: 0,
+        reg_resume: 0,
         resume_sp: 0,
         resume_value: 0,
         gc_ticks: JIT_GC_PROBE_INTERVAL,
@@ -7320,6 +7332,7 @@ pub(crate) fn run_jit_body(
         global_bits: Value::Object(global).bits(),
         resume_kind: 0,
         resume_ip: 0,
+        reg_resume: 0,
         resume_sp: 0,
         resume_value: 0,
         gc_ticks: JIT_GC_PROBE_INTERVAL,
@@ -7379,6 +7392,15 @@ pub(crate) fn run_jit_body(
         // the region to the stack bottom (the suspend shape) would destroy that
         // frame.
         vm.stack.truncate(work_base + depth);
+        // A guard inside a fused register body also named the op its program
+        // resumes at. Hand that to the interpreter: re-entering the step pops
+        // the mirrored accumulator and continues the run from that op rather
+        // than restarting the program (which would re-fire a getter or
+        // re-apply a store).
+        if ctx.reg_resume != 0 {
+            vm.set_reg_resume((ctx.reg_resume - 1) as u32);
+            ctx.reg_resume = 0;
+        }
         JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The speculation this guard carried was wrong for this body. Mark the
         // body and clear its fast pointer so the next consult rebuilds it with
@@ -7607,6 +7629,7 @@ pub(crate) fn run_jit_resume(
         global_bits: Value::Object(global).bits(),
         resume_kind: kind,
         resume_ip: vm.ip,
+        reg_resume: 0,
         resume_sp: (work_ptr as usize + sp_offset * std::mem::size_of::<Value>()) as u64,
         resume_value: resume_value.bits(),
         gc_ticks: JIT_GC_PROBE_INTERVAL,

@@ -4953,7 +4953,10 @@ pub struct Vm {
     /// body's statement-position `counter = expr` (`expr_is_number`) must
     /// be provably Number — so the head's test and increment are plain
     /// float ops, never the Value round-trip.
-    loop_counter: f64,
+    ///
+    /// `pub(crate)` because the JIT exposes its offset (`VM_LOOP_COUNTER_OFFSET`)
+    /// and a compiled guard's deopt path restores it.
+    pub(crate) loop_counter: f64,
     /// Route B: the loop-carried Number slot (see `LeafOp::BinStoreNum`): a
     /// single f64 scratch, seeded by `Step::FastLoopBind` and written back by
     /// `Step::FastLoopStore`. Raw f64 is sound for the same reason
@@ -9112,6 +9115,15 @@ impl Vm {
             self.stack.push(value);
         }
         caller
+    }
+
+    /// Record the op a fused register program resumes at after a compiled guard
+    /// deopted (see `JitCallContext::reg_resume`). The next execution of the
+    /// body's `RunRegBody` pops the mirrored accumulator and continues from `op`
+    /// instead of starting the program at 0 — the shape a call withdrawal
+    /// already leaves behind.
+    pub(crate) fn set_reg_resume(&mut self, op: u32) {
+        self.reg_resume = Some(op);
     }
 
     /// Run one segment of the current body and hand its outcome to the driver:
@@ -15034,6 +15046,7 @@ impl Vm {
             suspend_sp: 0,
             resume_kind: 0,
             resume_ip: 0,
+            reg_resume: 0,
             resume_sp: 0,
             resume_value: 0,
             gc_ticks: crate::jit::JIT_GC_PROBE_INTERVAL,

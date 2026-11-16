@@ -216,6 +216,23 @@ pub enum Imm {
     },
     /// Raw 64 bits (a NaN-boxed `Value` or an identity).
     U64(u64),
+    /// A speculation guard *inside* a fused register body (`Step::RunRegBody`
+    /// or a body's `reg_ops`): the interpreter resumes at the `RunRegBody` step
+    /// `step`, and its register interpreter continues from `op` — the op after
+    /// the one the guard follows (`Vm::reg_resume`, with the accumulator
+    /// popped off the mirrored operand stack). A fused program has no step
+    /// boundary mid-run, so `Imm::Int` cannot express its resume point; this
+    /// carries both halves.
+    ///
+    /// `counter` is the frame slot holding the enclosing fused loop's counter
+    /// (`u32::MAX` = no counter loop), whose value the deopt path copies into
+    /// `Vm::loop_counter`: a compiled counter loop keeps it in a register, and
+    /// the interpreter's back-edge tests that field.
+    RegResume {
+        step: u32,
+        op: u32,
+        counter: u32,
+    },
 }
 
 /// An instruction opcode.

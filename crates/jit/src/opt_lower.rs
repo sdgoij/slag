@@ -29,7 +29,8 @@ use runtime::jit::{
     VM_BODY_CONTEXT_OFFSET, VM_COMPLETION_IS_EMPTY_OFFSET, VM_COMPLETION_OFFSET, VM_CTX_RUN_OFFSET,
     VM_DESTRUCTURE_STACK_LEN_OFFSET, VM_ENV_STACK_LEN_OFFSET, VM_FOR_IN_STACK_LEN_OFFSET,
     VM_FOR_OF_BOUNDARIES_LEN_OFFSET, VM_FOR_OF_STACK_LEN_OFFSET, VM_IP_OFFSET,
-    VM_LEXICAL_ENV_OFFSET, VM_PENDING_LEN_OFFSET, VM_STACK_LEN_OFFSET, VM_TRY_STACK_LEN_OFFSET,
+    VM_LEXICAL_ENV_OFFSET, VM_LOOP_COUNTER_OFFSET, VM_PENDING_LEN_OFFSET, VM_STACK_LEN_OFFSET,
+    VM_TRY_STACK_LEN_OFFSET,
 };
 use syntax::ast::{BinaryOp, UnaryOp, UpdateOp};
 
@@ -716,7 +717,16 @@ fn lower_inst(
                 )?;
                 builder.ins().icmp_imm_u(IntCC::NotEqual, t, 0)
             };
-            emit_guard(builder, abi, truthy, step, &inst.args[1..], values)?;
+            emit_guard(
+                builder,
+                abi,
+                truthy,
+                step,
+                None,
+                None,
+                &inst.args[1..],
+                values,
+            )?;
             builder
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
@@ -728,15 +738,33 @@ fn lower_inst(
         // type the bare arithmetic path (`emit_bare_numeric`) keys on; any
         // other type is a refusal (the per-step path), never a silent guess.
         Op::GuardType => {
-            let Imm::Int(step) = inst.imm else {
-                return Err(Unsupported::Step("opt:guard"));
+            // A step-lifted guard resumes the interpreter at a step; one inside
+            // a fused register body resumes the interpreter at that step and the
+            // body's op within it (`Imm::RegResume`).
+            let (step, reg_op, counter) = match inst.imm {
+                Imm::Int(step) => (step, None, None),
+                Imm::RegResume { step, op, counter } => (
+                    step as i32,
+                    Some(op),
+                    (counter != u32::MAX).then_some(counter),
+                ),
+                _ => return Err(Unsupported::Step("opt:guard")),
             };
             let value = arg!(0);
             let ok = match inst.ty {
                 Type::Number => is_number(builder, value),
                 _ => return Err(Unsupported::Step("opt:guard-type")),
             };
-            emit_guard(builder, abi, ok, step, &inst.args[1..], values)?;
+            emit_guard(
+                builder,
+                abi,
+                ok,
+                step,
+                reg_op,
+                counter,
+                &inst.args[1..],
+                values,
+            )?;
             value
         }
         // A callee guard (I5c-2b): the success path is the callee value
@@ -752,7 +780,7 @@ fn lower_inst(
             let callee = arg!(0);
             let expected = arg!(1);
             let ok = builder.ins().icmp(IntCC::Equal, callee, expected);
-            emit_guard(builder, abi, ok, step, &inst.args[2..], values)?;
+            emit_guard(builder, abi, ok, step, None, None, &inst.args[2..], values)?;
             callee
         }
         // The `for (let ... in/of ...)` per-iteration environment, and the
@@ -5888,11 +5916,14 @@ fn emit_leaf_call(
 /// The `vm.ip` write is skipped when the ctx's `vm` pointer is null, matching
 /// `emit_completion_store` — the scaffold's bare-ctx test harness runs a
 /// guard's deopt with a null `vm`.
+#[allow(clippy::too_many_arguments)]
 fn emit_guard(
     builder: &mut FunctionBuilder,
     abi: &Abi,
     ok: ClifValue,
     step: i32,
+    reg_op: Option<u32>,
+    counter: Option<u32>,
     live: &[ValueId],
     values: &[Option<ClifValue>],
 ) -> Result<(), Unsupported> {
@@ -5943,6 +5974,38 @@ fn emit_guard(
         vm,
         Offset32::new(VM_IP_OFFSET as i32),
     );
+    // A guard inside a fused register body also names the op to resume the
+    // body's program at (`op + 1`, 0 = none). `run_jit_body` transfers it to
+    // `Vm::reg_resume`; the interpreter's `RunRegBody` handler then pops the
+    // mirrored accumulator and continues from that op.
+    if let Some(op) = reg_op {
+        let resume = builder.ins().iconst(types::I64, (op as i64) + 1);
+        builder.ins().store(
+            MemFlagsData::new(),
+            resume,
+            abi.vm,
+            Offset32::new(std::mem::offset_of!(JitCallContext, reg_resume) as i32),
+        );
+    }
+    // A counter loop keeps its induction variable in a register, so the field
+    // the interpreter's `fast_loop_inc`/`fast_loop_test` read was never written
+    // during the run. The value is live at the guard (mem2reg flushed its frame
+    // slot, and the slot is the counter when promotion is off), so copy it into
+    // the field — a counter is a Number, whose `Value` bits are its f64.
+    if let Some(slot) = counter {
+        let count = builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            abi.frame,
+            Offset32::new((slot as i32) * 8),
+        );
+        builder.ins().store(
+            MemFlagsData::new(),
+            count,
+            vm,
+            Offset32::new(VM_LOOP_COUNTER_OFFSET as i32),
+        );
+    }
     builder.ins().jump(ret, &[]);
     builder.seal_block(store);
     builder.switch_to_block(ret);

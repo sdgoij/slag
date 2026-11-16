@@ -309,38 +309,58 @@ Goats reproduced it in `terrainMesh = rl.makeModel(...)`.
   `store_ident_value(..., true)` (the global binding the pre-resolve targeted)
   instead of throwing, in both the interpreter and `store_ident`.
 
-## 37. A `RunRegBody` cannot carry a read guard, so its accumulator stays in memory
-
-The typer's read guard (`Op::GuardType`, T2) is what makes an arithmetic chain
-type-provable: a guarded read is a `Number`, so `Add` over it is a `Number`, so
-`narrow` proves the slot numeric, so `mem2reg` can promote it (`SLAG_MEM2REG=0`
-is the seam; the top-level promotion exists and refuses only heap-possible
-slots — `non_heap_slots` in `opt/pass/mod.rs`). The guard's `Imm::Int` is a
-**step index the interpreter resumes at** when the speculation is wrong.
+## 37. A register body's read guard: sub-step resume, and the two traps
 
 A certified body that lowered entirely to `LeafOp`s is a single
-`Step::RunRegBody`, and the lift lowers its ops through `emit_leaf_op`
-(`LeafOp::GetMemberComputedLocal` → `Op::ElementLoad`) with **no guard** — there
-is no step inside a fused register program to resume at, and resuming at the
-`RunRegBody` step would re-run the whole body (re-firing a getter, re-applying a
-store). So in that lane:
+`Step::RunRegBody`, and its lift lowers the ops through `emit_leaf_op` with no
+typer guard — a guard's resume point is a *step*, and a fused program has none
+mid-run. Without a guard every read is `Type::Unknown`, so `Add` over it is
+Unknown too, so `narrow` cannot prove the slot numeric, so `mem2reg` (which
+exists — `SLAG_MEM2REG=0` is the seam, and its top-level promotion refuses only
+heap-possible slots) leaves the accumulator round-tripping through the frame
+every iteration.
 
-- every read is `Type::Unknown`;
-- `Add`/`Sub`/... over it is Unknown too (a `+` can be a string concat, so this
-  is correct, not conservative-by-accident);
-- the slot holding the result is heap-possible, so `mem2reg` declines it and the
-  accumulator round-trips through the frame every iteration.
+The resume machinery now exists for the **computed element read**
+(`LeafOp::GetMemberComputedLocal`): `Imm::RegResume { step, op, counter }` names
+the `RunRegBody` step plus the op after the read, the lowering writes
+`JitCallContext::reg_resume` (`op + 1`, 0 = none), and `run_jit_body`'s
+`DISPATCH_DEOPT` arm hands it to `Vm::reg_resume`. The interpreter already
+resumed a fused program at an op index for a *call withdrawal*, so the step
+handler's `acc = self.pop()` then `run_leaf_ops(start)` needs no new work.
+Effect: `arrays/index_loop` 14.6 -> 12.2 ms (-16.5%), `opcost/element_read`
+-10.4%, `opcost/array_for_each_js` -4.8%, and `s` becomes a loop-carried
+register (the CLIF's `load v0+16; addsd; store v0+16` becomes `addsd` alone,
+with one flush per guard).
 
-Diagnose it by the census, not the source: `SLAG_TYPER=1 JIT_DUMP_IR=1` prints
-`v15:? = ElementLoad` feeding `v17:? = Add` with `guard 0`, where a step-lifted
-body (`push_pop`'s `.length` read) shows `v19:num = GuardType(...)`. `index_loop`
-pays ~17 cycles/iteration against node's ~4 for exactly this reason, and read-lane
-work barely moves it (the canonical-index gate's two software sequences bought
-3%).
+Four rules, each of which cost a measurement or a bug:
 
-The fix is sub-step resume points: a resumable `(op index, reconstructed operand
-stack)` the guard can name, so a read guard can live inside a register body.
+- **Guard only the computed element read.** Guarding `GetMemberNameLocal`
+  (`.length`) too regressed every call- and member-heavy body that carries a
+  fused run: `control/for_in` +32%, `builtins/json_roundtrip` +19%,
+  `arrays/slice_concat` +3%. The narrow rule is a net win, the wide one is not.
+- **Require an empty spill stack.** A resume re-enters the step and captures
+  `stack_len` AFTER popping the accumulator, so a live `PushAcc` spill would
+  survive the run's closing truncate and leak onto the operand stack.
+- **Restore `Vm::loop_counter`.** This is the trap: a compiled counter loop
+  keeps the induction variable in a register and never writes the field, but the
+  interpreter's `fast_loop_inc`/`fast_loop_test` *test the field*. Without the
+  restore, a mid-loop deopt re-ran 504 phantom iterations (`scratch/probe/
+  reg_guard*.js`: 2004 chars instead of 1500, "x" appended 126 extra times).
+  The guard's pre-branch flush has already stored the counter's frame slot, so
+  the deopt block copies it into `VM_LOOP_COUNTER_OFFSET` — a counter is a
+  Number, whose `Value` bits are its f64.
+- **Decline bodies with a `BinStoreNum` slot.** `loop_num` is the same class of
+  scratch (the interpreter reads the field, compiled code carries a frame slot)
+  and is *not* restored, so such a body keeps the exact unguarded lowering. Two
+  `BinStoreNum` slots in one run would make the restore ambiguous as well.
+
 Note what is NOT needed — a stack map (C2): the promoted slot here is a Number,
-not a GC root. Do not "fix" this by typing `Add` numeric or by promoting
-heap-possible slots: the first miscompiles `"a" + b`, the second unroots a live
-object.
+not a GC root. And do not "fix" the unguarded case by typing `Add` numeric or
+by promoting heap-possible slots: the first miscompiles `"a" + b`, the second
+unroots a live object.
+
+Correctness net: `a_fused_body_read_guard_deopts_and_resumes_the_program` asserts
+value parity *and* a deopt for a loop whose element turns into a string at
+i == 500 — the `calls` counter in the result is what proves the resume position
+(a restart would re-apply the iteration's increments; value parity alone cannot
+tell, since an unguarded lowering computes the same answer).

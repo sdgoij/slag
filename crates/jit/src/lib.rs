@@ -954,6 +954,7 @@ mod tests {
             suspend_sp: 0,
             resume_kind: 0,
             resume_ip: 0,
+            reg_resume: 0,
             resume_sp: 0,
             resume_value: 0,
             gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
@@ -1387,6 +1388,7 @@ mod tests {
             suspend_sp: 0,
             resume_kind: 0,
             resume_ip: 0,
+            reg_resume: 0,
             resume_sp: 0,
             resume_value: 0,
             gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
@@ -1698,6 +1700,7 @@ mod tests {
             suspend_sp: 0,
             resume_kind: 0,
             resume_ip: 0,
+            reg_resume: 0,
             resume_sp: 0,
             resume_value: 0,
             gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
@@ -1794,6 +1797,7 @@ mod tests {
             suspend_sp: 0,
             resume_kind: 0,
             resume_ip: 0,
+            reg_resume: 0,
             resume_sp: 0,
             resume_value: 0,
             gc_ticks: runtime::jit::JIT_GC_PROBE_INTERVAL,
@@ -4229,6 +4233,71 @@ mod tests {
         assert!(
             calls < 2000,
             "the compiled dense pop must not call the helper per element ({calls} calls)"
+        );
+    }
+
+    #[test]
+    fn a_fused_body_read_guard_deopts_and_resumes_the_program() {
+        // A loop body that fuses into one `RunRegBody` (`s += a[i & 3]`): its
+        // element read carries the typer's Number guard, which a fused program
+        // could not have before `Imm::RegResume` (no step boundary exists
+        // mid-run). Making an element a string mid-loop fails that guard, and
+        // the interpreter must resume the program at the op AFTER the read with
+        // the read's value as the accumulator.
+        //
+        // `calls` is what makes the test mean something: a resume at the
+        // program's start would re-apply the iteration's `s` add and `calls`
+        // increment, so the counter in the result proves the resume position.
+        // Value parity alone would not — an unguarded lowering computes the
+        // same answer.
+        let deopts_before =
+            runtime::jit::JIT_DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let source = "var out = [];\n\
+                      function t(v) { out.push(String(v)); }\n\
+                      function helper() { return 1; }\n\
+                      function loop(n) {\n\
+                        var a = [1, 2, 3, 4];\n\
+                        var s = 0;\n\
+                        var calls = 0;\n\
+                        for (var i = 0; i < n; i++) {\n\
+                          s += a[i & 3];\n\
+                          calls += 1;\n\
+                          if (i === 500) { a[i & 3] = 'x'; }\n\
+                        }\n\
+                        helper();\n\
+                        return typeof s === 'string' ? s.length + ':' + calls : s + ':' + calls;\n\
+                      }\n\
+                      t(loop(2000)); t(loop(2000)); out.join(',');";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        extern "C" fn noop_drop(_cache: *mut c_void) {}
+        let mut agent = runtime::Agent::new();
+        agent.initialize_host_defined_realm().expect("realm");
+        let mut cache = JitCache::new(runtime_helpers()).expect("isa");
+        agent.jit_hook = Some(runtime::jit::JitHook {
+            cache: (&mut cache as *mut JitCache) as *mut c_void,
+            lookup: jit_cache_lookup,
+            drop_cache: noop_drop,
+            helpers: &runtime::jit::JIT_SLOW_PATHS,
+        });
+        let value = agent.run_script(source).expect("jit runs");
+        let compiled = cache.compiled_count();
+        agent.jit_hook = None;
+        assert_eq!(
+            value, interp,
+            "a fused body's read guard must resume the program exactly"
+        );
+        assert!(compiled >= 1, "{compiled} bodies");
+        // The counter is process-wide, so a concurrently running test can only
+        // make this pass; the value parity above is the semantic check and this
+        // is the one that would catch the guard silently not being emitted.
+        let deopts = runtime::jit::JIT_DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            deopts > deopts_before,
+            "the fused body's read guard must have deopted ({deopts_before} -> {deopts})"
         );
     }
 

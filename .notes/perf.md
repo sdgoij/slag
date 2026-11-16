@@ -176,7 +176,30 @@ x86-64 has no unsigned conversion, so Cranelift expands each into a software seq
 | `objects/many_objects_read` | 19.44 | 19.35 | -0.5% |
 | `objects/warm_store` | 25.27 | 25.34 | +0.3% (noise; +5.8% on a 9-round draw) |
 
-**The next lever, with its evidence.** `arrays/index_loop` (3M iterations of `s += a[i & 199999]`) is 14.5 ms = 4.8 ns/iteration against node's 1.1 ns (4 cycles = one `fadd` latency). The CLIF shows the accumulator `s` round-tripping through the frame every iteration (`load v0+16; fadd; store v0+16`; the counter `i` is already a block parameter). The cause is *not* missing promotion — `opt/pass/mem2reg.rs` promotes frame slots today (`SLAG_MEM2REG=0` is the seam) — it is that `s`'s store is `Type::Unknown` (`Add` of an element read can be a string concat), which `non_heap_slots` correctly refuses, and the only sound way to type it is the typer's read guard, which the register-body lifter cannot emit: the body is one `Step::RunRegBody`, and a guard needs a *step* to resume the interpreter at. `register-tier-plan.md` §1.4 has the full chain and the fix (sub-step resume points).
+**The next lever, with its evidence.** `arrays/index_loop` (3M iterations of `s += a[i & 199999]`) was 14.5 ms = 4.8 ns/iteration against node's 1.1 ns (4 cycles = one `fadd` latency), with the accumulator round-tripping through the frame every iteration. The cause was *not* missing promotion — `opt/pass/mem2reg.rs` promotes frame slots today — but a missing **resume point**: a fused register body is one `Step::RunRegBody`, a guard needs a step to resume at, and without a guard the element read stays `Type::Unknown`, so `Add` cannot be proven Number and the slot stays heap-possible. Sub-step resume points landed for the computed element read (`register-tier-plan.md` §1.4 has the mechanism and the two traps), and `index_loop` is now 12.2 ms (-16.5%) with `s` a loop-carried register.
+
+### The register body's read guard: sub-step resume (2026-11-16)
+
+The register-tier item the plan had queued as "keep the accumulator in a register" turned out to be a *resume-point* problem, not a promotion one: `mem2reg` already promotes frame slots, but a fused body is one `Step::RunRegBody`, a guard can only resume at a *step*, and without a guard the element read stays `Type::Unknown` (a `+` can be a string concat), so `s` is heap-possible and refused.
+
+`Imm::RegResume { step, op, counter }` closes it for the computed element read. The lowering writes `JitCallContext::reg_resume` (`op + 1`), `run_jit_body`'s deopt arm hands it to `Vm::reg_resume`, and the interpreter's existing call-withdrawal resume pops the mirrored accumulator and continues at that op. Two guards had to be added and one extension refused:
+
+- **Restore `Vm::loop_counter` on the deopt path.** A compiled counter loop keeps `i` in a register and never writes the field; the interpreter's `fast_loop_inc`/`fast_loop_test` *test* the field. Without the restore a mid-loop deopt produced 504 phantom iterations (2004 chars instead of 1500 on `scratch/probe/reg_guard5.js`). The guard's pre-branch flush has already stored the counter's frame slot, so the deopt block copies it into `VM_LOOP_COUNTER_OFFSET`.
+- **Require an empty spill stack** — a resume re-enters the step and captures `stack_len` after popping the accumulator, so a live `PushAcc` would leak onto the operand stack.
+- **Refused:** the same guard on `GetMemberNameLocal` (`.length`). It regressed every call- and member-heavy fused body (`control/for_in` +32%, `builtins/json_roundtrip` +19%, `arrays/slice_concat` +3.0%) while the narrow rule is a net win. Bodies with a `BinStoreNum` slot also keep the unguarded lowering (`loop_num` is the same class of unrestored scratch).
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `arrays/index_loop` | 14.56 | 12.16 | **-16.5%** |
+| `opcost/element_read` | 0.732 | 0.655 | -10.4% |
+| `opcost/array_for_each_js` | 3.934 | 3.746 | -4.8% |
+| `control/for_in` | 9.196 | 8.770 | -4.6% |
+| `arrays/typed_array` | 18.52 | 17.65 | -4.7% |
+| `calls/closure_capture` | 28.89 | 30.07 | +4.1% |
+| `objects/many_objects_read` | 19.48 | 20.11 | +3.2% |
+| `opcost/dyn_key_read`, `opcost/prim_prop` | | | +0.9 / -1.5% |
+
+`arrays/index_loop`'s loop body is now `addsd` on a loop-carried xmm plus one flush per guard, instead of a load-add-store round trip. Correctness net: `a_fused_body_read_guard_deopts_and_resumes_the_program` asserts parity *and* a deopt on a loop whose element turns into a string at i == 500 — the result's `calls` counter is what proves the resume position, since an unguarded lowering computes the same value.
 
 ### The inline pop (2026-11-15, last)
 

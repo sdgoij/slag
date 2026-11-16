@@ -71,9 +71,10 @@ Each of these has a section in the file named; none is guessable from the code.
 - **The primitive-receiver read is a measured non-lever** (`member-reads.md`
   §36): a string's `.length` and a number's `.valueOf` are ~12% of their own
   row, and `opcost/*`'s node column is a folded loop.
-- **A register body cannot carry a read guard** (`opt-tier.md` §37): its lift
-  lowers `LeafOp`s with no resumable step, so its reads stay `Unknown`, its
-  arithmetic stays unproven, and `mem2reg` leaves the accumulator in the frame.
+- **A register body can carry a read guard, but only on element reads**
+  (`opt-tier.md` §37): the resume needs `Imm::RegResume` (a step *and* an op),
+  an empty spill stack, and a restore of `Vm::loop_counter` — the field the
+  interpreter's back-edge tests, which compiled code never writes.
 
 ## 15. Validation
 

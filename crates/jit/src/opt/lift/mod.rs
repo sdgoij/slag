@@ -1671,7 +1671,7 @@ fn emit_step(
             emit_frame_store(builder, block, slot, next);
         }
         Step::RunRegBody { ops } => {
-            emit_reg_body(builder, block, ops, counter, index)?;
+            emit_reg_body(builder, block, ops, counter, index, stack, guard_reads)?;
         }
         // The whole-literal fused creates (I6-0a): the N value expressions are
         // already on the operand stack (in source order), so the lift pops them
@@ -1958,6 +1958,8 @@ fn emit_reg_body(
     ops: &[LeafOp],
     counter: Option<usize>,
     index: usize,
+    stack: &[ValueId],
+    guard_reads: bool,
 ) -> Result<(), Unsupported> {
     let mut acc = builder.emit(
         block,
@@ -1971,10 +1973,65 @@ fn emit_reg_body(
     // the accumulator (`PushAcc`) and pops it back into a binary (`BinAccPop`);
     // the pairs balance inside the body.
     let mut spill: Vec<ValueId> = Vec::new();
-    for op in ops {
-        acc = emit_leaf_op(builder, block, op, acc, counter, &mut spill, index)?;
+    // A `BinStoreNum` body keeps its loop-carried Number slot in the `Vm`
+    // scratch `loop_num`, which a deopt does not restore (the compiled code
+    // carries that slot in the frame instead). Such a body keeps the exact,
+    // unguarded lowering rather than resume with a stale scratch.
+    let uses_num_slot = ops
+        .iter()
+        .any(|op| matches!(op, LeafOp::BinStoreNum { .. }));
+    for (pos, op) in ops.iter().enumerate() {
+        let produced = emit_leaf_op(builder, block, op, acc, counter, &mut spill, index)?;
+        let replaced_read = matches!(op, LeafOp::GetMemberComputedLocal { .. });
+        // Only where the spill stack is empty. A resume re-enters the step with
+        // the mirrored stack and captures `stack_len` AFTER popping the
+        // accumulator, so a live spill would survive the run's closing truncate
+        // and leak onto the operand stack. (Reads that do run with a live spill
+        // keep the exact, unguarded lowering.)
+        acc = if guard_reads && replaced_read && spill.is_empty() && !uses_num_slot {
+            emit_reg_read_guard(builder, block, stack, produced, index, pos, counter)
+        } else {
+            produced
+        };
     }
     Ok(())
+}
+
+/// The typer's read guard for a read *inside* a fused register body: the same
+/// `Number` assertion the step lifter emits after `GetMemberName`/
+/// `GetMemberComputed`, but resuming the interpreter at the `RunRegBody` step
+/// and, inside it, at the op after this read (see `Imm::RegResume`).
+///
+/// The mirrored operand stack is the step's entry stack plus the read's value —
+/// which the interpreter's resume pops back into the accumulator, leaving the
+/// entry stack exactly as the step found it. The caller emits this only with an
+/// empty spill stack, so the resume cannot leak a spilled accumulator past the
+/// run.
+fn emit_reg_read_guard(
+    builder: &mut Builder,
+    block: BlockId,
+    stack: &[ValueId],
+    value: ValueId,
+    step: usize,
+    pos: usize,
+    counter: Option<usize>,
+) -> ValueId {
+    let mut args = Vec::with_capacity(stack.len() + 2);
+    args.push(value);
+    args.extend(stack.iter().copied());
+    args.push(value);
+    builder.emit(
+        block,
+        Op::GuardType,
+        &args,
+        Type::Number,
+        Effects::pure(),
+        Imm::RegResume {
+            step: step as u32,
+            op: (pos + 1) as u32,
+            counter: counter.map_or(u32::MAX, |slot| slot as u32),
+        },
+    )
 }
 
 /// A named member read (`o.name`) as the inline member-value cell probe: a
