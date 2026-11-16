@@ -75,6 +75,14 @@ Each of these has a section in the file named; none is guessable from the code.
   (`opt-tier.md` §37): the resume needs `Imm::RegResume` (a step *and* an op),
   an empty spill stack, and a restore of `Vm::loop_counter` — the field the
   interpreter's back-edge tests, which compiled code never writes.
+- **A `crux` payload layout change must update every fixed-offset load in
+  `crates/jit/src/cells.rs`** (`member-reads.md` §35.2): a function's object part
+  is now its box payload (no field load), and the failure signature for missing
+  this is a release-only segfault while the debug suite is green.
+- **A function receiver's own properties may be deferred**
+  (`member-reads.md` §35.2): the chain probe must decline while
+  `Function::props_pending` is set, or it serves the prototype's `name` for a
+  pending function.
 
 ## 15. Validation
 

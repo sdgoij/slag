@@ -1,6 +1,6 @@
 ---
 name: slag-property-writes
-description: "Load when working on Slag's property-write machinery: put_value (crates/runtime/src/context.rs), the L1a/L1c warm-store cell (Agent::member_write_cells, Vm::warm_store_put/record, JsObject::write_data_property_slot/map_store_field), the JsObject in-place writers (set_key, write_data_property, deferred_field_write), the JIT's compiled member store (set_member_slot, emit_deferred_field_store), or the vector-free (Option-3) store paths. Documents the two in-place store disciplines (bump-on-mutate vs no-bump + refresh the read cell), the store-cell invalidation and pinned-field rules, and the trap that JsObject::property_slot materializes a vector-free object."
+description: "Load when working on Slag's property-write machinery: put_value (crates/runtime/src/context.rs), the L1a/L1c warm-store cell (Agent::member_write_cells, Vm::warm_store_put/record, JsObject::write_data_property_slot/map_store_field), the JsObject in-place writers (set_key, write_data_property, deferred_field_write), the JIT's compiled member store (set_member_slot, emit_deferred_field_store), the vector-free (Option-3) store paths, or a function's deferred boilerplate own properties (length/name/caller/arguments, Function::props_pending, ensure_function_properties). Documents the two in-place store disciplines (bump-on-mutate vs no-bump + refresh the read cell), the store-cell invalidation and pinned-field rules, a function's deferred own-property barrier (the keyed/keyless funnels and the structural-op rule), and the trap that JsObject::property_slot materializes a vector-free object."
 ---
 
 # Slag property-write machinery traps
@@ -207,3 +207,59 @@ a shape-gate hit:
 The step and register stores both route their value-cell HIT (a warmed read,
 where the helper was still charged) through this same path via
 `emit_deferred_inline_store`.
+
+## 5. A function's boilerplate own properties are DEFERRED
+
+A plain ordinary function or arrow is created with **no own properties**: the
+`length`/`name`[/`caller`/`arguments`] trio SetFunctionLength +
+SetFunctionName + AddRestrictedFunctionProperties used to install eagerly now
+materializes on the first own-property observation. State is
+`Function::props_pending` (a `Cell<bool>` on the closure box, so the funnels and
+the compiled probe read it with one load); the materializer is
+`runtime::function::ensure_function_properties`, which reuses the pre-forked
+boilerplate adoption (Cut 67) with a structural fallback for an object that is
+no longer fresh. The values derive from the record (`params`, strictness/kind
+flags) and the box's `name` — `EcmaFunction::name` is a diagnostics copy, not
+the property value.
+
+What a change owes:
+
+- **SetFunctionName does not materialize.** It writes the box's `name` (with
+  `write_barrier_box` for the traced edge) and lets the property come later;
+  `function_name_is_placeholder` reads the box's name for a pending function.
+- **The keyed barrier covers five atoms only.**
+  `maybe_materialize_deferred_own` handles `prototype` plus the four
+  boilerplate keys; a keyed get/has/delete of any *other* key needs nothing,
+  because absent boilerplate changes neither another key's resolution nor its
+  chain walk. The keyless `materialize_deferred_own_value` (own-key
+  enumeration, `freeze`/`seal`/`isFrozen`, `Object.defineProperties`) does the
+  whole set, boilerplate **before** `prototype` because that is creation order.
+- **Every structural operation materializes, whatever the key.** A create,
+  define, or set-that-adds must place the new key AFTER the boilerplate, or
+  own-key order (observable via `Object.getOwnPropertyNames`) breaks. The
+  fast paths that bypass the get/set funnel are the bug surface:
+  `fast_fresh_store` (ir.rs), `put_value` (context.rs), `Reflect.set` /
+  `Reflect.defineProperty`, `Object.defineProperty`, and `Object.assign`'s
+  fresh-destination adoption (`ensure_deferred_before_structural`).
+- **A direct descriptor read must materialize first.** The funnels are the
+  only barrier, so `get_own_property`/`has_own_property` on a function value
+  without one sees no `length`. Known call sites that must stay fixed:
+  `Function.prototype.bind`'s `HasOwnProperty(target, "length")`,
+  ShadowRealm's `CopyNameAndLength` (the fixture the sweep caught:
+  `ShadowRealm/WrappedFunction/length.js`), and the console's name render.
+  Prefer the keyed hook with the key you are about to read.
+- **The compiled chain probe declines a pending function** (the function edge
+  loads `props_pending`; see the `slag-jit` skill §35.2): a pending function's
+  map is the empty one, so a map-keyed resolution learned on a `{}` shape could
+  otherwise answer `f.name`. Materialization bumps the receiver's generation,
+  which is what invalidates an identity cell recorded while it was pending.
+- **Snapshots carry the state.** The walk holds no mutable agent, so
+  `Record::Function` writes the deferral flag plus the pending name instead of
+  synthesizing the properties; the restore materializes from the re-parsed
+  record **before** the serialized properties and before extensibility is
+  applied, and clears the flag for a record that carried its own properties.
+
+Validation for this area: the `Object.getOwnPropertyNames(f)` order after a
+`f.extra = 1` / `Object.defineProperty` (the structural rule), a descriptor
+read before any other observation, and the sweep (`ShadowRealm/WrappedFunction`
+is the area's canary).

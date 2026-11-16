@@ -165,32 +165,41 @@ interleaved (min-of-9) or not at all; and an `opt bail`-free body means the opt
 lane is in play — `SLAG_OPT=0` is how you tell whether the per-step lane has the
 same arm.
 
-### 35.2 Function receivers: the object part, and why the dispatch must branch
+### 35.2 Function receivers: the object part is the payload, and the deferral gate
 
 `f.apply`/`f.call` and every "read a property off a function" site is a chain read
 whose receiver is not an `Object` value: `is_plain_object` rejects `TAG_FUNCTION`,
 so the probe used to decline before touching a cell and the read went to the
 helper (7.0 M calls on `calls/apply_call` alone).
 
-A Function value's payload is a `Function` box, and its own properties and
-`[[Prototype]]` live on `Function::object` — a SEPARATE box. That object part is
-the identity the interpreter records (`Vm::chain_object` maps a function value to
-`&function.object`), so the probe must key on it:
+A Function value's payload is a `Function` box, and since the closure layout cut
+(2026-11-16) `Function::object` is its FIRST `#[repr(C)]` field — there is no
+separate object box. The object part the interpreter records
+(`Vm::chain_object` maps a function value to its own payload) is therefore the
+same address, so both tags feed the probe the one pointer:
 
 ```text
-ptr_of(obj)  = (value & PAYLOAD_MASK) << 4 + GCBOX_DATA_OFFSET
-ptr_of(fn)   = load(ptr_of(obj) + offset_of!(Function, object)) + GCBOX_DATA_OFFSET
+ptr_of(obj) = (value & PAYLOAD_MASK) << 4 + GCBOX_DATA_OFFSET
+ptr_of(fn)  = (value & PAYLOAD_MASK) << 4 + GCBOX_DATA_OFFSET   // the object part
 ```
 
-Both probes gate on the tag and dispatch. The shape of that dispatch matters more
-than it looks:
+`cells::chain_object_ptr` is that expression for both; do not reintroduce a
+`load(ptr + offset_of!(Function, object))`. Before the merge, `Function::object`
+WAS a separate box and the probe loaded it — the merge changed the layout without
+that load, and the failure signature is worth remembering: **a release-only
+segfault (in `head-let`) while every debug test was green**. Any change to a
+`crux` payload's layout must re-read every fixed-offset load in
+`crates/jit/src/cells.rs`.
 
-- **Do not `select` the two pointers.** Computing both and selecting cost
-  `objects/proto_read` **30%**: the function-side load is speculative on every
-  ordinary-object read and touches another cache line. Branch instead, and pass
-  the pointer through the branch as a Cranelift block parameter
-  (`brif(plain, body, &[obj_ptr.into()], fn_gate, &[])`), so the object path's
-  instructions are unchanged — re-measured at +1.0% (noise).
+The dispatch shape still matters, for other reasons:
+
+- **Branch, do not `select`,** when the two edges need different work. Computing
+  both and selecting cost `objects/proto_read` **30%** before the merge, because
+the speculative function-side work touched another cache line on every
+ordinary-object read. Pass the pointer through the branch as a Cranelift block
+parameter (`brif(plain, body, &[obj_ptr.into()], fn_gate, &[])`). Even though
+both edges now compute the same address, the function edge has its own gate (below)
+and the object edge must stay unchanged.
 - **The block holding the join must not reuse the body's own block names.** The
   body already has a block called `gated` (the dense/typed gate); a second
   `gated` for the pointer join shadowed it and Cranelift panicked with
@@ -199,10 +208,20 @@ than it looks:
 - **Both tiers need it.** `calls/apply_call`'s loop lives in the *per-step* lane
   (its `bench` body bails while the callee lifts), and `method_call`/`hof_methods`
   move with it; an opt-only widening measured apply_call -3.5% instead of -37%.
+- **A FUNCTION receiver's own properties may be deferred.** A plain ordinary
+  function or arrow is created without its own `length`/`name`[/`caller`/
+  `arguments`] (`Function::props_pending`, see the `slag-property-writes` skill
+  §5). The own data properties those observations gain are not part of the chain a
+  cell recorded, and its empty map is the shared `{}`-shaped one, so the probe
+  could otherwise serve a resolution learned elsewhere. The function edge loads
+  `props_pending` (`cells::function_own_props_ready`) and falls to the helper,
+  which materializes. Do not drop that gate to save a load+test.
 - **Correctness net:** the cell is validated by the object part's generation, so
   `g.apply = function () { return 9; }` (an own property on that same part) bumps
   it and the read returns the own function —
-  `installed_jit_function_receiver_chain_read_honors_a_shadowing_apply`.
+  `installed_jit_function_receiver_chain_read_honors_a_shadowing_apply`; and
+  materializing the deferred properties bumps the generation too, which is what
+  invalidates a cell recorded while the function was pending.
 
 ## 36. The primitive receiver's read: measured, and not a lever
 
