@@ -299,16 +299,27 @@ pub fn array_create(agent: &Agent, length: f64) -> Result<Handle<JsObject>, JsEr
 
 /// CreateArrayFromList (spec 7.3.15): a fresh `%Array.prototype%`-linked
 /// array holding the values.
+///
+/// The fill is one `array_extend_dense` after an *empty* create, not one
+/// `create_data_property_index` per element: a per-element define pays the
+/// dense store's write barrier, `length` mirror and generation bump each time
+/// (~55 ns per element, `slag-dense-arrays` §9), while the extend takes one
+/// elements borrow, one buffer grow and one length/generation update. Nothing
+/// observes the array between the create and the extend, so the two are the
+/// same array; this is the funnel every array-returning builtin uses
+/// (`Object.keys`/`values`/`entries`, `String.split`, `map`/`filter`,
+/// `Array.from`).
+///
+/// Do not pre-size the create to `values.len()`: `array_extend_dense` appends
+/// at `length`, so a pre-sized array would be padded with holes first.
 pub fn array_from_values(agent: &Agent, values: &[Value]) -> Result<Value, JsError> {
     // GC-2: the caller's `values` slice may live in a native heap buffer the
     // stack scan cannot see (a freshly-built `Vec<Value>`); the array
-    // creation and element definitions below allocate — suppress
-    // `--gc-stress` for the window so the slice cannot be swept.
+    // creation and the extend below allocate — suppress `--gc-stress` for the
+    // window so the slice cannot be swept.
     let _stress = crate::ir::StressSuppress::new();
-    let array = array_create(agent, values.len() as f64)?;
-    for (index, value) in values.iter().enumerate() {
-        array.create_data_property_index(index as u64, *value)?;
-    }
+    let array = array_create(agent, 0.0)?;
+    array.array_extend_dense(values)?;
     Ok(Value::Object(array))
 }
 
@@ -3871,6 +3882,35 @@ mod tests {
 
     fn joined(source: &str) -> String {
         text(&format!("{source}.join(\",\")"))
+    }
+
+    #[test]
+    fn array_from_values_builds_a_dense_array_of_the_same_elements() {
+        // The fill is one `array_extend_dense` after an empty create, so the
+        // result must still be the dense array CreateArrayFromList describes:
+        // the exact length, every element present in order, no holes, and the
+        // `length` mirror in step with the cell (a mirror reader observes it).
+        assert_eq!(joined("Object.keys({ a: 1, b: 2, c: 3 })"), "a,b,c");
+        assert_eq!(number("Object.keys({ a: 1, b: 2 }).length"), 2.0);
+        assert_eq!(number("Object.keys({}).length"), 0.0);
+        assert_eq!(number("Object.keys({ a: 1 }).length"), 1.0);
+        assert_eq!(
+            number(
+                "var o = { a: 1 }; Object.keys(o).length + Object.getOwnPropertyDescriptor(Object.keys(o), 'length').value"
+            ),
+            2.0
+        );
+        assert!(bool(
+            "var o = { a: 1, b: 2 }; Object.keys(o).every(function (k) { return typeof k === 'string'; })"
+        ));
+        // Large results take the same path: 100 keys, all present, in order.
+        assert_eq!(
+            number(
+                "var o = {}; for (var i = 0; i < 100; i++) { o['k' + i] = i; } \
+                    var ks = Object.keys(o); ks.length === 100 && ks[0] === 'k0' && ks[99] === 'k99' ? 1 : 0"
+            ),
+            1.0
+        );
     }
 
     /// Evaluate a script ending in a promise, drain the jobs, and return the

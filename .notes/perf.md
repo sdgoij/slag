@@ -259,6 +259,30 @@ array allocation (`array_create` + two element defines ≈ 230 ns per pair, agai
 a JS `[k, v]` literal's ~150 ns). The corpus row that exercises all three
 (`builtins/object_keys`) reads 83.6 → 70.1 ms in a whole-corpus pass.
 
+**The third cut is the same allocation, one layer down.** `array_from_values`
+(CreateArrayFromList, the funnel every array-returning builtin uses) built its
+array with one `create_data_property_index` per element. That is the dense
+store's *slow* shape: a write barrier, an `elements_mut` borrow with a possible
+buffer grow, a `length` mirror write and a generation bump **per element**
+(~55 ns each), where `JsObject::array_extend_dense` — already the array
+literal's fill (`slag-dense-arrays` §9) — does one borrow, one grow and one
+length/generation update. The create must stay *empty*: `array_extend_dense`
+appends at `length`, so pre-sizing to `values.len()` would pad holes first.
+
+| probe | control | variant | delta |
+|---|---:|---:|---:|
+| `Object.keys` of a 100-key object (4 pairs) | 4.35 | 1.86 | **−57%** |
+| `builtins/object_keys` (9 pairs, minima) | 45.7 | 37.8 | **−17%** (medians −8.6%) |
+
+The 100-key probe is the one that reads the mechanism: the per-element term is a
+*fixed* cost per element, so it is invisible on a 3-element array and dominant on
+a hundred. A 6-element corpus row reads −8 to −17% with 7 of 9 pairs separated;
+`strings/split_join` was inconclusive in this window (its arrays are small and
+the host's spread on that row was ±25%), so it is not claimed either way. The
+whole-corpus total is not quoted for this cut: three passes of the same tree in
+this window read 2211, 2303 and 2429 ms against node's 913, 928 and 935, which is
+host drift, not the change.
+
 Whole corpus, same session, 5 interleaved rounds: **2511.5 → 2211.4 ms** across
 the arc, with node 953.8 → 912.6 — the ratio reads 2.63× at the start and
 **2.42×** at the end. Both engines drift with the host, so take the row-level

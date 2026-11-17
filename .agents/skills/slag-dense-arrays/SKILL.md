@@ -345,6 +345,17 @@ interpreter handler and by the JIT `array_fast(count, sp)` helper.
   `create_data_property_index` per element: one `elements_mut` borrow, one
   buffer grow, one `length`/mirror/generation update. The per-element cost
   collapses to the buffer memcpy, so 6- and 10-element literals cost the same.
+- **The same rule holds for `array_from_values`** (CreateArrayFromList), which
+  every array-returning builtin funnels through (`Object.keys`/`values`/
+  `entries`, `String.split`, `map`/`filter`, `Array.from`, JSON). It also
+  creates *empty* and extends, because `array_extend_dense` appends at
+  `length` — pre-sizing the create to `values.len()` pads that many holes
+  first. A per-element define costs ~55 ns (its own barrier, borrow, mirror
+  write and generation bump), which is invisible on a 3-element result and
+  dominant on a hundred: `Object.keys` of a 100-key object 4.35 → 1.86 ms
+  (−57%). Do not "simplify" either call back to a loop of defines, and do not
+  fuse the empty case (see below) — the difference is per element, not per
+  call.
 - **No write barrier, and that is correct here.** The target is a fresh YOUNG
   array, so it can hold no old->young edge; a young box is traced with the full
   `trace` (never `trace_dirty`), so its `dirty_from = (0,0)` from
