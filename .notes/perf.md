@@ -319,6 +319,53 @@ interleaved pairs).
 Gates: `sweep all` 48,633/48,633, `cargo test --workspace` green, clippy
 `-D warnings` clean.
 
+### Where the rest of the creation cost is: not the record (and the phase instrument cannot say)
+
+`SLAG_CLOSURE_PHASES` reports `function_new` 299, `register` 155, `record` 92
+per closure on the creation row. Those numbers do not reconcile with the wall
+clock: the same row measures 239 ns per closure isolated, while the phase values
+sum to ~430 after subtracting the instrument's own empty-block line (39 ns) — the
+instrument's `callee_total`/`call_register` lines imply a 4–5x inflation. That is
+`slag-object-layout` §5's effect: an `rdtsc` bracket cannot be overlapped by the
+work between brackets, so a small phase reads far above its marginal cost, and
+the empty-block calibration only measures the bracket (it has no work to
+serialize). **Treat no sub-100 ns phase split from this instrument as
+attribution.**
+
+What is solid:
+
+- `size_of::<JsObject>() = 432`, `size_of::<Function>() = 600`. That is ~10x a
+  V8 object header, and it is the one number here that is not a measurement
+  artefact.
+- Isolated `crux` micros, 1 M *live* boxes: a bare 432-byte arena payload 110 ns,
+  `ordinary_object_create` 132–140 ns, `Function::new_with_prototype` 203 ns,
+  `canonical_empty_map`'s cached path 12–18 ns. These are **footprint-inflated**
+  (432–600 MB of first-touch pages); `slag-object-layout` §5 records the
+  recycled steady state as ~14 ns for `ordinary_object_create`, and a nursery
+  sweep on the real row (256 → 262,144) moves nothing, which rules the same
+  footprint effect out there too.
+- So the ~239 ns is a long tail — the box, the `EcmaFunction` literal, the
+  `ecma_functions` insert, four context reads, `canonical_empty_map`, `name`, and
+  the return — with no single item large enough to justify the
+  `Rc<SiteFacts>` refactor that was queued next (the insert writes into an
+  existing hashbrown bucket array; there is no per-entry allocation to remove).
+  **Not taken**, and a real profiler — not this instrument — is the prerequisite
+  for the next attempt.
+
+Isolated real rows (one workload per process) against this session's start and
+against node v24:
+
+| row | before | now | node | gap |
+|---|---:|---:|---:|---:|
+| `for-in/head-let-fresh-binding-per-iteration` | 511.6 | 460.7 | 62.0 | 7.4x |
+| `calls/closure_capture` | 44.3 | 33.9 | 2.36 | 14.4x |
+
+Both rows are call-heavy with stable callees, and node's advantage on them is
+inlining, not allocation: `closure_capture` calls one of 64 closures through an
+array index a million times, which V8 inlines away. The whole-corpus pass
+(`bench.js`, 81 rows in one process per mode) reads mean-jitGap 12.85 overall
+with result parity across all four modes.
+
 ## 2026-11-17: the optimizing tier was not running on the two biggest rows
 
 A helper-call *signature* whose parameter count disagrees with the call is not a

@@ -89,6 +89,23 @@ The payload init's stores overlap the surrounding latency. Judge this area on
 the creation loop (or corpus rows), never on the helper in isolation, and
 prefer changes that remove *stores* over changes that remove delay.
 
+### The instrument trap inside this trap
+
+`SLAG_CLOSURE_PHASES` (the closure-creation phase timers, `.notes/perf.md`
+§2026-11-17) is the same distortion one level up. An `rdtsc` pair cannot be
+overlapped by the work between the two reads, so a sub-100 ns phase reads far
+above its marginal cost, and the instrument's own empty-block calibration does
+not correct for it — an empty block has no work to serialize. On a creation row
+that measures 239 ns wall, the phase lines summed to ~430 ns after subtracting
+the calibration, and its `callee_total` implies a 4–5x inflation. **Do not
+attribute sub-100 ns work with it**; it is useful only for ordering ("the box is
+bigger than the record build"), never for a number.
+
+What *is* solid from that pass: `size_of::<JsObject>() = 432` and
+`size_of::<Function>() = 600` — ~10x a V8 object header — and a micro that keeps
+1 M boxes live reads 110 ns per 432-byte payload purely from first-touch pages,
+so a "box cost" micro is only meaningful with recycling in the loop.
+
 ## 6. Making a length addressable: the `Props` mirror
 
 The compiled member probes need `properties.len() == 0` as a machine test ("this
