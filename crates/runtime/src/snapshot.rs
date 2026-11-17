@@ -6074,6 +6074,7 @@ impl Builder<'_> {
             Vec::new().into(),
             span,
             None,
+            None,
         );
         self.agent.roots.execution_context_stack.pop();
         let value = value.map_err(|error| {
@@ -6187,6 +6188,7 @@ impl Builder<'_> {
             Vec::new().into(),
             Vec::new().into(),
             span,
+            None,
             None,
         );
         self.agent.roots.execution_context_stack.pop();

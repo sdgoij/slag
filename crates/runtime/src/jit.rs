@@ -4178,6 +4178,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain,
         per_iteration_chain,
         span,
+        site,
     }) = step_at(ctx, step)
     else {
         unreachable!("create_arrow on a non-CreateArrow step");
@@ -4194,6 +4195,7 @@ extern "C" fn create_arrow(ctx: *mut c_void, step: u64) -> u64 {
         per_iteration_chain.clone(),
         *span,
         named.clone(),
+        Some(site),
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),

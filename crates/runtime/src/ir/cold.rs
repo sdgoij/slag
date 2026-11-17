@@ -1913,6 +1913,7 @@ impl Vm {
                 outer_chain,
                 per_iteration_chain,
                 span,
+                site,
             } => {
                 let env = agent.running_context()?.lexical_environment;
                 let value = crate::function::instantiate_arrow(
@@ -1926,6 +1927,7 @@ impl Vm {
                     per_iteration_chain.clone(),
                     *span,
                     named.clone(),
+                    Some(site),
                 )?;
                 self.stack.push(value);
             }

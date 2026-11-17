@@ -718,6 +718,9 @@ pub enum Step {
         /// above, so the span that names it is carried here (`CreateFunction`
         /// keeps its whole node and reads the span off that instead).
         span: crux::Span,
+        /// The site's lazily filled creation template; see
+        /// [`Step::CreateFunction`].
+        site: crate::function::SiteCell,
     },
     /// `new.target` (spec 13.3.5.3): the active constructor, or *undefined*
     /// at the script level.
@@ -22097,6 +22100,7 @@ impl Compiler {
                     outer_chain,
                     per_iteration_chain,
                     span: expr.span,
+                    site: Default::default(),
                 });
                 Ok(())
             }

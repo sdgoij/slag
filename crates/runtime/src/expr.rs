@@ -73,6 +73,7 @@ pub fn eval_expr(agent: &mut Agent, expr: &Expr, strict: bool) -> Result<Value, 
                 Vec::new().into(),
                 expr.span,
                 None,
+                None,
             )
         }
         ExprKind::Class(class) => {

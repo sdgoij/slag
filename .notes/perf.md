@@ -304,10 +304,17 @@ lexical-this arrow must never get sloppy `caller`/`arguments`.
 
 Cumulative against the pre-body-site control over both cuts: the per-iteration
 capturing closure 643.9 → 313.4 ms (**−51.3%**), the head-let shape 247.0 →
-158.8 (**−35.7%**), a stable closure −17%, arrow creation −10.7%; the
-untouched stable-leaf row is flat. What remains of the creation row is the
-`ecma_functions` insert (one record per live function), the arena allocation
-and the per-closure context reads.
+158.8 (**−35.7%**), a stable closure −17%; the untouched stable-leaf row is
+flat. What remains of the creation row is the `ecma_functions` insert (one
+record per live function), the arena allocation and the per-closure context
+reads.
+
+Arrows then take the same template (`Step::CreateArrow` carries its own
+`SiteCell`), which is where the rest of their creation cost was: **−34.6%** on a
+1 M-arrow-creation probe and −20.3% on the per-iteration capturing arrow
+against the previous commit (−31.3% / −38.4% against the pre-body-site
+control), while the function-expression rows stay flat (c0 −1.2% at nine
+interleaved pairs).
 
 Gates: `sweep all` 48,633/48,633, `cargo test --workspace` green, clippy
 `-D warnings` clean.

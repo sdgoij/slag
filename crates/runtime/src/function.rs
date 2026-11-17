@@ -2841,31 +2841,58 @@ pub fn instantiate_arrow(
     per_iteration_chain: PerIterationChain,
     span: crux::Span,
     named: Option<JsString>,
+    site: Option<&SiteCell>,
 ) -> Result<Value, JsError> {
     // Cut 43: the site's shared Block — every closure from the same arrow
     // node shares it (and, via `shared_compiled_body` below, one compiled
     // body), so a loop-created arrow does not recompile per iteration. The
     // pointer is captured before the Rc moves into the record.
-    let block = shared_arrow_body(agent, body);
+    //
+    // The site's static facts (the shared block, params and source, the body's
+    // directive strictness and the compiled body) are resolved by the site's
+    // FIRST creation and cached (see `SiteTemplate`); every later arrow from
+    // the same site reads them.
+    let template = site.and_then(|cell| cell.get().cloned());
+    let (block, params, source_info, body_strict) = match template.as_deref() {
+        Some(template) => (
+            std::rc::Rc::clone(&template.body),
+            std::rc::Rc::clone(&template.params),
+            template.source_info.clone(),
+            template.body_strict,
+        ),
+        None => {
+            let block = shared_arrow_body(agent, body);
+            let params = shared_params(&block, params);
+            // `[[SourceText]]` is the text matched by the ArrowFunction
+            // production, which is a complete expression — so it is what
+            // `Function.prototype.toString` answers (the same slot a function or
+            // class carries) and what lets a snapshot rebuild this closure from
+            // its own text rather than its compiled body. Captured at creation,
+            // like a function expression's: `None` when the creation site has no
+            // source text, which keeps the native form. The enclosing text
+            // itself is the record's `parse_text` — the same walk, and the one a
+            // closure created inside this arrow resolves its span against.
+            let site_node = match body {
+                ArrowBody::Expr(expr) => expr.as_ref() as *const Expr as usize,
+                ArrowBody::Block(block) => block as *const Block as usize,
+            };
+            let source_info = shared_source_info(agent, site_node, span);
+            let body_strict = body_is_strict(agent, &block, None);
+            (block, params, source_info, body_strict)
+        }
+    };
+    let template_facts = (site.is_some() && template.is_none()).then(|| {
+        (
+            std::rc::Rc::clone(&block),
+            std::rc::Rc::clone(&params),
+            source_info.clone(),
+        )
+    });
     let body_key = std::rc::Rc::as_ptr(&block) as usize;
     let realm = agent.current_realm()?;
     let private_environment = agent.running_context()?.private_environment;
-    let strict = body_is_strict(agent, &block, None) || enclosing_strict;
+    let strict = body_strict || enclosing_strict;
     let class_field_initializer = agent.field_initializer_depth > 0;
-    let params = shared_params(&block, params);
-    // `[[SourceText]]` is the text matched by the ArrowFunction production, which
-    // is a complete expression — so it is what `Function.prototype.toString`
-    // answers (the same slot a function or class carries) and what lets a
-    // snapshot rebuild this closure from its own text rather than its compiled
-    // body. Captured at creation, like a function expression's: `None` when the
-    // creation site has no source text, which keeps the native form. The
-    // enclosing text itself is the record's `parse_text` — the same walk, and
-    // the one a closure created inside this arrow resolves its span against.
-    let site_node = match body {
-        ArrowBody::Expr(expr) => expr.as_ref() as *const Expr as usize,
-        ArrowBody::Block(block) => block as *const Block as usize,
-    };
-    let source_info = shared_source_info(agent, site_node, span);
     // The arrow's `[[ScriptOrModule]]`, read at creation like every other
     // closure's: an async body's start and a promise reaction's callback run in
     // contexts the engine synthesizes, so the record is where the script or
@@ -2920,10 +2947,24 @@ pub fn instantiate_arrow(
     if !environment.ptr_eq(realm.global_env) {
         function.set_environment_edge(Some(environment.as_any()));
     }
-    let entry = shared_compiled_body(agent, &data, body_key)?;
+    let entry = match template.as_deref() {
+        Some(template) => template.compiled.clone(),
+        None => shared_compiled_body(agent, &data, body_key)?,
+    };
     let this_writes = entry.this_writes;
     function.set_body_site(entry.site_id);
-    data.set_compiled(entry.compiled);
+    data.set_compiled(std::rc::Rc::clone(&entry.compiled));
+    if let (None, Some(cell), Some((body, params, source_info))) =
+        (template.as_deref(), site, template_facts)
+    {
+        cell.fill(SiteTemplate {
+            body,
+            params,
+            source_info,
+            body_strict,
+            compiled: entry.clone(),
+        });
+    }
     agent.register_ecma_function(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
     // An arrow's boilerplate own properties (`length`, `name`) are DEFERRED like
