@@ -98,6 +98,15 @@ held up on this corpus: the same probe read +73% cross-binary and -2.9% here.
 Prefer it whenever the change has a switchable seam; keep the seam afterwards, it
 costs one cached env read per compile.
 
+**The seam must be a `OnceLock`, never `std::env::var` at the hot point.** A
+temporary `if std::env::var("SLAG_SKIP_X").is_ok()` inside `register_function`
+(a per-closure path) made closure creation read 553 ms where the same work
+without it reads 239 ms — a 2.3x artefact of the instrument, which then made the
+"skip" variant look *slower* than the baseline. `std::env::var` takes the
+environment lock and allocates a `String`; at one call per object it dwarfs the
+work being attributed. Cache the answer (`static ON: OnceLock<bool>`, as
+`leaf_trace_on` and `jit_stats_on` do) or the measurement is meaningless.
+
 ## Bound the blast radius before timing anything
 
 A tier change can only move a row whose generated IR differs. Diff it first
