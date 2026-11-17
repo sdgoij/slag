@@ -645,3 +645,38 @@ re-derives them: reusing the probe's certified verdict from `call_slow` (a
 −10% on the capturing probe and flat on `head-let`; and building an
 `Object.entries` pair through `array_from_values` (one dense extend instead of
 two defines) is neutral at 2 elements.
+
+### Measured attempt: the body-site key alone buys nothing
+
+The body-site key was implemented and reverted. What it proved, in order:
+
+- **It works, and the probes go away.** A monotonic site id on the compiled
+  body's cache entry, a `Function::body_site` reloaded by the emitted gate,
+  `LeafCallRecord::body_site` as the key, and the same identity test retained
+  only to choose *which* lane may serve. All 400 `jit` tests pass, and the
+  capturing probe's `LeafCallProbe` count goes **2,100,686 → 1,372**.
+- **It is neutral in time.** The same probe reads 227.7 ms against the control's
+  229.4 at the minima (five interleaved pairs). So the probe was never the cost:
+  what a per-iteration closure call pays is `call_slow`'s *derived* certified
+  lane, which re-does the eligibility scan, the `ecma_functions` facts, the
+  globals walk and the compiled-entry consult on every call.
+- **The epoch has to be bypassed, and that part is sound.** A capturing closure's
+  loop keeps a per-iteration environment open, so `emit_leaf_state_at_rest`
+  (which requires the body's own env only) can never re-stamp the epoch: every
+  call probed. Routing a *stable* record with a stale epoch to the certified
+  lane instead is correct — that lane re-validates per call and does not depend
+  on the probe's at-rest assumptions — and it is what the count above measures.
+- **Caching the descriptor in `call_slow` is the actual win, and it is blocked.**
+  A `cached_certified` that serves the record's descriptor to a sibling closure
+  makes `installed_jit_caught_call_error_in_a_loop_does_not_drift_the_working_sp`
+  and `installed_jit_finally_continue_swallowing_loop_errors_does_not_drift`
+  fail with an escaping `Uncaught exception` — the swallowing-`.ok()` convention
+  in `certified_call` means a lane that throws is retried through the funnel,
+  and that double run is what the drift guards catch. Gating the refresh behind
+  `jit_info > 1` (so it cannot compile) does **not** fix it, so the compile is
+  not the trigger.
+
+So the next attempt starts at the drift interaction, not at the record: find why
+a second run of a throwing callee drifts the working sp (`certified_lane_inline`'s
+error exit vs the caller's resume), then the descriptor cache is available — and
+with it the ~3x this lane has in it (252 ms → ~60 ms on the probe above).
