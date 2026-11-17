@@ -213,6 +213,33 @@ The register-tier item the plan had queued as "keep the accumulator in a registe
 
 Those two contain no `pop` and are pure layout: `ir_diff.py` reports **0 of 81 rows** with different IR, which is the tell for a lowering-only change (the tier's IR is untouched; only the emitted code moves). For that class the helper census is the discriminator, and it is exact here — `ArrayPop` 1.44 M -> **0** with the row's value unchanged.
 
+## 2026-11-17: the optimizing tier was not running on the two biggest rows
+
+A helper-call *signature* whose parameter count disagrees with the call is not a
+refusal. Cranelift's verifier rejects it at assembly, `opt_lower::compile`
+answers `None`, and the body silently drops to the per-step tier while its IR
+dump still looks perfect. Four sites had a signature one parameter too wide
+(`PerIterEnter`/`PerIterNext`, `PerIterLoad`, `PerIterStore`, `StringSub`), so
+every body containing a per-iteration environment failed to assemble — which is
+`head-let` and `evaluation-order`, 47% of the corpus's total gap.
+
+Found with `JIT_DUMP_CLIF=1` (`jit codegen error: … mismatched argument count`
+then `opt assemble failed`), attributed by running one row per process and
+grepping for `codegen error`: exactly 2 of 81 rows, the two largest. `call_helper`
+now debug-asserts `signature.params.len() == args.len() + 1`; that assertion
+immediately caught the fourth site (`Op::StringSub`, which only
+`installed_jit_template_rope_matches_the_interpreter` builds).
+
+| row | control | variant | delta |
+|---|---:|---:|---:|
+| `head-let` (min of 9 interleaved pairs) | 487.1 | 456.2 | **−6.3%** |
+| `evaluation-order` (min of 7) | 249.3 | 241.1 | −3.3% (medians flat) |
+
+`evaluation-order` barely moves, and that is the useful part of the result: its
+body enters the tier now, but its cost is template strings, per-body closure
+creation and calls, none of which the tier lowers differently from the per-step
+path. Being in the tier is a precondition, not a win.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

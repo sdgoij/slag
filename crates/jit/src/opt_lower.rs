@@ -102,6 +102,13 @@ pub fn compile(
 
 /// The entry ABI a lowered op reads: the frame base, the working-region base,
 /// the `JitCallContext` pointer, and the shared helper signatures.
+///
+/// Each helper signature's parameter count must be **one more** than the
+/// explicit argument list the call site passes: the lowered call prepends
+/// `vm`. `call_helper` asserts it, because a signature whose arity disagrees
+/// with the call is rejected by Cranelift's verifier at assembly time, and
+/// `compile` answers that with `None` — the body silently drops back to the
+/// per-step tier, which is a performance cliff rather than an error.
 struct Abi {
     frame: ClifValue,
     /// The working-region base handed to the compiled body (the second
@@ -116,9 +123,6 @@ struct Abi {
     /// The `(vm, callee, this, argc, args, direct_eval)` signature of the
     /// general `call_slow` helper.
     sig_call_slow: SigRef,
-    /// The `(ctx, depth, index, value)` signature of the per-iteration slot
-    /// store helper.
-    sig_per_iter_store: SigRef,
     /// The `(frame, stack, ctx) -> value` signature of a compiled body's entry —
     /// the in-frame leaf lane calls the callee's entry with it directly.
     sig_entry: SigRef,
@@ -173,7 +177,6 @@ fn lower(
         sig_bool: builder.import_signature(helper_sig(&[types::I64; 2], conv)),
         sig_tdz: builder.import_signature(helper_sig(&[types::I64; 1], conv)),
         sig_call_slow: builder.import_signature(helper_sig(&[types::I64; 6], conv)),
-        sig_per_iter_store: builder.import_signature(helper_sig(&[types::I64; 5], conv)),
         sig_entry: builder.import_signature(helper_sig(&[types::I64; 3], conv)),
     };
     let undefined = JsValue::Undefined.bits() as i64;
@@ -797,7 +800,7 @@ fn lower_inst(
             } else {
                 Helper::PerIteration
             };
-            call_helper(builder, helpers, abi, abi.sig_unary, helper, &[step])?;
+            call_helper(builder, helpers, abi, abi.sig_bool, helper, &[step])?;
             builder
                 .ins()
                 .iconst(types::I64, JsValue::Undefined.bits() as i64)
@@ -812,7 +815,7 @@ fn lower_inst(
                 builder,
                 helpers,
                 abi,
-                abi.sig_binary,
+                abi.sig_unary,
                 Helper::LoadPerIter,
                 &[depth, index],
             )?
@@ -828,7 +831,7 @@ fn lower_inst(
                 builder,
                 helpers,
                 abi,
-                abi.sig_per_iter_store,
+                abi.sig_binary,
                 Helper::StorePerIter,
                 &[depth, index, value],
             )?;
@@ -1427,7 +1430,7 @@ fn lower_inst(
                 builder,
                 helpers,
                 abi,
-                abi.sig_unary,
+                abi.sig_bool,
                 Helper::TemplateSub,
                 &[value],
             )?
@@ -5196,6 +5199,14 @@ fn call_helper(
     let mut all = Vec::with_capacity(args.len() + 1);
     all.push(abi.vm);
     all.extend_from_slice(args);
+    debug_assert_eq!(
+        builder.func.dfg.signatures[sig].params.len(),
+        all.len(),
+        "helper {} is called with {} arguments but its signature takes {}",
+        helper.name(),
+        all.len(),
+        builder.func.dfg.signatures[sig].params.len(),
+    );
     let call = builder.ins().call_indirect(sig, callee, &all);
     let result = builder.func.dfg.inst_results(call)[0];
 

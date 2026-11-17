@@ -364,3 +364,39 @@ value parity *and* a deopt for a loop whose element turns into a string at
 i == 500 — the `calls` counter in the result is what proves the resume position
 (a restart would re-apply the iteration's increments; value parity alone cannot
 tell, since an unguarded lowering computes the same answer).
+
+## 38. A helper signature's arity is part of the call, and a mismatch is silent
+
+`call_helper` prepends the `JitCallContext` pointer and calls the helper through
+one of the `Abi`'s shared signatures, so a signature is correct only when its
+parameter count is exactly `args.len() + 1`. Cranelift does not check the
+*signature* against the Rust function; it checks the call against the signature
+at assembly time, and `opt_lower::compile` answers a verifier error with `None`
+— by design, since a codegen failure is a bug rather than a refusal. The
+consequence is the worst kind of silent: the whole body drops back to the
+per-step tier, its IR dump still looks perfect, and nothing fails.
+
+Three calls in the per-iteration environment family (`PerIterEnter`/
+`PerIterNext`, `PerIterLoad`, `PerIterStore`) plus `StringSub` had a signature
+one parameter too wide (`sig_binary` for a two-argument call, and so on). Every
+body containing a per-iteration environment therefore failed to assemble: the
+corpus's two largest rows, `head-let` (‑6% once fixed) and
+`evaluation-order`, plus `installed_jit_template_rope_matches_the_interpreter`,
+which is the only test that would have caught the fourth site.
+
+Rules:
+
+- **Pick the signature by the argument list you pass**, never by the shape of
+the helper's name: `sig_binary` takes four `i64` (ctx + three arguments),
+`sig_unary` three, `sig_bool` two, `sig_tdz` one. A call with two explicit
+arguments belongs on `sig_unary`.
+- **`call_helper` asserts it now** (debug builds): the message names the helper
+and both counts, which is how the fourth site was found. Keep the assertion.
+- **A body whose CLIF you have not looked at may not be running.**
+`JIT_DUMP_CLIF=1` prints `jit codegen error: …` then `opt assemble failed`;
+those two lines are the tell, and `grep -c "codegen error"` over one row per
+process is how to find which rows pay. The dump names the offending
+`call_indirect` with its `sigN`, so count the arguments in the message.
+- **The fix must be measured as a tier change, not a code change**: the row's
+value is unchanged either way, so only the timing (and the disappearance of
+`opt assemble failed`) reports it.

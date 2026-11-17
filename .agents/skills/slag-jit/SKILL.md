@@ -48,6 +48,12 @@ Each of these has a section in the file named; none is guessable from the code.
 
 - **A helper touches four files** (`foundations.md` §1) and its arity slip is
   silent — the runtime reads machine-code argument slots.
+- **A shared helper signature's arity is part of the call** (`opt-tier.md` §38):
+  one parameter too many and Cranelift's verifier rejects the body at assembly,
+  `opt_lower::compile` answers `None`, and the body silently falls to the
+  per-step tier (the two biggest corpus rows were doing exactly that).
+  `call_helper` debug-asserts the count — pick the signature by the argument
+  list, not by the helper's name.
 - **Never add a jump into a sealed block** (`foundations.md` §4): Cranelift panics
   at compile time in `ssa::declare_block_predecessor`, and the *block name* you
   reuse is often the culprit (a duplicate `gated` did exactly that).
