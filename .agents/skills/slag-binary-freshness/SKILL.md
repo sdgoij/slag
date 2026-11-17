@@ -34,13 +34,27 @@ Do not assume `cargo build -p slag` rebuilt the CLI.
 and `wasmtest` (`wasmtest`) and caches the binaries under `target/build-cache`.
 It lives in `crates/xtask`; the flags below are its own.
 
-- The key is the **content of the working tree**, not the commit: `git add -A`
-  on a throwaway index (`target/.build-cache-index`) followed by `git write-tree`,
-  hashed together with the profile, `rustc -vV`, the checkout path, `RUSTFLAGS`,
-  `RUSTC`, `CARGO_BUILD_TARGET`, and the test262 submodule's HEAD plus status
-  hash. On a clean checkout the tree hash equals `git rev-parse HEAD^{tree}`; a
-  tree assembled by `git checkout <rev> -- crates/` gets its own entry, which a
-  commit hash could not do.
+- The key is the content of the **paths the binaries are compiled from**, not
+  the commit and not the whole tree: `git add -A -- <KEY_PATHS>` on a throwaway
+  index (`target/.build-cache-index`) followed by `git write-tree`, hashed with
+  the profile, `rustc -vV`, the checkout path, `RUSTFLAGS`, `RUSTC`,
+  `CARGO_BUILD_TARGET`, and the test262 submodule's HEAD plus status hash.
+  `KEY_PATHS` (`crates/xtask/src/main.rs`) is `crates/` plus the root
+  `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` and `.cargo`.
+  - **A note, skill, doc or probe edit does not change the key** — that is the
+    point: `.notes/`, `.agents/`, `docs/`, `scratch/` and `tools/` are out, so
+    writing up a measurement after it lands does not invalidate the binaries you
+    just built and want as the A/B control.
+  - The tree hash is therefore **not** `HEAD^{tree}`; it is the hash of a
+    partial tree holding only those paths. A tree assembled by
+    `git checkout <rev> -- crates/` still gets its own entry, which a commit
+    hash could not do.
+  - Deliberately still keyed: a crate's own prose and data files, because
+    `crates/` is one entry and crates `include_str!` files beside their sources
+    (`runtime/src/rlx.rs`, the `examples`). Narrowing by extension would trade a
+    rare needless rebuild for a real stale-binary hazard.
+  - `cargo test -p xtask` pins the allowlist to the workspace: a member outside
+    `KEY_PATHS` fails the test rather than silently escaping the key.
 - Output is one line: `build-cache: hit <tree16>/ <profile>, HEAD <sha> clean|dirty`
   or `miss`. A hit copies the stored binaries into `target/<profile>/` in well
   under a second; a miss runs cargo and stores the result.
@@ -86,23 +100,25 @@ So, when abandoning an experiment:
 3. Only then run a gate, and say which tree the binary came from. A green sweep
    from an entry whose tree matches no commit is not evidence about the source.
 
-## Build after the last edit, or the commit tree is never cached
+## Build after the last *source* edit
 
-The cache keys on the working tree, so the build that lands in the cache must
-come **after** the last thing that changes a file — including `cargo fmt` and the
-pre-commit hook's `fmt --all`. A session that builds, then formats, then commits
-leaves the committed tree with no entry at all. Measured over one session: of 10
-builds, 3 matched a commit, 7 matched nothing (5 of those from building before
-the tree was final — a later edit, or the final `cargo fmt` — and 2 from reverted
-experiments), and **2 of the 4 commits had no entry** — the two that would have
-been the controls for the next measurement.
-The cost is the 3-minute rebuild you were trying to avoid, at the worst moment:
-when you are about to A/B against the previous commit.
+The cache keys on the keyed paths, so the build that lands an entry must come
+**after** the last thing that changes one of them — including `cargo fmt` and the
+pre-commit hook's `fmt --all`, which rewrite crate sources. A session that
+builds, then formats, then commits leaves its own commit with no entry. Measured
+over one session, before `KEY_PATHS` existed: of 10 builds, 3 matched a commit
+and 7 matched nothing (5 from building before the tree was final — a later edit
+or the final `cargo fmt` — and 2 from reverted experiments), with **2 of the 4
+commits having no entry at all**: the two a later measurement wanted as controls.
+The cost is exactly the rebuild you were trying to avoid, at the worst moment.
 
 The order that keeps it: edit → `cargo fmt --all` → `cargo run -p xtask -- build`
-→ commit. A docs-only commit is a new tree and so a new (miss) key; it does not
-change the binaries, so build once after the code is final and do not rebuild for
-it.
+→ commit. A commit that touches only notes, skills or docs does **not** change
+the key, so it needs no rebuild; that is why `KEY_PATHS` is an allowlist rather
+than the whole tree.
+
+Conversely, a *legitimate* same-tree rebuild is cheap: a hit copies in well under
+a second, so there is never a reason to skip a rebuild before reporting results.
 
 Conversely, a *legitimate* same-tree rebuild is cheap: a hit copies in well under
 a second, so there is never a reason to skip a rebuild before reporting results.

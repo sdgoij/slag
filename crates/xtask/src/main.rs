@@ -25,6 +25,29 @@ mod quickjs;
 /// The packages this task knows, in the order the key records them.
 const KNOWN_PACKAGES: [&str; 3] = ["cli", "test262", "wasmtest"];
 
+/// The paths whose content the compiled binaries depend on. The cache key is
+/// the tree hash of exactly these, so everything else in the repository
+/// (`.notes/`, `.agents/`, `docs/`, `README.md`, `scratch/`, the test262
+/// fixtures) is out of it.
+///
+/// This exists because keying on the whole tree made every documentation commit
+/// a cache miss: a commit changes `HEAD^{tree}` even when no compiled input
+/// moved, so after finishing a measurement and writing its notes the next
+/// `build` was a full three-minute rebuild — at the moment the previous
+/// commit's binaries were wanted as an A/B control.
+///
+/// A **new workspace member must be added here** or its edits will not
+/// invalidate the cache; `the_key_covers_every_workspace_member` checks that
+/// against `cargo metadata`. A path that does not exist in the checkout is
+/// skipped (a pathspec that matches nothing is a hard error).
+const KEY_PATHS: [&str; 5] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo",
+    "crates",
+];
+
 const USAGE: &str = "\
 usage: cargo run -p xtask -- <task> [options]
 
@@ -49,10 +72,12 @@ options:
   --print-key           print the cache key for the current tree, then exit
   -h, --help            show this help
 
-The key is the hash of the working tree as `git write-tree` would record it,
-plus the profile and toolchain. On a clean checkout it is `HEAD^{tree}`. A dirty
-tree gets its own entry, so checking out single paths during a bisect still hits
-the right binaries.
+The key is the tree hash of the paths the binaries are compiled from
+(`KEY_PATHS`: `crates/` plus the root manifest, lockfile, toolchain and
+`.cargo`), together with the profile and toolchain — not the whole working tree,
+so a documentation commit does not invalidate it. A dirty tree gets its own
+entry, so checking out single paths during a bisect still hits the right
+binaries.
 ";
 
 #[derive(Debug)]
@@ -216,6 +241,7 @@ fn build(arguments: &[String]) -> Result<(), Error> {
         println!("config {configuration}");
         println!("entry {}", entry.display());
         println!("head {head_short} ({state})");
+        println!("paths {}", KEY_PATHS.join(" "));
         return Ok(());
     }
 
@@ -437,34 +463,33 @@ fn compute_key(root: &Path, profile: &str) -> Result<(String, String), Error> {
     let index = root.join("target").join(".build-cache-index");
     fs::create_dir_all(root.join("target"))?;
 
-    // Seed from HEAD so recorded modes survive a host that does not track the
-    // executable bit (core.filemode=false on Windows): `git add -A` on an empty
-    // index would record every file as 644 and a clean tree would never hash to
-    // HEAD^{tree}.
-    if git_text(root, &["rev-parse", "--verify", "HEAD"]).is_some() {
-        let seeded = git_with_index(root, &["read-tree", "HEAD"], &index)?;
-        if !seeded.status.success() {
-            return Err(Error::Step(format!(
-                "cannot seed the cache index from HEAD:\n{}",
-                stderr_of(&seeded)
-            )));
-        }
-    } else {
-        match fs::remove_file(&index) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+    // The index starts EMPTY, so the resulting tree holds exactly the paths
+    // below. Seeding it from HEAD would drag every other path in at its
+    // committed content, which puts the whole repository back in the key: a
+    // documentation commit is a new `HEAD^{tree}` and would miss again.
+    match fs::remove_file(&index) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
-    // `git add` on a throwaway index snapshots the working tree without
-    // disturbing the real index. Untracked files that are not ignored are part of
-    // the key; the submodule is recorded as a gitlink, so its own HEAD is added
-    // explicitly below along with a hash of its status.
-    let added = git_with_index(root, &["add", "-A"], &index)?;
+    // Only the paths that can change a compiled binary. `git add` on a
+    // throwaway index snapshots them without disturbing the real index;
+    // untracked files that are not ignored are part of the key (a new source
+    // file counts), and a tracked file deleted here disappears from the tree.
+    // A pathspec that matches nothing is a hard error, so a path that does not
+    // exist in this checkout is skipped.
+    let mut added = vec!["add", "-A", "--"];
+    added.extend(
+        KEY_PATHS
+            .iter()
+            .copied()
+            .filter(|path| root.join(path).exists()),
+    );
+    let added = git_with_index(root, &added, &index)?;
     if !added.status.success() {
         return Err(Error::Step(format!(
-            "cannot snapshot the working tree:\n{}",
+            "cannot snapshot the source tree:\n{}",
             stderr_of(&added)
         )));
     }
@@ -752,4 +777,107 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     } as u32;
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KEY_PATHS, git_text};
+    use std::path::{Path, PathBuf};
+
+    /// The workspace root from this crate's manifest directory.
+    fn root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crates/xtask has a grandparent")
+            .to_path_buf()
+    }
+
+    /// `KEY_PATHS` is an allowlist, so a workspace member outside it would have
+    /// its edits silently excluded from the cache key — the cache would serve a
+    /// binary built from other sources. Every member lives under `crates/`
+    /// today; this fails the moment one does not, and names the fix.
+    #[test]
+    fn the_key_covers_every_workspace_member() {
+        let root = root();
+        let output = std::process::Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .expect("cargo metadata runs");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        let marker = "\"manifest_path\":\"";
+        let mut seen = 0;
+        let mut outside = Vec::new();
+        for tail in text.split(marker).skip(1) {
+            let raw = tail.split('"').next().unwrap_or_default();
+            // JSON escapes the Windows separator, and the path is absolute.
+            let path = raw.replace("\\\\", "\\");
+            seen += 1;
+            let Ok(relative) = Path::new(&path).strip_prefix(&root) else {
+                outside.push(path.clone());
+                continue;
+            };
+            let ok = KEY_PATHS
+                .iter()
+                .any(|covered| relative.starts_with(covered));
+            if !ok {
+                outside.push(relative.display().to_string());
+            }
+        }
+        assert!(seen >= 3, "expected the workspace's members, saw {seen}");
+        assert!(
+            outside.is_empty(),
+            "workspace members outside KEY_PATHS {KEY_PATHS:?}: {outside:?} — add \
+             their root to KEY_PATHS or the cache will not notice edits to them"
+        );
+    }
+
+    /// A key path that does not exist is skipped at key time, so a typo would
+    /// silently narrow the key. Every declared path must exist here.
+    #[test]
+    fn every_key_path_exists() {
+        let root = root();
+        for path in KEY_PATHS {
+            assert!(
+                root.join(path).exists(),
+                "KEY_PATHS lists {path}, which is not in this checkout"
+            );
+        }
+    }
+
+    /// The key tracks the source tree only: a documentation commit must not
+    /// change it. This is the property the allowlist exists for, asserted
+    /// against the paths themselves rather than by listing them again.
+    ///
+    /// A crate's *own* prose stays keyed, deliberately: `crates/` is one
+    /// allowlist entry, and a crate may `include_str!` a data file next to its
+    /// sources (`runtime` does, `examples` do), so narrowing further by
+    /// extension would trade a rare needless rebuild for a real stale-binary
+    /// hazard. The trees that change constantly are the session's notes, the
+    /// skills and the probes, and those are what this pins.
+    #[test]
+    fn the_key_excludes_the_session_notes_and_scratch() {
+        let root = root();
+        let tracked = git_text(&root, &["ls-files"]).expect("git ls-files runs");
+        let mut leaked = Vec::new();
+        for file in tracked.lines() {
+            let covered = KEY_PATHS.iter().any(|path| file.starts_with(path));
+            let is_outside_source = [".notes/", ".agents/", "docs/", "scratch/", "tools/"]
+                .iter()
+                .any(|tree| file.starts_with(tree));
+            if is_outside_source && covered {
+                leaked.push(file.to_owned());
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "notes/skills/probes under a keyed path would invalidate the cache: {leaked:?}"
+        );
+    }
 }
