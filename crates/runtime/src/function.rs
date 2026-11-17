@@ -138,6 +138,17 @@ impl Trace for ClassField {
 pub(crate) struct CompiledBodyCacheEntry {
     pub compiled: std::rc::Rc<crate::ir::CompiledBody>,
     pub this_writes: (usize, [crux::AtomId; 4]),
+    /// The creation site's id (see `Function::body_site`). Monotonic, never
+    /// reused, unlike the `Rc`'s address.
+    pub site_id: u64,
+}
+
+/// The next compiled-body site id; 0 is the "no site" sentinel.
+static NEXT_BODY_SITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_body_site() -> u64 {
+    let site = NEXT_BODY_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if site == 0 { next_body_site() } else { site }
 }
 
 /// The source texts a function record carries, shared by every closure from the
@@ -2176,6 +2187,7 @@ fn shared_compiled_body(
     let entry = CompiledBodyCacheEntry {
         compiled: std::rc::Rc::new(compiled),
         this_writes,
+        site_id: next_body_site(),
     };
     agent
         .roots
@@ -2306,8 +2318,16 @@ fn register_function(
         leaf_inline: false,
         construct_inline: false,
         outer_chain,
-        // Installed after the shared compile (see below).
-        per_iteration_chain: Vec::new().into(),
+        // The per-iteration head layouts at the creation site. Installed
+        // BEFORE the shared compile below: the chain is a compile-time
+        // constant per body site and `compile_body` resolves captured
+        // per-iteration heads (`CapturedIteration`) through it. Installing it
+        // afterwards compiled the site's body with an empty chain, so a
+        // closure created inside `for (let i ...)` resolved `i` dynamically
+        // (`Step::LoadIdent`, an env walk per read) instead of
+        // `LoadPerIteration` — which also disqualified the body from ever
+        // being a leaf, since `LoadIdent` is not a leaf step.
+        per_iteration_chain,
         named_expression,
         // Plain ordinary functions defer MakeConstructor: the own
         // `prototype` property + prototype object are materialized lazily on
@@ -2352,12 +2372,8 @@ fn register_function(
         shared_compiled_body(agent, &data, body_key)?
     };
     let this_writes = entry.this_writes;
+    function.set_body_site(entry.site_id);
     data.set_compiled(entry.compiled);
-    // The chain is per creation site and is read by the call machinery, not by
-    // the shared compile above (which is keyed by the body, so every closure
-    // from the site compiles once) — install it here rather than in a second
-    // `ecma_functions` probe after the record is registered.
-    data.per_iteration_chain = per_iteration_chain;
     {
         let _phase = phases::enter(phases::REGISTER);
         agent.register_ecma_function(function.id(), data);
@@ -2777,6 +2793,7 @@ pub fn instantiate_arrow(
     }
     let entry = shared_compiled_body(agent, &data, body_key)?;
     let this_writes = entry.this_writes;
+    function.set_body_site(entry.site_id);
     data.set_compiled(entry.compiled);
     let params = data.params.clone();
     agent.register_ecma_function(function.id(), data);

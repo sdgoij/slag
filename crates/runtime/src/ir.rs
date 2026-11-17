@@ -11635,6 +11635,18 @@ impl Vm {
     /// are only set around the iterator steps that run on nested Vms).
     #[inline]
     pub(crate) fn can_inline_leaf(&self) -> bool {
+        self.leaf_stacks_clear() && self.env_stack.len() == 1
+    }
+
+    /// [`can_inline_leaf`](Self::can_inline_leaf) without the environment
+    /// depth. The env leaf lane swaps `body_context`/`lexical_env` for the
+    /// callee's own environment, so a leaf that READS one can be probed and
+    /// called while an enclosing loop keeps a per-iteration environment open
+    /// (the head-let shape: a closure created and called inside `for (let i
+    /// ...)`). A leaf that reads none still needs the body's own environment
+    /// only, because the in-frame lane runs its frame in the caller's buffer.
+    #[inline]
+    pub(crate) fn leaf_stacks_clear(&self) -> bool {
         self.try_stack.is_empty()
             && self.pending.is_empty()
             && self.for_of_stack.is_empty()
@@ -11642,7 +11654,6 @@ impl Vm {
             && self.for_in_stack.is_empty()
             && self.async_for_of_stack.is_empty()
             && self.destructure_stack.is_empty()
-            && self.env_stack.len() == 1
     }
 
     /// The shared leaf-run core (Cut 25): swap the caller's run state for
@@ -17414,6 +17425,13 @@ struct Compiler {
     /// Whether the enclosing function is an async generator: `yield*` then
     /// delegates through the async-iterator protocol with awaited results.
     is_async_generator: bool,
+    /// Whether the enclosing function is resumable (a generator or async). Its
+    /// per-iteration environments are created and restored by the resumable
+    /// driver around each suspension, so a closure created inside one is not
+    /// statically addressable through `per_iteration_chain` — it resolves its
+    /// captured head through the env walk (see
+    /// `closure_per_iteration_chain`).
+    resumable: bool,
     /// The nesting depth of optional chains being compiled: the outermost
     /// chain node clears the runtime short-circuit flag when it finishes.
     chain_depth: usize,
@@ -17709,10 +17727,22 @@ impl Compiler {
     /// this body captures its running env — the capture context when it has
     /// one).
     fn closure_per_iteration_chain(&self) -> crate::function::PerIterationChain {
-        let mut chain =
-            Vec::with_capacity(self.per_iteration_heads.len() + self.per_iteration_chain.len());
+        // A resumable body's per-iteration envs only exist while the body is
+        // suspended mid-loop: the driver creates and restores them around each
+        // `yield`/`await`, so the env a closure captures there is not at the
+        // static hop `per_iteration_chain` would record. Keep those closures on
+        // the dynamic env walk (the pre-Cut-28 behavior) rather than reading a
+        // wrong slot at call time.
+        if self.resumable {
+            return Vec::new().into();
+        }
+        // Depth 0 is the INNERMOST open loop (its per-iteration env is the
+        // closure's own [[Environment]]), matching `per_iteration`'s
+        // `total - 1 - position` for references inside this body.
+        let total = self.per_iteration_heads.len();
+        let mut chain = Vec::with_capacity(total + self.per_iteration_chain.len());
         for (position, heads) in self.per_iteration_heads.iter().enumerate() {
-            chain.push((heads.clone(), position));
+            chain.push((heads.clone(), total - 1 - position));
         }
         let hop = usize::from(
             self.scope
@@ -27679,6 +27709,7 @@ pub fn compile_body(
     let scope = analyze_scope(function);
     let mut compiler = Compiler {
         is_async_generator: function.is_generator && function.is_async,
+        resumable: function.is_generator || function.is_async,
         scope,
         strict: function.strict,
         outer_chain: function.outer_chain.clone(),

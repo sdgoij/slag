@@ -33,7 +33,7 @@ use syntax::ast::{AssignOp, BinaryOp, UnaryOp, UpdateOp};
 
 use crate::agent::Agent;
 use crate::context::ReferenceBase;
-use crate::env::{EnvRecord, EnvRef};
+use crate::env::EnvRecord;
 use crate::ir::{
     Builder, CompiledBody, EnvStack, INTRINSIC_COUNT, INTRINSICS, MEMBER_CELLS, MemberValueCell,
     PropertyKeyName, ScopeInfo, Vm,
@@ -131,16 +131,8 @@ pub struct LeafInlineInfo {
     /// G13: 1 when the leaf reads its environment (context or per-iteration
     /// slots), so the compiled hit path cannot call it in-frame — the
     /// `body_context`/`lexical_env` swap has to span the call. The site takes
-    /// the env lane (`leaf_call_env`) instead.
+    /// the env lane instead.
     pub uses_env: u32,
-    /// G13: the callee's closure environment (the `[[Environment]]` the env
-    /// lane swaps in), or `None` for a leaf that never reads one. Cached here
-    /// so the lane does not re-derive it per call (an `ecma_functions` lookup
-    /// behind a `RefCell` borrow plus two `Rc<CompiledBody>` clones). Sound for
-    /// the same reason the cached entry is: a sweeping collection clears the
-    /// record table and boxes never move, so a box named here cannot be freed
-    /// or recycled while the record is readable.
-    pub environment: Option<EnvRef>,
     /// G13: 1 when the leaf reads a per-iteration binding, so the lane swaps
     /// `lexical_env` as well as `body_context` (`CompiledBody::leaf_needs_env`).
     pub needs_env: u32,
@@ -160,7 +152,6 @@ impl LeafInlineInfo {
             tdz_mask: 0,
             fill_ok: 0,
             uses_env: 0,
-            environment: None,
             needs_env: 0,
         }
     }
@@ -205,6 +196,8 @@ pub struct CertifiedInlineInfo {
     /// rejections); the certified lane must re-check the id, which the lane
     /// already resolves for the `ecma_functions` lookup.
     pub callee_id: u64,
+    /// The callee body's site id at probe time.
+    pub body_site: u64,
 }
 
 impl CertifiedInlineInfo {
@@ -224,6 +217,7 @@ impl CertifiedInlineInfo {
             has_call_apply: 0,
             has_call_intrinsic: 0,
             callee_id: 0,
+            body_site: 0,
         }
     }
 }
@@ -260,6 +254,10 @@ const TDZ_MASK_SLOTS: usize = u64::BITS as usize;
 pub struct LeafCallRecord {
     /// The callee's `bits & PAYLOAD_MASK` (the box address >> 4) at probe time.
     pub callee_payload: u64,
+    /// The callee's compiled-body site id. The record's KEY: a hit means the
+    /// live callee's BODY is the one described here. The identity fields above
+    /// gate the lanes that may use per-closure facts.
+    pub body_site: u64,
     /// The probe's verdict (see `LeafInlineInfo`).
     pub leaf_inline: LeafInlineInfo,
     /// C1: the probe's certified-callee verdict (see `CertifiedInlineInfo`),
@@ -280,6 +278,7 @@ impl LeafCallRecord {
     pub const fn empty() -> Self {
         Self {
             callee_payload: 0,
+            body_site: u64::MAX,
             leaf_inline: LeafInlineInfo::empty(),
             certified: CertifiedInlineInfo::empty(),
             epoch: 0,
@@ -315,8 +314,16 @@ const _: () = assert!(LEAF_CALL_RECORDS == 1 << (u64::BITS - LEAF_CALL_RECORD_SH
 /// a divergence is SILENT (the verdict is written to one slot and read from
 /// another, so the site simply never inlines).
 #[inline]
-pub fn leaf_record_slot(callee: u64) -> usize {
-    (callee.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> LEAF_CALL_RECORD_SHIFT) as usize
+pub fn leaf_record_slot(site: u64) -> usize {
+    (site.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> LEAF_CALL_RECORD_SHIFT) as usize
+}
+
+/// The body site of a callee value: 0 for anything that is not a function box.
+pub fn callee_body_site(callee: u64) -> u64 {
+    match Value::from_bits(callee).kind() {
+        ValueKind::Function(function) => function.body_site(),
+        _ => 0,
+    }
 }
 
 /// M10: the compiled `Step::CallApply` fast path inlines a dense
@@ -2121,12 +2128,42 @@ extern "C" fn call_slow(
     // code runs directly, with a nested frame carved from `vm.stack`, instead
     // of the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
     // falls through to that funnel, which ports the callee and promotes it.
-    if direct_eval == 0
-        && let Some(result) = certified_lane_inline(ctx, callee, this, args, argc, None, false)
-            .ok()
-            .flatten()
-    {
-        return result;
+    if direct_eval == 0 {
+        // Serving the record's cached verdict is only sound with every Vm
+        // stack clear: a nested run's pending error is attributed through the
+        // CALLER's try/boundary stacks, so with a `try` open a throwing callee
+        // ran this way let its exception escape the caller's `catch` (test262
+        // `super-must-be-called.js`). The compiled site gates its own
+        // certified route the same way (`emit_leaf_cert_ready`); with a stack
+        // open, derive the verdict instead.
+        let cached = if unsafe { &*ctx.vm }.leaf_stacks_clear() {
+            record_certified(ctx, callee)
+        } else {
+            None
+        };
+        let (info, same) = match cached {
+            Some((info, same)) => (Some(info), same),
+            None => (None, true),
+        };
+        let outcome =
+            certified_lane_inline(ctx, callee, this, args, argc, info.as_ref(), same, false);
+        if std::env::var("SLAG_SLOW_TRACE").is_ok() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 14 {
+                eprintln!(
+                    "slow: cached={} served={} err={}",
+                    info.is_some(),
+                    matches!(&outcome, Ok(Some(_))),
+                    outcome.is_err()
+                );
+            }
+        }
+        match outcome {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(error) => return slow_error(ctx, error),
+        }
     }
     // A registered builtin runs its handler directly on the JIT's argument
     // buffer: the `vm.stack` round trip (push `this`/callee/args, the funnel,
@@ -2342,6 +2379,7 @@ fn self_call_inline(ctx: &mut JitCallContext, args: *mut u64, argc: u64) -> Opti
 /// eligible, already-compiled certified body (the caller then takes the
 /// interpreter path, which ports and promotes it); `Err` only from
 /// `construct_this_object`'s prototype read.
+#[allow(clippy::too_many_arguments)]
 fn certified_lane_inline(
     ctx: &mut JitCallContext,
     callee: u64,
@@ -2349,6 +2387,8 @@ fn certified_lane_inline(
     args: *mut u64,
     argc: u64,
     cached: Option<&CertifiedInlineInfo>,
+    // Whether `callee` IS the closure the descriptor was probed from.
+    same_callee: bool,
     construct: bool,
 ) -> Result<Option<u64>, JsError> {
     // A callee that is not an ECMAScript function — an engine builtin, a bound
@@ -2434,7 +2474,8 @@ fn certified_lane_inline(
     let (entry, stack_usage, frame_len) = if let Some(cached) = cached {
         // The box-address identity can match a recycled box whose descriptor
         // is another body's; the id is the exact discriminator.
-        if cached.fill_ok == 0 || cached.callee_id != function.id() {
+        if cached.fill_ok == 0 || cached.body_site == 0 || cached.body_site != function.body_site()
+        {
             return Ok(None);
         }
         (
@@ -2655,7 +2696,7 @@ fn certified_lane_inline(
         member_chain_map_cells: ctx.member_chain_map_cells,
         globals_unshadowed: cached.map_or_else(
             || Vm::global_reads_are_unshadowed(environment, &body.ident_names),
-            |c| c.globals_unshadowed != 0,
+            |c| same_callee && c.globals_unshadowed != 0,
         ),
         buf_end: (buf_ptr as usize + buf_len * std::mem::size_of::<Value>()) as *mut c_void,
         leaf_epoch: 0,
@@ -2771,7 +2812,7 @@ extern "C" fn certified_call(
     // SAFETY: `record_slot_of` masks below `LEAF_CALL_RECORDS`, and
     // `leaf_records` is the running agent's table, live for this run.
     let cache_entry = unsafe { &*ctx.leaf_records.add(record_slot_of(callee, slot)) };
-    if !record_matches(ctx, cache_entry, callee)
+    if !record_body_matches(ctx, cache_entry, callee)
         || cache_entry.certified.entry == 0
         || cache_entry.certified.fill_ok == 0
     {
@@ -2784,6 +2825,7 @@ extern "C" fn certified_call(
         args,
         argc,
         Some(&cache_entry.certified),
+        record_matches(ctx, cache_entry, callee),
         false,
     )
     .ok()
@@ -2804,7 +2846,16 @@ pub(crate) fn certified_construct_lane(
     args: *const u64,
     argc: usize,
 ) -> Result<Option<u64>, JsError> {
-    certified_lane_inline(ctx, callee, 0, args as *mut u64, argc as u64, None, true)
+    certified_lane_inline(
+        ctx,
+        callee,
+        0,
+        args as *mut u64,
+        argc as u64,
+        None,
+        true,
+        true,
+    )
 }
 
 extern "C" fn call_apply(
@@ -2964,7 +3015,6 @@ fn leaf_fill_info(
         tdz_mask,
         fill_ok,
         uses_env: u32::from(uses_env),
-        environment: None,
         needs_env: 0,
     }
 }
@@ -3057,7 +3107,7 @@ fn fill_leaf_frame(
 /// [`record_matches`], never applied.
 #[inline]
 fn record_slot_of(callee: u64, slot: u64) -> usize {
-    debug_assert_eq!(slot as usize, leaf_record_slot(callee));
+    debug_assert_eq!(slot as usize, leaf_record_slot(callee_body_site(callee)));
     (slot as usize) & (LEAF_CALL_RECORDS - 1)
 }
 
@@ -3071,6 +3121,48 @@ fn record_matches(ctx: &JitCallContext, record: &LeafCallRecord, callee: u64) ->
     record.code_gen == ctx.leaf_gen
         && record.callee_hi == (callee >> 44) as u32
         && record.callee_payload == callee & crux::PAYLOAD_MASK
+}
+
+/// Whether `record` describes the body the live `callee` runs.
+#[inline]
+fn record_body_matches(ctx: &JitCallContext, record: &LeafCallRecord, callee: u64) -> bool {
+    record.code_gen == ctx.leaf_gen
+        && record.body_site != u64::MAX
+        && record.body_site == callee_body_site(callee)
+}
+
+/// The record's certified descriptor for `callee`, when the record still
+/// describes the callee's body, together with whether it is the probed closure.
+fn record_certified(ctx: &mut JitCallContext, callee: u64) -> Option<(CertifiedInlineInfo, bool)> {
+    let slot = leaf_record_slot(callee_body_site(callee)) & (LEAF_CALL_RECORDS - 1);
+    // SAFETY: `leaf_records` is the running agent's table, live for this run.
+    let record = unsafe { &mut *ctx.leaf_records.add(slot) };
+    if !record_body_matches(ctx, record, callee) {
+        return None;
+    }
+    if record.certified.entry == 0 || record.certified.fill_ok == 0 {
+        let ValueKind::Function(function) = Value::from_bits(callee).kind() else {
+            return None;
+        };
+        let agent = unsafe { &mut *ctx.agent };
+        let compiled = agent
+            .ecma_function(&function.id())
+            .and_then(|data| data.ir.as_ref().map(|ir| ir.jit_info.get() > 1))
+            .unwrap_or(false);
+        if !compiled {
+            return None;
+        }
+        let verdict = certified_verdict(agent, &function);
+        let code_gen = ctx.leaf_gen;
+        // SAFETY: the table outlives this run.
+        let record = unsafe { &mut *ctx.leaf_records.add(slot) };
+        record.certified = verdict;
+        record.code_gen = code_gen;
+    }
+    if record.certified.entry == 0 || record.certified.fill_ok == 0 {
+        return None;
+    }
+    Some((record.certified, record_matches(ctx, record, callee)))
 }
 
 /// G14: the compiled leaf-call *hit* path for a non-aliased frame. The
@@ -3092,10 +3184,12 @@ extern "C" fn leaf_call_fill(
     let ctx = unsafe { ctx_of(ctx) };
     let cache_entry = unsafe { &*ctx.leaf_records.add(record_slot_of(callee, slot)) };
     let info = &cache_entry.leaf_inline;
-    // Defense in depth: the machine code validated the record's generation,
-    // the callee identity and the `fill_ok` gate before branching here, and
-    // no JS runs between that gate and this call.
-    if !record_matches(ctx, cache_entry, callee) || info.entry == 0 || info.fill_ok == 0 {
+    // Defense in depth: the machine code validated the record's generation and
+    // the `fill_ok` gate before branching here, and no JS runs between that
+    // gate and this call. The record is keyed by the callee's body site, so a
+    // fresh closure of the same site (a per-iteration closure) is served too —
+    // the fill descriptor is body-static.
+    if !record_body_matches(ctx, cache_entry, callee) || info.entry == 0 || info.fill_ok == 0 {
         return 0;
     }
     if !fill_leaf_frame(
@@ -3181,6 +3275,7 @@ fn certified_verdict(
         has_call_apply: u32::from(ir.has_call_apply),
         has_call_intrinsic: u32::from(ir.has_call_intrinsic),
         callee_id: function.id(),
+        body_site: function.body_site(),
     }
 }
 
@@ -3230,6 +3325,7 @@ extern "C" fn leaf_call_probe(
     // `lookup_info`'s null arm below), so the next visit re-probes.
     *cache_entry = LeafCallRecord {
         callee_payload: callee & crux::PAYLOAD_MASK,
+        body_site: callee_body_site(callee),
         leaf_inline: LeafInlineInfo::empty(),
         certified: CertifiedInlineInfo::empty(),
         epoch: ctx.leaf_epoch,
@@ -3245,7 +3341,12 @@ extern "C" fn leaf_call_probe(
     // record), and an environment-reading leaf is recorded with `uses_env` so
     // the compiled hit path routes it to the env lane (`leaf_call_env`)
     // instead of calling it in-frame.
-    if !vm.can_inline_leaf() || agent.realm_count.get() != 1 {
+    //
+    // Only the Vm stacks are required clear here, not the environment depth:
+    // whether the environment matters is decided once `leaf_uses_env` is known
+    // (an env leaf swaps it itself, so it is inlineable under a per-iteration
+    // environment — the head-let shape).
+    if !vm.leaf_stacks_clear() || agent.realm_count.get() != 1 {
         reject!("not-at-rest");
     }
     let ValueKind::Function(function) = callee.kind() else {
@@ -3259,7 +3360,7 @@ extern "C" fn leaf_call_probe(
     // to the certified helper without re-deriving it.
     cache_entry.certified = certified_verdict(agent, &function);
     let Some(entry) = agent.leaf_lookup(function.id()) else {
-        reject!("leaf-lookup-miss");
+        reject!("leaf-lookup-miss")
     };
     // Copy the fields out before `ir` is cloned: `leaf_lookup` returns a borrow
     // of `agent`, and `strict` is needed much later (the `this` binding), so the
@@ -3316,7 +3417,14 @@ extern "C" fn leaf_call_probe(
     // (`leaf_call_env`) owns the whole call.
     let uses_env = ir.leaf_uses_env;
     let needs_env = ir.leaf_needs_env;
-    let environment = entry.environment;
+    // A leaf that reads NO environment takes the in-frame lane, which runs its
+    // frame in the caller's buffer under the probe's environment base — only
+    // the body's own environment may be on the stack. An env leaf swaps
+    // `body_context`/`lexical_env` for the callee's own environment, so it is
+    // inlineable at any depth.
+    if !uses_env && vm.env_stack.len() != 1 {
+        reject!("env-not-at-rest");
+    }
     let mut info = leaf_fill_info(
         scope,
         strict,
@@ -3324,7 +3432,6 @@ extern "C" fn leaf_call_probe(
         compiled.stack_usage,
         uses_env,
     );
-    info.environment = environment;
     info.needs_env = u32::from(needs_env);
     // The frame fill (bind `this`, room check, write slots) is identical to
     // the compiled hit path's (G14) — see `fill_leaf_frame`; a rejection there
@@ -3382,22 +3489,39 @@ extern "C" fn leaf_call_env(
     let vm = unsafe { &mut *ctx.vm };
     let cache_entry = unsafe { &*ctx.leaf_records.add(record_slot_of(callee, slot)) };
     let info = &cache_entry.leaf_inline;
-    // Defense in depth: the machine code validated the record's generation,
-    // the callee identity and the `uses_env` gate before branching here, and
-    // no JS runs between that gate and this call.
-    if !record_matches(ctx, cache_entry, callee)
+    // Defense in depth: the machine code validated the record's generation and
+    // the `uses_env` gate before branching here, and no JS runs between that
+    // gate and this call. The record is keyed by the callee's body site, so a
+    // fresh closure of the same site (a per-iteration closure) is served too.
+    if !record_body_matches(ctx, cache_entry, callee)
         || info.entry == 0
         || info.uses_env == 0
         || info.fill_ok == 0
     {
         return u64::MAX;
     }
-    // The probe recorded the callee's environment (the `[[Environment]]` the
-    // capture-context read resolves from) and whether the lane has to swap
-    // `lexical_env` too, so the lane needs no `ecma_functions` lookup, no
-    // `Rc<CompiledBody>` clone and no `new_body_context` (always `None` for a
-    // leaf — it creates no closures).
-    let Some(environment) = info.environment else {
+    // The callee's LIVE [[Environment]]: a per-iteration closure is a new box
+    // each call, so the environment the probe recorded belonged to an earlier
+    // closure of the same body site and is stale for this one. The box stores
+    // the address word (0 = the realm's global environment, which the box
+    // elides); everything else the lane needs is body-static in the record, so
+    // there is still no `ecma_functions` lookup, no `Rc<CompiledBody>` clone
+    // and no `new_body_context` (always `None` for a leaf — it creates no
+    // closures).
+    let ValueKind::Function(function) = Value::from_bits(callee).kind() else {
+        return u64::MAX;
+    };
+    let environment_addr = function.environment_addr();
+    if environment_addr == 0 {
+        return u64::MAX;
+    }
+    // SAFETY: the word names the box's live [[Environment]] edge — the callee
+    // handle keeps the closure, and the box's edge keeps the environment — and
+    // the edge was registered from an `EnvRef`, so the payload is an
+    // `EnvRecord`.
+    let Some(environment) =
+        (unsafe { crux::heap::GcAny::from_addr(environment_addr).cast::<crate::env::EnvRecord>() })
+    else {
         return u64::MAX;
     };
     let entry = info.entry;

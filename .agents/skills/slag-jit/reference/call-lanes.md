@@ -596,87 +596,70 @@ iteration).
   leaf_call_inlines_not_call_slow` asserts `opt_compiled_count >= 2` (caller +
   callee) and a small `call_slow` count instead.
 
-## 26. The record is keyed by callee IDENTITY, so a per-iteration closure never hits
+## 26. The record is keyed by BODY SITE; the environment is the only per-closure fact
 
-This is the largest measured item left in the call lane, and it is not a bug:
-the record's key is the callee's exact NaN-box identity, and a closure created
-inside a loop is a new box every iteration. Measured on five probes of the same
-shape (one closure, created and called, 100k bodies; `JIT_HELPER_STATS` counts
-per body):
+The record's key used to be the callee's exact NaN-box identity, so a closure
+created inside a loop — a new box every iteration — never hit it. It is now the
+callee's **compiled-body site id** (`Function::body_site`, assigned once per
+`shared_compiled_body` entry, monotonic so a recycled `Rc` address cannot alias
+it, `u64::MAX` = empty). Everything the lanes read except one thing is
+body-static:
 
-| probe | ms | probe calls | lane |
-|---|---:|---:|---|
-| captures the loop binding, fresh per iteration | 252 | 3 | `call_slow` ×4 |
-| captures nothing, fresh per iteration | 128 | 3 | in-frame inline ×2 + cert |
-| one closure per body, called 3× | 53–61 | 1 | in-frame inline |
-| one closure per body capturing an outer `var` | 57 | 1 | certified ×2 |
+- `LeafInlineInfo`'s entry, frame shape, `uses_env`/`needs_env` and the
+  certified descriptor all come from the shared `CompiledBody`;
+- the one per-closure fact is the **environment**, which the env lane now loads
+  from the live callee's `Function` box (`Function::ENVIRONMENT_OFFSET`, one
+  word; 0 = the realm global env, which the box elides, so the lane declines).
+  `LeafInlineInfo::environment` is gone: a per-iteration closure would make it
+  stale by definition.
 
-So a *stable* callee reaches the in-frame or certified lane (~10-20 ns a call)
-while a *fresh capturing* callee pays a full probe plus `call_slow` every time
-(~650 ns a call). The capture matters twice over: `uses_env` leaves are rejected
-by the probe (`reject!("uses-env")`, which is why they never reach the env lane
-from a miss), and `call_slow` then re-derives the certified descriptor the probe
-had already computed.
+Consequences worth keeping in mind:
 
-What a fix needs, and the two facts that make it sound:
+- **A body-only hit may use either lane.** A fresh closure of a known site takes
+  the in-frame machine call when its body reads no environment, and the env lane
+  (live environment swapped around a direct call) when it does. The identity
+  fields are still written (the certified lane's `globals_unshadowed` reuse is
+  gated on them), but they no longer choose the lane.
+- **The env lane is env-depth-free.** `emit_leaf_cert_ready` is the route's gate
+  (Vm stacks clear + one realm, no env check), so a call site inside
+  `for (let i ...)`, whose loop keeps a per-iteration env open, can take machine
+  code instead of the certified helper. A leaf that reads NO environment still
+  needs `env_stack.len() == 1` (the in-frame lane runs its frame in the caller's
+  buffer), and the probe enforces exactly that split.
+- **`record_certified` (the `call_slow` descriptor cache) requires stacks
+  clear.** With a `try` frame open, a nested run's pending error is attributed
+  through the CALLER's stacks: serving the cached verdict there let a throwing
+  callee's exception escape its caller's `catch` (test262
+  `subclass/builtin-objects/TypedArray/super-must-be-called.js` — found by the
+  sweep, fixed by gating on `Vm::leaf_stacks_clear`). Deriving the verdict
+  instead is what `call_slow` did before the cache.
 
-- **Key the record by a body site, not by the box.** `CompiledBody` is shared per
-  creation site, so a monotonic `site_id` on it (a counter — *not* the `Rc`
-  address, which can be recycled after a chunk frees) identifies the callee's
-  body across closures. The record then stores that id instead of
-  `callee_hi`/`callee_payload`, and the emitted gate loads it from the callee
-  box at a fixed offset (guard the load with the Function tag; an Object has no
-  such field).
-- **`globals_unshadowed` is site-invariant**, which is the fact that makes the
-  certified descriptor reusable. It walks the environment chain asking each
-  record `has_binding(name)` for the body's global names; every link's *name
-  set* comes from the compile-time lexical shape, so two closures of one site
-  answer identically even though their environment objects differ (a `Global`
-  link answers true and an `Object` link false by kind alone).
-- **A `uses_env` leaf is the exception**, because `LeafInlineInfo::environment`
-  is the *closure's* [[Environment]] and the env lane swaps it in. Serving a
-  body-keyed hit there needs the environment compared too: store the edge
-  pointer in the record and have the emitter compare it against the live
-  callee's (one fixed-offset load), falling to the probe on a mismatch.
+### The bug that made the lane look impossible: the empty `per_iteration_chain`
 
-Two experiments in this area did **not** pay and were reverted, so nobody
-re-derives them: reusing the probe's certified verdict from `call_slow` (a
-`cached_certified` helper, validated by `record_matches` + the epoch) measured
-−10% on the capturing probe and flat on `head-let`; and building an
-`Object.entries` pair through `array_from_values` (one dense extend instead of
-two defines) is neutral at 2 elements.
+The measured 650 ns a call was never the lane. `register_function` installed
+`data.per_iteration_chain` *after* `shared_compiled_body`, so the one compile of
+a closure body created inside `for (let i ...)` saw an empty chain and lowered
+`i` to `Step::LoadIdent` (a dynamic env walk) instead of
+`Step::LoadPerIteration`. `LoadIdent` is not a leaf step, so the body was not a
+leaf at all and every call took the certified helper. Install the chain before
+the compile; record nested loops innermost-first (`total - 1 - position`, the
+same convention as `per_iteration`); and record **no** chain for a
+resumable body (a generator's per-iteration envs only exist while it is
+suspended, so the static hop is meaningless there — its closures stay on the
+env walk).
 
-### Measured attempt: the body-site key alone buys nothing
+Measured (`head-let`-shaped probes, min of 5 interleaved pairs; see
+`.notes/perf.md` §2026-11-17): per-iteration capturing closure −42%, fresh
+non-capturing −20%, stable closure −17%, and `CertifiedCall` 7.0 M → 2.3 k on a
+1 M-iteration probe.
 
-The body-site key was implemented and reverted. What it proved, in order:
+### Ruled out along the way (do not re-derive)
 
-- **It works, and the probes go away.** A monotonic site id on the compiled
-  body's cache entry, a `Function::body_site` reloaded by the emitted gate,
-  `LeafCallRecord::body_site` as the key, and the same identity test retained
-  only to choose *which* lane may serve. All 400 `jit` tests pass, and the
-  capturing probe's `LeafCallProbe` count goes **2,100,686 → 1,372**.
-- **It is neutral in time.** The same probe reads 227.7 ms against the control's
-  229.4 at the minima (five interleaved pairs). So the probe was never the cost:
-  what a per-iteration closure call pays is `call_slow`'s *derived* certified
-  lane, which re-does the eligibility scan, the `ecma_functions` facts, the
-  globals walk and the compiled-entry consult on every call.
-- **The epoch has to be bypassed, and that part is sound.** A capturing closure's
-  loop keeps a per-iteration environment open, so `emit_leaf_state_at_rest`
-  (which requires the body's own env only) can never re-stamp the epoch: every
-  call probed. Routing a *stable* record with a stale epoch to the certified
-  lane instead is correct — that lane re-validates per call and does not depend
-  on the probe's at-rest assumptions — and it is what the count above measures.
-- **Caching the descriptor in `call_slow` is the actual win, and it is blocked.**
-  A `cached_certified` that serves the record's descriptor to a sibling closure
-  makes `installed_jit_caught_call_error_in_a_loop_does_not_drift_the_working_sp`
-  and `installed_jit_finally_continue_swallowing_loop_errors_does_not_drift`
-  fail with an escaping `Uncaught exception` — the swallowing-`.ok()` convention
-  in `certified_call` means a lane that throws is retried through the funnel,
-  and that double run is what the drift guards catch. Gating the refresh behind
-  `jit_info > 1` (so it cannot compile) does **not** fix it, so the compile is
-  not the trigger.
-
-So the next attempt starts at the drift interaction, not at the record: find why
-a second run of a throwing callee drifts the working sp (`certified_lane_inline`'s
-error exit vs the caller's resume), then the descriptor cache is available — and
-with it the ~3x this lane has in it (252 ms → ~60 ms on the probe above).
+- Reusing the probe's verdict from `call_slow` without the stacks-clear gate:
+  the test262 sink above. It is the gate, not `jit_info > 1`, that matters.
+- `globals_unshadowed` forcing: neutral on the failing repro, and the stale-flag
+  risk it was meant to remove does not explain the error.
+- Making the `Function` environment edge a single word: neutral for
+  correctness; kept because the lane needs the fixed-offset load anyway.
+- Building `Object.entries` pairs through `array_from_values` (one dense extend
+  instead of two defines) is neutral at 2 elements.

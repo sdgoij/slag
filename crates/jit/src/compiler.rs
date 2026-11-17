@@ -381,12 +381,12 @@ fn certified_offset(field: usize) -> usize {
 /// (the verdict is written to one slot and read from another, so the site
 /// simply never inlines). `the_emitter_and_runtime_leaf_record_slots_agree`
 /// pins the two expressions together.
-fn emit_leaf_record_slot(lowerer: &mut Lowerer<'_>, callee: ClifValue) -> ClifValue {
+fn emit_leaf_record_slot(lowerer: &mut Lowerer<'_>, site: ClifValue) -> ClifValue {
     let builder = &mut lowerer.builder;
     let k = builder
         .ins()
         .iconst(types::I64, 0x9E37_79B9_7F4A_7C15u64 as i64);
-    let mixed = builder.ins().imul(callee, k);
+    let mixed = builder.ins().imul(site, k);
     builder
         .ins()
         .ushr_imm_u(mixed, LEAF_CALL_RECORD_SHIFT as i64)
@@ -5405,6 +5405,11 @@ impl<'a> Lowerer<'a> {
     /// `body_context`/`lexical_env` swap `leaf_call_env` performs, emitted
     /// around a direct call to the leaf's entry instead of a helper round trip.
     ///
+    /// `env` is the LIVE callee's [[Environment]] (`cells::callee_environment`),
+    /// not the record's: a per-iteration closure is a fresh box each call, so
+    /// the environment the record captured belongs to an earlier closure of the
+    /// same body site.
+    ///
     /// Only the frame shape the machine code can build itself qualifies: an
     /// ALIASED frame (the frame IS the argument region, so there is nothing to
     /// fill) with room for the leaf's working area. Everything else — a
@@ -5420,6 +5425,7 @@ impl<'a> Lowerer<'a> {
         &mut self,
         cache: ClifValue,
         entry: ClifValue,
+        env: ClifValue,
         args_ptr: ClifValue,
         argc: ClifValue,
         pre_call_offset: ClifValue,
@@ -5436,11 +5442,6 @@ impl<'a> Lowerer<'a> {
                 Offset32::new(leaf_inline_offset(field) as i32),
             )
         };
-        let env = load(
-            self,
-            std::mem::offset_of!(LeafInlineInfo, environment),
-            types::I64,
-        );
         let frame_size = load(
             self,
             std::mem::offset_of!(LeafInlineInfo, frame_size),
@@ -6010,7 +6011,13 @@ impl<'a> Lowerer<'a> {
     /// positive (the entry is a pure function of the unchanged callee) or
     /// negative (the slow path is always correct) — is still valid and the
     /// epoch is simply re-stamped.
-    fn emit_leaf_state_at_rest(&mut self) -> ClifValue {
+    /// The Vm stacks the probe's verdicts assume EMPTY, plus the single-realm
+    /// gate — everything `emit_leaf_state_at_rest` checks except the environment
+    /// depth. The certified lane needs these (a pending error from a nested run
+    /// is attributed through the caller's try/boundary stacks), while the env
+    /// depth only matters to the in-frame lane, which runs the callee's frame in
+    /// the caller's buffer.
+    fn emit_leaf_stacks_clear(&mut self, include_env: bool) -> ClifValue {
         let vm = self.vm_ptr();
         let mut ok = self.builder.ins().iconst(types::I64, 1);
         for offset in [
@@ -6032,15 +6039,6 @@ impl<'a> Lowerer<'a> {
             let empty_64 = self.bint(empty);
             ok = self.builder.ins().band(ok, empty_64);
         }
-        let env_len = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            vm,
-            Offset32::new(VM_ENV_STACK_LEN_OFFSET as i32),
-        );
-        let env_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, env_len, 1);
-        let env_ok_64 = self.bint(env_ok);
-        ok = self.builder.ins().band(ok, env_ok_64);
         let ctx = self.vm();
         let agent = self.builder.ins().load(
             types::I64,
@@ -6056,7 +6054,33 @@ impl<'a> Lowerer<'a> {
         );
         let realm_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, realm, 1);
         let realm_ok_64 = self.bint(realm_ok);
-        self.builder.ins().band(ok, realm_ok_64)
+        let ok = self.builder.ins().band(ok, realm_ok_64);
+        if !include_env {
+            return ok;
+        }
+        // The body's own environment only: a per-iteration or nested env makes
+        // the in-frame lane's assumption (the probe's env base) untrue.
+        let env_len = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            vm,
+            Offset32::new(VM_ENV_STACK_LEN_OFFSET as i32),
+        );
+        let env_ok = self.builder.ins().icmp_imm_u(IntCC::Equal, env_len, 1);
+        let env_ok_64 = self.bint(env_ok);
+        self.builder.ins().band(ok, env_ok_64)
+    }
+
+    /// The in-frame lane's precondition: every stack clear AND the body's own
+    /// environment only.
+    fn emit_leaf_state_at_rest(&mut self) -> ClifValue {
+        self.emit_leaf_stacks_clear(true)
+    }
+
+    /// The certified lane's precondition: the stacks and realm, without the
+    /// environment depth (a nested run swaps the env itself).
+    fn emit_leaf_cert_ready(&mut self) -> ClifValue {
+        self.emit_leaf_stacks_clear(false)
     }
 
     /// The `Step::LoadIdent` read: the inline global-value cell probe with the
@@ -6212,7 +6236,8 @@ impl<'a> Lowerer<'a> {
             self.builder.ins().brif(gate, slow, &[], leaf, &[]);
             self.builder.switch_to_block(leaf);
         }
-        let slot = emit_leaf_record_slot(self, callee);
+        let site = crate::cells::callee_body_site(&mut self.builder, callee);
+        let slot = emit_leaf_record_slot(self, site);
         let slot_bytes = self
             .builder
             .ins()
@@ -6258,31 +6283,14 @@ impl<'a> Lowerer<'a> {
             Offset32::new(std::mem::offset_of!(LeafCallRecord, epoch) as i32),
         );
         let epoch_ok = self.builder.ins().icmp(IntCC::Equal, epoch, cached_epoch);
-        let callee_hi = self.builder.ins().ushr_imm_u(callee, 44);
-        let cached_hi = self.builder.ins().load(
-            types::I32,
-            MemFlagsData::new(),
-            cache,
-            Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_hi) as i32),
-        );
-        let cached_hi = self.builder.ins().uextend(types::I64, cached_hi);
-        let hi_ok = self.builder.ins().icmp(IntCC::Equal, callee_hi, cached_hi);
-        let payload = self
-            .builder
-            .ins()
-            .band_imm_u(callee, crux::PAYLOAD_MASK as i64);
-        let cached_payload = self.builder.ins().load(
+        let cached_site = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
             cache,
-            Offset32::new(std::mem::offset_of!(LeafCallRecord, callee_payload) as i32),
+            Offset32::new(std::mem::offset_of!(LeafCallRecord, body_site) as i32),
         );
-        let payload_ok = self
-            .builder
-            .ins()
-            .icmp(IntCC::Equal, payload, cached_payload);
-        let callee_hit = self.builder.ins().band(hi_ok, payload_ok);
-        let stable = self.builder.ins().band(callee_hit, gen_ok);
+        let site_ok = self.builder.ins().icmp(IntCC::Equal, site, cached_site);
+        let stable = self.builder.ins().band(site_ok, gen_ok);
         let hit = self.builder.ins().band(stable, epoch_ok);
         let cached_entry = self.builder.ins().load(
             types::I64,
@@ -6294,6 +6302,10 @@ impl<'a> Lowerer<'a> {
         let stable_check = self.builder.create_block();
         let stale_block = self.builder.create_block();
         let probe_block = self.builder.create_block();
+        // The env lane is also entered from the stale-epoch route below (a
+        // per-iteration closure's loop keeps an env open), so it is declared
+        // here.
+        let env_lane = self.builder.create_block();
         self.builder
             .ins()
             .brif(hit, hit_block, &[], stable_check, &[]);
@@ -6312,9 +6324,48 @@ impl<'a> Lowerer<'a> {
         self.builder.switch_to_block(stale_block);
         let state_ok = self.emit_leaf_state_at_rest();
         let restamp = self.builder.create_block();
+        // Not at rest. The in-frame and env lanes need the probe's at-rest
+        // assumptions, but the CERTIFIED lane re-validates per call and needs
+        // only the Vm stacks clear: a pending error from its nested run is
+        // attributed through the caller's try/boundary stacks, which is why this
+        // route is gated on `cert_ready` rather than on the env depth alone. A
+        // capturing per-iteration closure lands exactly here — its loop keeps a
+        // per-iteration environment open, so `state_at_rest` can never hold,
+        // while `cert_ready` can.
+        let cert_ready = self.emit_leaf_cert_ready();
+        let cert_route = self.builder.create_block();
         self.builder
             .ins()
-            .brif(state_ok, restamp, &[], probe_block, &[]);
+            .brif(state_ok, restamp, &[], cert_route, &[]);
+        self.builder.switch_to_block(cert_route);
+        // The env lane does not need the at-rest environment: it swaps
+        // `body_context`/`lexical_env` itself and restores them around the
+        // direct call, so a per-iteration closure (a fresh box at this site,
+        // whose live environment the lane loads from the callee) takes machine
+        // code here instead of the certified lane. Anything else, and any state
+        // with a Vm stack live, keeps the certified route.
+        let retry = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(cert_ready, retry, &[], probe_block, &[]);
+        self.builder.switch_to_block(retry);
+        let retry_env = self.builder.ins().load(
+            types::I32,
+            MemFlagsData::new(),
+            cache,
+            Offset32::new(
+                leaf_inline_offset(std::mem::offset_of!(LeafInlineInfo, uses_env)) as i32,
+            ),
+        );
+        let retry_env = self.builder.ins().icmp_imm_u(IntCC::NotEqual, retry_env, 0);
+        let retry_entry = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::NotEqual, cached_entry, 0);
+        let retry_ok = self.builder.ins().band(retry_env, retry_entry);
+        self.builder.ins().brif(retry_ok, env_lane, &[], miss, &[]);
+        self.builder.seal_block(cert_route);
+        self.builder.seal_block(retry);
         self.builder.switch_to_block(restamp);
         self.builder.ins().store(
             MemFlagsData::new(),
@@ -6326,13 +6377,31 @@ impl<'a> Lowerer<'a> {
         self.builder.seal_block(restamp);
         self.builder.seal_block(stale_block);
         self.builder.seal_block(stable_check);
-        // A cache hit. G13: an environment-using leaf cannot be called
-        // in-frame (the `body_context`/`lexical_env` swap has to span the
-        // call), so its site takes the env lane, which performs the whole call
-        // from the record. Anything else is the in-frame lane: a cached zero
-        // entry is a stable rejection (straight to `call_slow`); a nonzero one
-        // reuses the verdict.
+        // A cache hit. The record is keyed by the callee's BODY SITE, not its
+        // identity: a per-iteration closure is a fresh box each iteration, and
+        // everything the lanes read (entry, frame shape, `uses_env`/`needs_env`)
+        // is body-static. The one per-closure value, the environment, is loaded
+        // from the live callee. So a body-only hit takes the same lanes as an
+        // identity hit; a cached zero entry is still a stable rejection.
+        // A cache hit. The record is keyed by the callee's BODY SITE, not its
+        // identity: a per-iteration closure is a fresh box each iteration, and
+        // everything the lanes read (entry, frame shape, `uses_env`/`needs_env`)
+        // is body-static. The one per-closure value, the environment, is loaded
+        // from the live callee. So a body-only hit takes the same lanes as an
+        // identity hit; a cached zero entry is still a stable rejection.
         self.builder.switch_to_block(hit_block);
+        let lane = self.builder.create_block();
+        self.builder.ins().jump(lane, &[]);
+        self.builder.seal_block(hit_block);
+        self.builder.switch_to_block(lane);
+        // A cached zero entry is a stable rejection on BOTH lanes: an env leaf
+        // the probe declined (a frame wider than the record's TDZ mask, or a
+        // body that builds its own capture context) records `uses_env` with
+        // entry 0, so the split below must never call it directly.
+        let entry_zero = self.builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
+        let live = self.builder.create_block();
+        self.builder.ins().brif(entry_zero, miss, &[], live, &[]);
+        self.builder.switch_to_block(live);
         let uses_env = self.builder.ins().load(
             types::I32,
             MemFlagsData::new(),
@@ -6342,15 +6411,8 @@ impl<'a> Lowerer<'a> {
             ),
         );
         let env_ok = self.builder.ins().icmp_imm_u(IntCC::NotEqual, uses_env, 0);
-        let env_lane = self.builder.create_block();
-        let plain_hit = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(env_ok, env_lane, &[], plain_hit, &[]);
-        self.builder.switch_to_block(plain_hit);
-        let entry_zero = self.builder.ins().icmp_imm_u(IntCC::Equal, cached_entry, 0);
         let fast = self.builder.create_block();
-        self.builder.ins().brif(entry_zero, miss, &[], fast, &[]);
+        self.builder.ins().brif(env_ok, env_lane, &[], fast, &[]);
         // G14: a hit splits on the frame shape. An ALIASED frame (the leaf's
         // frame IS the argument region — `frame_size == arity` with all args
         // present) is called in-frame directly behind the room check. Any
@@ -6467,9 +6529,11 @@ impl<'a> Lowerer<'a> {
         // the whole call in one round trip.
         self.builder.switch_to_block(env_lane);
         let env_slow = self.builder.create_block();
+        let env = crate::cells::callee_environment(&mut self.builder, callee);
         self.emit_env_leaf_fast(
             cache,
             cached_entry,
+            env,
             args_ptr,
             argc,
             pre_call_sp,

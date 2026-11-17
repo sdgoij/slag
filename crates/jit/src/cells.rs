@@ -24,6 +24,52 @@ pub(crate) fn object_data_ptr(builder: &mut FunctionBuilder, object: Value) -> V
         .iadd_imm_s(ptr, crux::heap::GCBOX_DATA_OFFSET as i64)
 }
 
+/// The compiled body's site id behind a callable value: a Function box's
+/// `body_site`, or 0 for anything else (0 never matches a non-empty record).
+/// The load is guarded by a branch because a non-function's payload is not a
+/// box.
+pub(crate) fn callee_body_site(builder: &mut FunctionBuilder, callee: Value) -> Value {
+    let is_fn = is_function(builder, callee);
+    let load_block = builder.create_block();
+    let zero_block = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    builder.ins().brif(is_fn, load_block, &[], zero_block, &[]);
+    builder.switch_to_block(load_block);
+    let ptr = object_data_ptr(builder, callee);
+    let site = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        ptr,
+        Offset32::new(std::mem::offset_of!(crux::function::Function, body_site) as i32),
+    );
+    builder.ins().jump(merge, &[site.into()]);
+    builder.seal_block(load_block);
+    builder.switch_to_block(zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(merge, &[zero.into()]);
+    builder.seal_block(zero_block);
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.block_params(merge)[0]
+}
+
+/// The raw [[Environment]] word behind a callable value the caller already
+/// established is a `Function` (a nonzero record site matched its loaded
+/// `body_site`). A fresh closure at a known body site is a NEW box, so a
+/// call-site record cannot cache its environment: the env lane loads the live
+/// one. 0 means the closure's environment IS the realm's global environment
+/// (the box elides that edge), so the lane declines.
+pub(crate) fn callee_environment(builder: &mut FunctionBuilder, callee: Value) -> Value {
+    let ptr = object_data_ptr(builder, callee);
+    builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        ptr,
+        Offset32::new(crux::function::Function::ENVIRONMENT_OFFSET as i32),
+    )
+}
+
 /// Whether a NaN-boxed `Value` is a plain Object (`TAG_OBJECT`), the receiver
 /// shape the member-value-cell probe serves.
 pub(crate) fn is_plain_object(builder: &mut FunctionBuilder, value: Value) -> Value {

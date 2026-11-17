@@ -213,6 +213,66 @@ The register-tier item the plan had queued as "keep the accumulator in a registe
 
 Those two contain no `pop` and are pure layout: `ir_diff.py` reports **0 of 81 rows** with different IR, which is the tell for a lowering-only change (the tier's IR is untouched; only the emitted code moves). For that class the helper census is the discriminator, and it is exact here — `ArrayPop` 1.44 M -> **0** with the row's value unchanged.
 
+## 2026-11-17: a per-iteration closure was never a leaf (the empty `per_iteration_chain`)
+
+`head-let`'s 3-per-iteration closure call was the last big measured lane item
+(`call-lanes.md` §26). The attribution was wrong in the doc: it is not the call
+lane, it is the **closure's own body**, and it had never been compiled as a
+leaf at all.
+
+`register_function` compiled the body (`shared_compiled_body`) and installed
+`data.per_iteration_chain` **after** that compile, so the first (and only)
+compilation of a closure body created inside `for (let i ...)` saw an empty
+chain. `i` therefore lowered to `Step::LoadIdent` — a dynamic environment walk
+per read — instead of `Step::LoadPerIteration`. `LoadIdent` is not a leaf step,
+so the body was never leaf-certified, and every call fell to the certified
+helper (`CertifiedCall` 7.0 M on a 1 M-iteration probe). Two further bugs
+surfaced once the chain was actually used: `closure_per_iteration_chain`
+recorded the *outer* enumeration position as the env hop, so a loop nested in
+another loop read the wrong per-iteration env (`total - 1 - position`, matching
+`per_iteration`); and a generator/async body must record no chain at all — its
+per-iteration envs only exist while it is suspended, so a closure created there
+resolves through the env walk (`resumable`).
+
+With the body a leaf again, the call site needed the body-site keyed record that
+was already in flight, plus:
+
+- the env lane loads the **live** callee's [[Environment]] from the `Function`
+  box (`Function::ENVIRONMENT_OFFSET`; the edge is now one traced word, not an
+  16-byte `Option<GcAny>`), because a per-iteration closure is a new box each
+  call and the record's copy belongs to an earlier one;
+- the probe may record an `uses_env` leaf while a per-iteration env is open
+  (the in-frame lane still requires the body's own env only);
+- the stale-epoch route (`cert_ready`) offers the env lane before the certified
+  helper, and a body-sited hit may use either lane — the frame descriptor is
+  body-static, and the environment is the one fact taken from the live callee.
+
+The sweep caught a real regression in the in-flight descriptor cache: serving
+the record's certified verdict to `call_slow` while a `try` frame is open let a
+throwing callee's error escape the caller's `catch` (test262
+`language/statements/class/subclass/builtin-objects/TypedArray/super-must-be-called.js`).
+That route now requires the same "Vm stacks clear" gate the compiled site uses
+(`emit_leaf_cert_ready`), and derives the verdict otherwise.
+
+| probe (min of 5 interleaved pairs) | control | variant | delta |
+|---|---:|---:|---:|
+| per-iteration capturing closure call, 1 M iterations | 657.6 | 379.6 | **−42.3%** |
+| the same shape at 3 calls per head-let iteration (100 k) | 233.5 | 178.8 | **−23.4%** |
+| fresh non-capturing closure call, 1 M | 371.2 | 298.4 | −19.6% |
+| fresh non-capturing, 3 per iteration (100 k) | 113.7 | 106.7 | −6.2% |
+| one closure per body, called 3× | 47.1 | 39.1 | −17.1% |
+| one closure per body capturing an outer `var` | 53.1 | 41.5 | −21.9% |
+| closure creation only | 298.3 | 303.1 | +1.6% (noise) |
+| stable leaf call in a loop | 8.94 | 8.83 | −1.3% |
+
+`CertifiedCall` on the 1 M probe drops **7,000,000 → 2,287**; what is left of
+the row's ~380 ns per iteration is closure creation (~300 ns, a separate
+lever) plus the loop's own per-iteration env bookkeeping. The call lane is no
+longer the dominant term.
+
+Gates: `sweep all` 48,633/48,633 (0 fail, 0 skip, 0 hang), `cargo test
+--workspace` green, clippy `-D warnings` clean.
+
 ## 2026-11-17: the optimizing tier was not running on the two biggest rows
 
 A helper-call *signature* whose parameter count disagrees with the call is not a

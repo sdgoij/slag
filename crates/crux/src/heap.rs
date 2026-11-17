@@ -99,6 +99,13 @@ impl GcAny {
         self.0 as usize
     }
 
+    /// Rebuild an erased reference from a box base address. The `Function`
+    /// box's [[Environment]] edge stores its address as a plain word so the
+    /// compiled env lane can load it directly; tracing turns it back.
+    pub fn from_addr(addr: usize) -> GcAny {
+        GcAny(addr as *mut GcHeader)
+    }
+
     /// Whether this box's payload is exactly `T`, decided by the payload's
     /// `TypeId`. A sound test because a `TypeId` is one per type, whereas the
     /// vtable's own address is not: a `const VTABLE` promoted to `'static` at two

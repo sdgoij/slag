@@ -253,7 +253,13 @@ pub struct Function {
     /// edge on the record kept every dead closure's environment - and its
     /// source string - alive for that extra collection, promoting them to the
     /// old generation where only a major could reclaim them.
-    environment: Cell<Option<crate::heap::GcAny>>,
+    ///
+    /// Kept as a bare box address (0 = none) rather than an `Option<GcAny>`:
+    /// the address is one word the compiled env lane loads straight from a
+    /// fresh closure (`ENVIRONMENT_OFFSET`), and a per-iteration closure is a
+    /// new box every iteration, so a call-site record cannot cache its
+    /// environment. `Option<GcAny>` is 16 bytes (a raw pointer has no niche).
+    environment: Cell<usize>,
     /// [[HomeObject]], as an erased heap edge, for the same reason as
     /// `environment` but stronger: the home object roots the method (its
     /// property value is the closure), so a traced record edge formed a cycle
@@ -275,6 +281,10 @@ pub struct Function {
     /// observation and the JIT's chain probe declines the receiver while it is
     /// set. `pub` so the compiled probe can read it by offset.
     pub props_pending: Cell<bool>,
+    /// The compiled body's site id (0 = none). Every closure from one creation
+    /// site carries the same id, which lets a call-site record serve a fresh
+    /// closure of a known site (`slag-jit`'s `call-lanes.md` §26).
+    pub body_site: Cell<u64>,
 }
 
 // The object handle built from a function box reads the payload as a
@@ -336,8 +346,9 @@ impl Trace for Function {
         }
         // [[Environment]]: the closure keeps its captured chain alive, so the
         // edge is on the closure rather than on the record (see the field).
-        if let Some(environment) = self.environment.get() {
-            visit(environment);
+        let environment = self.environment.get();
+        if environment != 0 {
+            visit(crate::heap::GcAny::from_addr(environment));
         }
         // [[HomeObject]]: same reason as the environment (see the field).
         if let Some(home_object) = self.home_object.get() {
@@ -400,11 +411,22 @@ impl Function {
         self.id
     }
 
+    /// The byte offset of the `environment` word, for the compiled env lane's
+    /// load of a fresh closure's [[Environment]].
+    pub const ENVIRONMENT_OFFSET: usize = std::mem::offset_of!(Self, environment);
+
     /// Record the closure's [[Environment]] as this box's GC edge (see the
     /// field's note). The runtime calls it once at registration, from the
     /// record's `environment`.
     pub fn set_environment_edge(&self, environment: Option<crate::heap::GcAny>) {
-        self.environment.set(environment);
+        self.environment
+            .set(environment.map_or(0, |any| any.addr()));
+    }
+
+    /// The raw [[Environment]] box address (0 = none). The runtime's
+    /// `leaf_call_env` reads it here; the compiled lane loads the word itself.
+    pub fn environment_addr(&self) -> usize {
+        self.environment.get()
     }
 
     /// Whether the boilerplate own properties are still deferred (see the
@@ -481,17 +503,28 @@ impl Function {
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).name), name);
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).kind), kind);
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).self_handle), Cell::new(None));
-                std::ptr::write(std::ptr::addr_of_mut!((*ptr).environment), Cell::new(None));
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).environment), Cell::new(0));
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).home_object), Cell::new(None));
                 std::ptr::write(std::ptr::addr_of_mut!((*ptr).resolver), Cell::new(None));
                 std::ptr::write(
                     std::ptr::addr_of_mut!((*ptr).props_pending),
                     Cell::new(false),
                 );
+                std::ptr::write(std::ptr::addr_of_mut!((*ptr).body_site), Cell::new(0));
             }
         });
         Self::link_self_handle(&function);
         function
+    }
+
+    /// The compiled body's site id (0 until the runtime registers a body).
+    pub fn body_site(&self) -> u64 {
+        self.body_site.get()
+    }
+
+    /// See [`Self::body_site`].
+    pub fn set_body_site(&self, site: u64) {
+        self.body_site.set(site);
     }
 
     fn link_self_handle(function: &Handle<Function>) {
