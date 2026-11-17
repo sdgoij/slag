@@ -240,6 +240,38 @@ body enters the tier now, but its cost is template strings, per-body closure
 creation and calls, none of which the tier lowers differently from the per-step
 path. Being in the tier is a precondition, not a win.
 
+**The second cut is a missing fast path, not a missing port.**
+`Object.values`/`Object.entries` read each key's descriptor (to test
+enumerability), then called the full `get_property` — a proxy check, a chain
+walk and a getter dispatch — to read a value the descriptor already held. For an
+own **data** property of an Ordinary object or an Array, `Get` cannot run user
+code and cannot consult the chain, so the descriptor's value *is* the answer.
+Accessors, exotic receivers (module namespace, Proxy, mapped `arguments`,
+boxed strings, typed arrays) keep the general path; a function's deferred
+boilerplate cannot be observed here, because every structural operation that
+adds an enumerable own key materializes it first.
+
+200k-iteration probe (`scratch/probe/ok/values_200k.js`), six interleaved pairs,
+control built from the tree without the cut: `Object.values` 155.5 → 105.9 ms
+(min), **every pair separated** — −32%. `Object.entries`
+(`entries_200k.js`) is unchanged within noise, because its cost is the per-pair
+array allocation (`array_create` + two element defines ≈ 230 ns per pair, against
+a JS `[k, v]` literal's ~150 ns). The corpus row that exercises all three
+(`builtins/object_keys`) reads 83.6 → 70.1 ms in a whole-corpus pass.
+
+Whole corpus, same session, 5 interleaved rounds: **2511.5 → 2211.4 ms** across
+the arc, with node 953.8 → 912.6 — the ratio reads 2.63× at the start and
+**2.42×** at the end. Both engines drift with the host, so take the row-level
+numbers and the disappearance of `opt assemble failed` as the evidence and the
+ratio as the direction.
+
+The census that follows from this arc is the *allocation* line: a 2-element
+array literal costs ~150 ns, an empty array that escapes ~83 ns, and a GC box
+~44 ns — one `JsObject` plus one `ArraySlots` box is the whole difference, and
+that is what `Object.entries` and every string-building row pay per element.
+Node's equivalents are 5-10 ns, so this is where the next structural cut is, not
+in another register-tier lift.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

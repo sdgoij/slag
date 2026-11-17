@@ -1024,6 +1024,50 @@ fn object_define_property(agent: &mut Agent, args: &[Value]) -> Result<Value, Js
     Ok(receiver)
 }
 
+/// EnumerableOwnProperties (spec 7.3.26) for one own string key: `Some(value)`
+/// when the key is still an enumerable own property, `None` when it is not.
+///
+/// The descriptor read and the value read are one operation for the shape that
+/// dominates: an own **data** property of an ordinary object or an Array. Get
+/// on that property cannot run user code and cannot consult the prototype
+/// chain, so the descriptor's value IS the answer — which removes a second
+/// full `[[Get]]` (proxy check, chain walk, getter dispatch) per key, the
+/// reason `Object.entries` over a plain object cost 2.3 µs for six keys.
+///
+/// Every other shape keeps the general `get_property`: an accessor runs its
+/// getter, and an exotic receiver's own descriptor is not its `[[Get]]` answer
+/// (a module namespace's reads the live binding, a Proxy's the trap, a mapped
+/// `arguments` index its parameter). A function with deferred boilerplate
+/// cannot reach the fast path with an enumerable key: every structural
+/// operation that adds one materializes the boilerplate first.
+fn enumerable_own_value(
+    agent: &mut Agent,
+    object: &Value,
+    obj: &Handle<crux::object::JsObject>,
+    id: crux::AtomId,
+) -> Result<Option<Value>, JsError> {
+    let key = PropertyKey::String(id);
+    // EnumerableOwnProperties re-reads each descriptor, so a getter for an
+    // earlier key can hide a later one.
+    let Some(property) = obj.get_own_property_key(&key)? else {
+        return Ok(None);
+    };
+    if !property.enumerable {
+        return Ok(None);
+    }
+    let plain = matches!(
+        obj.kind,
+        crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
+    );
+    if plain && let crux::object::PropertyKind::Data { value, .. } = property.kind {
+        return Ok(Some(value));
+    }
+    let text = crux::lookup(id);
+    Ok(Some(crate::context::get_property(
+        agent, object, &text, *object,
+    )?))
+}
+
 /// Object.entries (spec 20.1.2.5): the enumerable string-keyed [key, value]
 /// pairs as an array.
 fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
@@ -1045,15 +1089,10 @@ fn object_entries(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         let PropertyKey::String(id) = key else {
             continue;
         };
-        let key = PropertyKey::String(*id);
-        if !obj
-            .get_own_property_key(&key)?
-            .is_some_and(|prop| prop.enumerable)
-        {
+        let Some(value) = enumerable_own_value(agent, &object, &obj, *id)? else {
             continue;
-        }
+        };
         let text = crux::lookup(*id);
-        let value = crate::context::get_property(agent, &object, &text, object)?;
         let pair = crate::builtins::array::array_create(agent, 2.0)?;
         pair.create_data_property_index(0, Value::String(Handle::new(text)))?;
         pair.create_data_property_index(1, value)?;
@@ -1079,16 +1118,9 @@ fn object_values(agent: &mut Agent, args: &[Value]) -> Result<Value, JsError> {
         let PropertyKey::String(id) = key else {
             continue;
         };
-        let key = PropertyKey::String(*id);
-        if !obj
-            .get_own_property_key(&key)?
-            .is_some_and(|prop| prop.enumerable)
-        {
-            continue;
+        if let Some(value) = enumerable_own_value(agent, &object, &obj, *id)? {
+            values.push(value);
         }
-        let text = crux::lookup(*id);
-        let value = crate::context::get_property(agent, &object, &text, object)?;
-        values.push(value);
     }
     array_of(agent, &values)
 }
@@ -1898,6 +1930,54 @@ mod tests {
             run("Object.keys(Object.defineProperty({}, 'x', { value: 1, enumerable: false })).length")
                 .unwrap(),
             Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn values_and_entries_read_own_data_properties_and_run_accessors() {
+        // The fast path answers an own data property from the descriptor it
+        // already has; an accessor must still run, a non-enumerable property
+        // must still be skipped, and a dense Array's elements are data
+        // properties of the array itself.
+        assert_eq!(
+            run("Object.values({ a: 1, b: 2 }).join()").unwrap(),
+            str("1,2")
+        );
+        assert_eq!(
+            run("var calls = 0; var o = {}; \
+                 Object.defineProperty(o, 'g', { enumerable: true, get: function () { calls++; return 7; } }); \
+                 var v = Object.values(o)[0]; v + '|' + calls")
+            .unwrap(),
+            str("7|1")
+        );
+        assert_eq!(
+            run(
+                "var o = Object.defineProperty({ a: 1 }, 'h', { value: 2, enumerable: false }); \
+                 Object.values(o).join()"
+            )
+            .unwrap(),
+            str("1")
+        );
+        assert_eq!(
+            run("Object.values([10, 20, 30]).join() + '|' + Object.entries([10, 20]).length")
+                .unwrap(),
+            str("10,20,30|2")
+        );
+        // A getter that hides a later key while an earlier one is read still
+        // hides it: the descriptor is re-read per key.
+        assert_eq!(
+            run("var o = {}; \
+                 Object.defineProperty(o, 'a', { enumerable: true, get: function () { \
+                   Object.defineProperty(o, 'b', { value: 2, enumerable: false }); return 1; } }); \
+                 o.b = 2; \
+                 Object.values(o).join()")
+            .unwrap(),
+            str("1")
+        );
+        // An Arguments object's mapped index reflects its parameter.
+        assert_eq!(
+            run("(function (x) { x = 5; return Object.values(arguments).join(); })(1)").unwrap(),
+            str("5")
         );
     }
 
