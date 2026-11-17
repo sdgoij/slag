@@ -296,6 +296,19 @@ that is what `Object.entries` and every string-building row pay per element.
 Node's equivalents are 5-10 ns, so this is where the next structural cut is, not
 in another register-tier lift.
 
+The same session scoped the other half of that line — the call lane — and landed
+neither: `slag-jit`'s `call-lanes.md` §26 has the census and the design. In
+short, a closure created and called inside a loop (three of them per `head-let`
+iteration) is keyed by its box identity, so it never hits the call-site record:
+it pays a probe plus `call_slow` per call, ~650 ns against ~15 ns for the same
+call through a stable callee. Serving it needs the record keyed by a *body site*
+instead, and two facts make that sound (`globals_unshadowed` is site-invariant;
+a `uses_env` leaf additionally needs its environment compared).
+Two smaller experiments were measured and reverted rather than landed: reusing
+the probe's certified verdict from `call_slow` (−10% on the capturing probe, flat
+on `head-let`) and building an `Object.entries` pair through `array_from_values`
+(neutral at two elements).
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

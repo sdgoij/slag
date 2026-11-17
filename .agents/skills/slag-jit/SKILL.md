@@ -74,6 +74,15 @@ Each of these has a section in the file named; none is guessable from the code.
   chain; the signed pair is one instruction each. The canonical-index gate lives
   in `crates/jit/src/index_gate.rs` — use it, and grep a CLIF dump for `_seq`
   before blaming a probe.
+- **A call-site record is keyed by the callee's box identity** (`call-lanes.md`
+  §26): a closure created and called in a loop never hits it, so such a call
+  pays a probe plus `call_slow` (~650 ns) where a stable callee's costs ~15 ns.
+  A body-site key would fix it — `globals_unshadowed` is site-invariant, and a
+  `uses_env` leaf additionally needs its environment compared.
+- **A probe that runs and then falls to `call_slow` does its work twice**
+  (`call-lanes.md` §26): the leaf probe computes the certified descriptor, and
+  `call_slow` re-derives it. Reusing it measured only ~10% on that probe and is
+  not worth the extra record load on every `call_slow`.
 - **The primitive-receiver read is a measured non-lever** (`member-reads.md`
   §36): a string's `.length` and a number's `.valueOf` are ~12% of their own
   row, and `opcost/*`'s node column is a folded loop.

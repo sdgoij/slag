@@ -595,3 +595,53 @@ iteration).
   so it cannot be used to "calibrate" the opt count — `installed_jit_opt_tier_
   leaf_call_inlines_not_call_slow` asserts `opt_compiled_count >= 2` (caller +
   callee) and a small `call_slow` count instead.
+
+## 26. The record is keyed by callee IDENTITY, so a per-iteration closure never hits
+
+This is the largest measured item left in the call lane, and it is not a bug:
+the record's key is the callee's exact NaN-box identity, and a closure created
+inside a loop is a new box every iteration. Measured on five probes of the same
+shape (one closure, created and called, 100k bodies; `JIT_HELPER_STATS` counts
+per body):
+
+| probe | ms | probe calls | lane |
+|---|---:|---:|---|
+| captures the loop binding, fresh per iteration | 252 | 3 | `call_slow` ×4 |
+| captures nothing, fresh per iteration | 128 | 3 | in-frame inline ×2 + cert |
+| one closure per body, called 3× | 53–61 | 1 | in-frame inline |
+| one closure per body capturing an outer `var` | 57 | 1 | certified ×2 |
+
+So a *stable* callee reaches the in-frame or certified lane (~10-20 ns a call)
+while a *fresh capturing* callee pays a full probe plus `call_slow` every time
+(~650 ns a call). The capture matters twice over: `uses_env` leaves are rejected
+by the probe (`reject!("uses-env")`, which is why they never reach the env lane
+from a miss), and `call_slow` then re-derives the certified descriptor the probe
+had already computed.
+
+What a fix needs, and the two facts that make it sound:
+
+- **Key the record by a body site, not by the box.** `CompiledBody` is shared per
+  creation site, so a monotonic `site_id` on it (a counter — *not* the `Rc`
+  address, which can be recycled after a chunk frees) identifies the callee's
+  body across closures. The record then stores that id instead of
+  `callee_hi`/`callee_payload`, and the emitted gate loads it from the callee
+  box at a fixed offset (guard the load with the Function tag; an Object has no
+  such field).
+- **`globals_unshadowed` is site-invariant**, which is the fact that makes the
+  certified descriptor reusable. It walks the environment chain asking each
+  record `has_binding(name)` for the body's global names; every link's *name
+  set* comes from the compile-time lexical shape, so two closures of one site
+  answer identically even though their environment objects differ (a `Global`
+  link answers true and an `Object` link false by kind alone).
+- **A `uses_env` leaf is the exception**, because `LeafInlineInfo::environment`
+  is the *closure's* [[Environment]] and the env lane swaps it in. Serving a
+  body-keyed hit there needs the environment compared too: store the edge
+  pointer in the record and have the emitter compare it against the live
+  callee's (one fixed-offset load), falling to the probe on a mismatch.
+
+Two experiments in this area did **not** pay and were reverted, so nobody
+re-derives them: reusing the probe's certified verdict from `call_slow` (a
+`cached_certified` helper, validated by `record_matches` + the epoch) measured
+−10% on the capturing probe and flat on `head-let`; and building an
+`Object.entries` pair through `array_from_values` (one dense extend instead of
+two defines) is neutral at 2 elements.
