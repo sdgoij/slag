@@ -537,8 +537,48 @@ primitive rows read 5-16% slower against the control binary, and the change is
 provably less work (`cell_object`/`chain_object` return `None` for a primitive).
 `--jitless` rows in that size class move ±13% between two runs of the *same*
 binary here, so this is the cross-binary layout sensitivity the skill warns
-about, not a mechanism. The JIT is the measured, default mode; do not "fix" the
-interpreter on the strength of a cross-binary `--jitless` number alone.
+about, not a mechanism. The JIT is the measured, default mode; do not "fix"
+the interpreter on the strength of a cross-binary `--jitless` number alone.
+
+### The same shape in `JSON.stringify`: a key re-interned per member
+
+A corpus-wide profile (`SLAG_SAMPLE=200` over all 81 workloads in one
+process) put GC at ~11% and the call lane at ~7%, but nothing single-function
+that large — the remaining time is spread. The per-row profile of
+`opcost/json_stringify` (778 ns for a three-property object, 3.2x node) did
+have one defect worth naming:
+
+| share | symbol |
+|---:|---|
+| 7.5% | `JsObject::ordinary_property_lookup` |
+| 4.1% | `string::intern` |
+| 2.6% | `context::get_property_key` |
+| 2.2% | `JsObject::get_own_property_key` |
+| 2.1% | `string::lookup` |
+| 1.7% | `JsString::from_utf8` |
+
+`enumerable_string_keys` resolves the object's own keys as **atoms** (they come
+from `own_keys_cached`), then threw the atom away to return `Vec<JsString>`, and
+`serialize_json_property` passed that string to `get_property`, which
+`PropertyKey::from_js_string` interns again — per member. So every member paid a
+hash-and-intern plus the generic [[Get]] chain walk to read a property whose
+key it already held. The key is now carried as a `PropertyKey` and read with
+`get_property_key`, whose own-data fast path answers from the property vector.
+The `"toJSON"` probe had the same shape one level up (`JsString::from_utf8` +
+intern per object-valued member) and now uses a cached atom; the array path no
+longer spells `index.to_string()` per element (a canonical-index atom instead,
+with the text materialized only if a replacer/`toJSON` actually runs).
+
+Isolated, interleaved min-of-7 against the previous binary:
+`opcost/json_stringify` **−14.2%**, `builtins/json_roundtrip` **−20.5%**.
+The values are still read per member, not up front — a replacer that mutates a
+later property must see the mutation, so the pre-read shortcut is not available
+and the atom is the whole win.
+
+The reusable rule: `get_property` takes a `&JsString` and interns it. A caller
+that already holds a `PropertyKey`/atom and hands it a string has thrown that
+away — the pattern shows up as `intern` + `ordinary_property_lookup` in a
+profile of a loop that only reads own data properties.
 
 ## What the current design has taken as far as it goes
 

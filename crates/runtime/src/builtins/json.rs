@@ -14,7 +14,7 @@ use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable};
 
 use crate::agent::Agent;
-use crate::context::{as_object, get_property};
+use crate::context::{as_object, get_property, get_property_key};
 use crate::realm::Realm;
 
 const JSON_NS: &str = "%JSON%";
@@ -649,7 +649,7 @@ fn internalize_json_property(
             }
         } else {
             let keys = enumerable_string_keys(agent, &value)?;
-            for key in keys {
+            for (_, key) in keys {
                 let entry_record = entries
                     .iter()
                     .find(|(entry_key, _)| entry_key == &key)
@@ -685,7 +685,10 @@ fn length_of_array_like(agent: &mut Agent, value: &Value) -> Result<u64, JsError
 }
 
 /// EnumerableOwnPropertyNames (spec 7.3.23) restricted to string keys.
-fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsString>, JsError> {
+fn enumerable_string_keys(
+    agent: &mut Agent,
+    value: &Value,
+) -> Result<Vec<(crux::property::PropertyKey, JsString)>, JsError> {
     let object = crate::context::to_object(agent, value)?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
@@ -697,7 +700,10 @@ fn enumerable_string_keys(agent: &mut Agent, value: &Value) -> Result<Vec<JsStri
         if let Some(prop) = obj.get_own_property_key(key)?
             && prop.enumerable
         {
-            out.push(crux::lookup(*id));
+            // Carry the key itself, not just its text: the member read needs
+            // the `PropertyKey`, and recovering it from the string re-interns
+            // every key of every object.
+            out.push((key.clone(), crux::lookup(*id)));
         }
     }
     Ok(out)
@@ -781,6 +787,7 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
     // lookup and the `%Object.prototype%` intrinsic read were about half of
     // `JSON.stringify({})`'s 430 ns (`scratch/iso/j0`).
     let empty = JsString::from_utf8("");
+    let root_key = crux::property::PropertyKey::String(empty_key_atom());
     let mut out: Vec<u16> = Vec::new();
     let wrote = if state.replacer_function.is_some() {
         let wrapper = JsObject::ordinary_object_create(
@@ -791,9 +798,24 @@ fn json_stringify(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Val
                 .and_then(|value| as_object(&value)),
         );
         wrapper.create_data_property_or_throw(&empty, value)?;
-        serialize_json_property(agent, &mut state, &empty, &Value::Object(wrapper), &mut out)?
+        serialize_json_property(
+            agent,
+            &mut state,
+            &root_key,
+            Some(&empty),
+            &Value::Object(wrapper),
+            &mut out,
+        )?
     } else {
-        serialize_json_value(agent, &mut state, &empty, value, value, &mut out)?
+        serialize_json_value(
+            agent,
+            &mut state,
+            &root_key,
+            Some(&empty),
+            value,
+            value,
+            &mut out,
+        )?
     };
     // The result is assembled in one buffer, so the whole document costs one
     // allocation here instead of a box per member.
@@ -873,12 +895,46 @@ fn property_list_from(agent: &mut Agent, replacer: &Value) -> Result<Vec<JsStrin
 fn serialize_json_property(
     agent: &mut Agent,
     state: &mut StringifyState,
-    key: &JsString,
+    key: &crux::property::PropertyKey,
+    // The key's text, when the caller already has it. Resolved from the atom
+    // only on the rare paths that hand `P` to a user callback, so the common
+    // member read never allocates or interns the key.
+    text: Option<&JsString>,
     holder: &Value,
     out: &mut Vec<u16>,
 ) -> Result<bool, JsError> {
-    let value = get_property(agent, holder, key, *holder)?;
-    serialize_json_value(agent, state, key, value, *holder, out)
+    let value = get_property_key(agent, holder, key, *holder)?;
+    serialize_json_value(agent, state, key, text, value, *holder, out)
+}
+
+/// The key text a replacer function or `toJSON` method receives as `P` (spec
+/// 26.6.3.2). Resolved lazily: `strv` used to be handed the key unconditionally,
+/// which meant every member held a `JsString` for a callback that usually never
+/// runs.
+fn json_key_text(key: &crux::property::PropertyKey, text: Option<&JsString>) -> JsString {
+    if let Some(text) = text {
+        return text.clone();
+    }
+    match key {
+        crux::property::PropertyKey::String(id) => crux::lookup(*id),
+        crux::property::PropertyKey::Symbol(_) => JsString::from_utf8(""),
+    }
+}
+
+/// The interned `"toJSON"` atom. Reading it through `get_property` with a
+/// `JsString` key re-interns the text for every object-valued member, which is
+/// one lookup (plus a fresh string) per object otherwise.
+fn to_json_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
+    *ATOM.get_or_init(|| crux::string::intern_utf8("toJSON"))
+}
+
+/// The canonical `""` atom — the root member key of spec 26.6.3.2.
+fn empty_key_atom() -> crux::AtomId {
+    use std::sync::OnceLock;
+    static ATOM: OnceLock<crux::AtomId> = OnceLock::new();
+    *ATOM.get_or_init(|| crux::string::intern_utf8(""))
 }
 
 /// [`serialize_json_property`] with the value already in hand: the root call
@@ -893,7 +949,8 @@ fn serialize_json_property(
 fn serialize_json_value(
     agent: &mut Agent,
     state: &mut StringifyState,
-    key: &JsString,
+    key: &crux::property::PropertyKey,
+    key_text: Option<&JsString>,
     mut value: Value,
     receiver: Value,
     out: &mut Vec<u16>,
@@ -902,13 +959,20 @@ fn serialize_json_value(
         value.kind(),
         ValueKind::Object(_) | ValueKind::Function(_) | ValueKind::BigInt(_)
     ) {
-        let to_json = get_property(agent, &value, &JsString::from_utf8("toJSON"), value)?;
+        let to_json = get_property_key(
+            agent,
+            &value,
+            &crux::property::PropertyKey::String(to_json_atom()),
+            value,
+        )?;
         if is_callable(&to_json) {
-            value = crate::function::call(agent, &to_json, value, &[strv(key)])?;
+            let name = strv(&json_key_text(key, key_text));
+            value = crate::function::call(agent, &to_json, value, &[name])?;
         }
     }
     if let Some(replacer_function) = &state.replacer_function {
-        value = crate::function::call(agent, replacer_function, receiver, &[strv(key), value])?;
+        let name = strv(&json_key_text(key, key_text));
+        value = crate::function::call(agent, replacer_function, receiver, &[name, value])?;
     }
     if let ValueKind::Object(obj) = value.kind() {
         if is_raw_json(agent, &value) {
@@ -1020,7 +1084,15 @@ fn serialize_json_object_inner(
         state.indent = format!("{}{}", state.indent, state.gap);
     }
     let keys = match &state.property_list {
-        Some(list) => list.clone(),
+        Some(list) => list
+            .iter()
+            .map(|text| {
+                (
+                    crux::property::PropertyKey::from_js_string(text),
+                    text.clone(),
+                )
+            })
+            .collect(),
         None => enumerable_string_keys(agent, value)?,
     };
     // Assemble the member text directly in the caller's UTF-16 buffer, so a
@@ -1045,7 +1117,7 @@ fn serialize_json_object_inner(
     out.push(b'{' as u16);
     let open = out.len() - 1;
     let mut wrote = false;
-    for key in &keys {
+    for (key, key_text) in &keys {
         let mark = out.len();
         if wrote {
             out.push(b',' as u16);
@@ -1054,12 +1126,12 @@ fn serialize_json_object_inner(
             out.push(b'\n' as u16);
             out.extend_from_slice(&inner);
         }
-        quote_into(out, key);
+        quote_into(out, key_text);
         out.push(b':' as u16);
         if gapped {
             out.push(b' ' as u16);
         }
-        if serialize_json_property(agent, state, key, value, out)? {
+        if serialize_json_property(agent, state, key, Some(key_text), value, out)? {
             wrote = true;
         } else {
             // Omitted: nothing of this member may reach the result, separator
@@ -1146,9 +1218,11 @@ fn serialize_json_array_inner(
             out.push(b'\n' as u16);
             out.extend_from_slice(&inner);
         }
-        let key = JsString::from_utf8(&index.to_string());
+        // A canonical index key, so the member read never spells or interns
+        // the index; the text is materialized only if a callback wants it.
+        let key = crux::property::PropertyKey::String(crux::string::index_atom(index));
         // spec 26.6.3.5 step 8: an omitted element serializes as "null".
-        if !serialize_json_property(agent, state, &key, value, out)? {
+        if !serialize_json_property(agent, state, &key, None, value, out)? {
             out.extend_from_slice(&[b'n' as u16, b'u' as u16, b'l' as u16, b'l' as u16]);
         }
     }
