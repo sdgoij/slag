@@ -2128,7 +2128,21 @@ extern "C" fn call_slow(
     // code runs directly, with a nested frame carved from `vm.stack`, instead
     // of the interpreter funnel. `None` (an ineligible or not-yet-compiled callee)
     // falls through to that funnel, which ports the callee and promotes it.
-    if direct_eval == 0 {
+    // One decode serves both lanes below: only a function box is a candidate
+    // for either, and a method call's callee is usually an engine builtin.
+    let callee_function = match Value::from_bits(callee).kind() {
+        ValueKind::Function(function) => Some(function),
+        _ => None,
+    };
+    // A callee that is not an ECMAScript function — an engine builtin, a bound
+    // function, a proxy — can never be a lane target. Gate the record probe on
+    // the kind first: `record_certified` dereferences the callee's body site
+    // through the box and `certified_lane_inline` repeats the decode, all of it
+    // wasted on a builtin (method) call, the common slow-call shape.
+    if direct_eval == 0
+        && let Some(function) = callee_function
+        && matches!(function.kind, crux::function::FunctionKind::EcmaScript)
+    {
         // Serving the record's cached verdict is only sound with every Vm
         // stack clear: a nested run's pending error is attributed through the
         // CALLER's try/boundary stacks, so with a `try` open a throwing callee
@@ -2147,7 +2161,7 @@ extern "C" fn call_slow(
         };
         let outcome =
             certified_lane_inline(ctx, callee, this, args, argc, info.as_ref(), same, false);
-        if std::env::var("SLAG_SLOW_TRACE").is_ok() {
+        if slow_trace_on() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 14 {
@@ -2172,9 +2186,9 @@ extern "C" fn call_slow(
     // callback still needs its own activation, and a cross-realm call keeps
     // the general path (the callee's realm must be current for its handler).
     if direct_eval == 0
+        && let Some(function) = callee_function
         && !unsafe { &*ctx.agent }.is_terminating()
         && unsafe { &*ctx.agent }.realm_count.get() == 1
-        && let ValueKind::Function(function) = Value::from_bits(callee).kind()
     {
         let agent = unsafe { &mut *ctx.agent };
         let is_native = matches!(
@@ -3285,6 +3299,15 @@ fn leaf_trace_on() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("JIT_LEAF_TRACE").is_ok())
+}
+
+/// Whether the `SLAG_SLOW_TRACE` diagnostic is on, read once per process. The
+/// slow-call path consults this on every builtin call, and `std::env::var_os`
+/// costs ~140 ns, so it must not be re-read per call.
+fn slow_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SLAG_SLOW_TRACE").is_some())
 }
 
 extern "C" fn leaf_call_probe(

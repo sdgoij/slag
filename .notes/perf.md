@@ -462,6 +462,84 @@ the probe's certified verdict from `call_slow` (−10% on the capturing probe, f
 on `head-let`) and building an `Object.entries` pair through `array_from_values`
 (neutral at two elements).
 
+## 2026-11-17: a builtin call was paying the interpreter's bills
+
+The opcost table was the tell: `num_valueof` 105x node's JIT and 11.5x its
+*interpreter*, `array_slice` 10.3x the interpreter, `typed_array_for_each`
+6.6x, `regexp_test` 5.6x, `string_indexof` 3.3x. A row that beats its own
+`--jitless` run by only 25% (`num_valueof` 5.9 vs 7.4 ms) is not being run by
+the JIT at all — it is running the interpreter's call machinery with a helper
+call on top.
+
+`JIT_HELPER_STATS` says why: every one of those rows is `GetMemberName` +
+`CallSlow` per iteration (`string_charat` is the exception — it has an
+intrinsic). The `prof` profile (`cargo build --profile prof -p cli`,
+`SLAG_SAMPLE=500`, `tools/profile.py`) of an amplified `num_valueof` loop then
+split the cost:
+
+| share | symbol |
+|---:|---|
+| 27.9% | `runtime::jit::call_slow` |
+| 21.9% | outside-image (the compiled loop) |
+| 10.1% | `<crux::value::Value>::kind` |
+| 7.3% | `Vm::primitive_proto_data_get` |
+| 6.5% | `runtime::jit::certified_lane_inline` |
+| 6.0% | `Agent::builtin_call_lookup` |
+| 4.9% | `Vm::get_member_name` |
+| 4.2% | `Vm::get_primitive_member` |
+
+The cheap parts of that were three separate wastes, none of them an algorithm:
+
+- `call_slow` read `std::env::var("SLAG_SLOW_TRACE")` **on every call** to
+decide whether to print a 14-line trace. The codebase's own note puts an
+`env::var_os` at ~140 ns; the whole builtin call was 220 ns. Cached behind a
+`OnceLock` like the neighbouring `leaf_trace_on`.
+- `get_member_name` ran the identity-keyed chain cache and the own-property
+cell on a *primitive* receiver before `get_primitive_member`. Both decline a
+primitive (`chain_object`/`cell_object` return `None`), and the two
+`resolve_*_cell` calls after the read were no-ops — four `Value::kind` decodes
+and three calls per read, purely to reach the same answer. The primitive now
+takes `get_primitive_member` before those probes.
+- `call_slow` probed the call-site record (`record_certified`, which
+dereferences the callee's body site) and then `certified_lane_inline` (which
+decodes the kind and immediately rejects) for callees that are not ECMAScript
+functions — i.e. for every builtin. One decode now gates both lanes, and the
+record probe only runs for an EcmaScript callee.
+
+Isolated rows, interleaved min-of-N, control = the previous binary (a
+cross-binary layout swing of ±7% on the short rows, from a same-binary null
+control):
+
+| row | before | after | delta |
+|---|---:|---:|---:|
+| `opcost/num_valueof` | 24.84 | 3.00 | **−87.9%** |
+| `opcost/string_indexof` | 18.25 | 6.30 | −65.5% |
+| `opcost/array_slice` | 42.31 | 17.66 | −58.3% |
+| `opcost/object_keys` | 39.00 | 17.88 | −54.2% |
+| `opcost/typed_array_for_each` | 44.12 | 21.55 | −51.2% |
+| `opcost/object_keys_fresh` | 54.55 | 28.55 | −47.7% |
+| `opcost/array_for_each` | 29.84 | 18.07 | −39.4% |
+| `opcost/map_for_each` | 31.75 | 19.58 | −38.3% |
+| `opcost/json_stringify` | 106.92 | 67.08 | −37.3% |
+| `opcost/array_length_write` | 11.65 | 7.88 | −32.4% |
+| `opcost/array_to_sorted` | 51.02 | 38.22 | −25.1% |
+| `opcost/regexp_test` | 51.63 | 39.11 | −24.2% |
+| `opcost/array_fill` | 19.00 | 6.01 | −68.4% |
+
+The whole-corpus pass moves mean-jitGap **12.85 → 10.22** (81 rows, parity
+exact in all four modes); `builtins` 29.57 → 17.45 and `opcost` fell with it.
+The first of the three changes alone was −66% on `num_valueof`, so an
+`env::var` on a per-call path is worth checking for before assuming a profile's
+"call overhead" is intrinsic.
+
+One caveat, recorded rather than explained: on the *interpreter* side the three
+primitive rows read 5-16% slower against the control binary, and the change is
+provably less work (`cell_object`/`chain_object` return `None` for a primitive).
+`--jitless` rows in that size class move ±13% between two runs of the *same*
+binary here, so this is the cross-binary layout sensitivity the skill warns
+about, not a mechanism. The JIT is the measured, default mode; do not "fix" the
+interpreter on the strength of a cross-binary `--jitless` number alone.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at

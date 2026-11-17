@@ -10870,6 +10870,18 @@ impl Vm {
         // the bulk of a prototype read's helper cost, and a chain hit proves
         // the receiver owns no `name` (the record checks it, and the
         // generation/link validation catches any structural change since).
+        //
+        // A PRIMITIVE receiver is served first: the chain cache and the
+        // own-property cells are keyed by object identity, so every probe
+        // below declines a primitive (four `Value::kind` decodes) and the two
+        // post-read `resolve_*_cell` stores are no-ops (`chain_object`/
+        // `cell_object` return `None`). A hot `(n).valueOf()` loop showed this
+        // wasted work at ~27% of the read's samples. `get_primitive_member`
+        // reproduces the exact [[Get]] for every primitive kind, so taking it
+        // directly is behaviour-identical.
+        if !matches!(object.kind(), ValueKind::Object(_) | ValueKind::Function(_)) {
+            return Self::get_primitive_member(agent, object, &PropertyKey::String(name));
+        }
         if let Some(value) = Self::member_chain_get(agent, &object, name) {
             return Ok(value);
         }
