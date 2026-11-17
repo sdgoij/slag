@@ -4138,6 +4138,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         named,
         outer_chain,
         per_iteration_chain,
+        site,
     }) = step_at(ctx, step)
     else {
         // The compiled code passes its own step index; a mismatch is an
@@ -4157,6 +4158,7 @@ extern "C" fn create_function(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain.clone(),
         per_iteration_chain.clone(),
         named.clone(),
+        Some(site),
     ) {
         Ok(value) => value.bits(),
         Err(error) => slow_error(ctx, error),
@@ -4222,6 +4224,7 @@ extern "C" fn create_function_decl(ctx: *mut c_void, step: u64) -> u64 {
         outer_chain.clone(),
         per_iteration_chain.clone(),
         false,
+        None,
         None,
     ) {
         Ok(value) => value,

@@ -1287,6 +1287,7 @@ pub(crate) fn eval_function_declaration(
             Vec::new().into(),
             false,
             None,
+            None,
         )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;
         return Ok(());
@@ -1467,6 +1468,7 @@ pub(crate) fn block_declaration_instantiation_iter<'a>(
                             Vec::new().into(),
                             Vec::new().into(),
                             false,
+                            None,
                             None,
                         )?;
                         block_env.initialize_binding(&name, func_obj)?;

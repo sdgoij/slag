@@ -273,6 +273,45 @@ longer the dominant term.
 Gates: `sweep all` 48,633/48,633 (0 fail, 0 skip, 0 hang), `cargo test
 --workspace` green, clippy `-D warnings` clean.
 
+## 2026-11-17: the other half of the closure cost was the site's static facts
+
+With the call lane fixed, the per-iteration closure row was ~380 ns per
+iteration of which ~300 ns was **creation** — and creation re-derived, per
+closure, four things that cannot differ between closures of one site: the
+shared body, params and source texts (three thread-local `HashMap` probes), the
+body-directive strictness (an AST scan), and the compiled body (a per-agent
+`compiled_bodies` probe). None of them is large; together they are most of the
+row. A 1 M-creation probe with the nursery threshold swept from 256 to 65,536
+boxes moves by nothing (309 / 293 / 312 ms), so the cost is the work, not the
+collector.
+
+`SiteTemplate`/`SiteCell` (`function.rs`), carried by `Step::CreateFunction`,
+now hold those five facts; the site's first closure resolves and fills them and
+the rest read them. The template lives in the agent's compiled body, so its
+`Rc`s belong to the same agent as the closures. Arrows got one more cut on the
+same pass: they materialized `length`/`name` eagerly while a plain function
+deferred them to `ensure_function_properties`, so an arrow creation paid the
+shape fork. Deferring it needed `ensure_function_properties` to derive
+AddRestrictedFunctionProperties from `[[ThisMode]]` instead of strictness — a
+lexical-this arrow must never get sloppy `caller`/`arguments`.
+
+| probe (min of 5–7 interleaved pairs) | before | after | delta |
+|---|---:|---:|---:|
+| closure creation only, 1 M | 296.3 | 214.3 | **−27.7%** |
+| arrow creation only, 1 M | 330.3 | 271.5 | **−17.8%** |
+| per-iteration capturing closure + call, 1 M | 374.1 | 315.3 | −15.7% |
+| the head-let shape (3 per iteration, 100 k) | 191.4 | 160.3 | −16.3% |
+
+Cumulative against the pre-body-site control over both cuts: the per-iteration
+capturing closure 643.9 → 313.4 ms (**−51.3%**), the head-let shape 247.0 →
+158.8 (**−35.7%**), a stable closure −17%, arrow creation −10.7%; the
+untouched stable-leaf row is flat. What remains of the creation row is the
+`ecma_functions` insert (one record per live function), the arena allocation
+and the per-closure context reads.
+
+Gates: `sweep all` 48,633/48,633, `cargo test --workspace` green, clippy
+`-D warnings` clean.
+
 ## 2026-11-17: the optimizing tier was not running on the two biggest rows
 
 A helper-call *signature* whose parameter count disagrees with the call is not a

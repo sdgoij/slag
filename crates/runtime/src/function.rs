@@ -135,7 +135,7 @@ impl Trace for ClassField {
 /// re-applied to each fresh constructor record from the site (see
 /// `Agent::compiled_bodies`).
 #[derive(Clone)]
-pub(crate) struct CompiledBodyCacheEntry {
+pub struct CompiledBodyCacheEntry {
     pub compiled: std::rc::Rc<crate::ir::CompiledBody>,
     pub this_writes: (usize, [crux::AtomId; 4]),
     /// The creation site's id (see `Function::body_site`). Monotonic, never
@@ -149,6 +149,54 @@ static NEXT_BODY_SITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 fn next_body_site() -> u64 {
     let site = NEXT_BODY_SITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if site == 0 { next_body_site() } else { site }
+}
+
+/// The site-static facts of a closure creation site: the shared body, params and
+/// source texts, the body-directive strictness and the compiled body. Every
+/// closure from one site resolves the same values, so the site's first creation
+/// fills this and the rest read it — replacing three thread-local cache probes,
+/// the directive-prologue scan and the per-agent `compiled_bodies` probe per
+/// closure.
+#[derive(Clone)]
+pub struct SiteTemplate {
+    pub body: std::rc::Rc<Block>,
+    pub params: std::rc::Rc<[BindingElement]>,
+    pub source_info: Option<std::rc::Rc<SourceInfo>>,
+    /// Whether the body's own directive prologue says `"use strict"` (the
+    /// caller still folds in an enclosing function's strictness).
+    pub body_strict: bool,
+    pub compiled: CompiledBodyCacheEntry,
+}
+
+/// A creation site's lazily filled [`SiteTemplate`], carried by the step that
+/// creates the closure. Per-agent: the step lives in the agent's compiled body,
+/// so the template's `Rc`s belong to the same agent as the closures that read
+/// it.
+#[derive(Default, Clone)]
+pub struct SiteCell(std::cell::OnceCell<std::rc::Rc<SiteTemplate>>);
+
+impl SiteCell {
+    /// The site's template, once a closure has been created from it.
+    pub fn get(&self) -> Option<&std::rc::Rc<SiteTemplate>> {
+        self.0.get()
+    }
+
+    /// Fill the site from its first creation. A later fill is ignored: the
+    /// first writer wins, and every closure of the site resolves the same
+    /// facts.
+    pub fn fill(&self, template: SiteTemplate) {
+        let _ = self.0.set(std::rc::Rc::new(template));
+    }
+}
+
+impl std::fmt::Debug for SiteCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "SiteCell(filled)"
+        } else {
+            "SiteCell(empty)"
+        })
+    }
 }
 
 /// The source texts a function record carries, shared by every closure from the
@@ -1234,9 +1282,17 @@ pub(crate) fn ensure_function_properties(
     }
     // Copied out in one borrow: the adoption below allocates (the name box,
     // the empty string's box) and must not run with the record table borrowed.
+    //
+    // `restricted` is AddRestrictedFunctionProperties (spec 10.2.1): only a
+    // SLOPPY ordinary function gets the own `caller`/`arguments`. `[[ThisMode]]`
+    // is the discriminator, not strictness — an arrow is lexical-this in both
+    // modes and must never get them.
     let Some((restricted, params)) = agent.ecma_function(&function.id()).map(|data| {
         (
-            !data.strict && !data.is_method && !data.is_async && !data.is_generator,
+            data.this_mode == ThisMode::Sloppy
+                && !data.is_method
+                && !data.is_async
+                && !data.is_generator,
             data.params.clone(),
         )
     }) else {
@@ -1445,6 +1501,7 @@ pub fn instantiate_function(
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
     named: Option<JsString>,
+    site: Option<&SiteCell>,
 ) -> Result<Value, JsError> {
     instantiate_function_with_source(
         agent,
@@ -1456,6 +1513,7 @@ pub fn instantiate_function(
         per_iteration_chain,
         named_expression,
         named,
+        site,
     )
 }
 
@@ -1470,36 +1528,53 @@ pub fn instantiate_function_with_source(
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
     named: Option<JsString>,
+    site: Option<&SiteCell>,
 ) -> Result<Value, JsError> {
     let _total = phases::enter(phases::TOTAL);
     phases::count_call();
     {
         let _phase = phases::enter(phases::OVERHEAD);
     }
-    let source_info = {
-        let _phase = phases::enter(phases::SOURCE_INFO);
-        match source {
-            Some(slice) => {
-                // A caller-supplied slice (a module declaration's own text, a
-                // snapshot restore): its body spans run past the slice when it has
-                // nested closures, so the enclosing text is still the full one
-                // when a frame carries it.
-                Some(source_info_with_slice(agent, f.span, slice))
-            }
-            None => shared_source_info(agent, f as *const syntax::ast::Function as usize, f.span),
+    let template = site.and_then(|cell| cell.get().cloned());
+    let (source_info, body, params, body_strict) = match template.as_deref() {
+        Some(template) => (
+            template.source_info.clone(),
+            template.body.clone(),
+            template.params.clone(),
+            Some(template.body_strict),
+        ),
+        None => {
+            let source_info = {
+                let _phase = phases::enter(phases::SOURCE_INFO);
+                match source {
+                    Some(slice) => {
+                        // A caller-supplied slice (a module declaration's own text, a
+                        // snapshot restore): its body spans run past the slice when it has
+                        // nested closures, so the enclosing text is still the full one
+                        // when a frame carries it.
+                        Some(source_info_with_slice(agent, f.span, slice))
+                    }
+                    None => shared_source_info(
+                        agent,
+                        f as *const syntax::ast::Function as usize,
+                        f.span,
+                    ),
+                }
+            };
+            let site_source = source_info
+                .as_ref()
+                .and_then(|info| info.site())
+                .or_else(|| site_source(agent, f.span));
+            let body = {
+                let _phase = phases::enter(phases::BODY);
+                shared_function_body_at(agent, f, site_source)
+            };
+            let params = {
+                let _phase = phases::enter(phases::PARAMS);
+                shared_params(&body, &f.params)
+            };
+            (source_info, body, params, None)
         }
-    };
-    let site = source_info
-        .as_ref()
-        .and_then(|info| info.site())
-        .or_else(|| site_source(agent, f.span));
-    let body = {
-        let _phase = phases::enter(phases::BODY);
-        shared_function_body_at(agent, f, site)
-    };
-    let params = {
-        let _phase = phases::enter(phases::PARAMS);
-        shared_params(&body, &f.params)
     };
     let value = {
         let _phase = phases::enter(phases::CALL_REGISTER);
@@ -1513,9 +1588,12 @@ pub fn instantiate_function_with_source(
             DefinitionKind::function(f.is_async, f.is_generator),
             source_info,
             None,
+            body_strict,
             outer_chain,
             per_iteration_chain,
             named_expression,
+            site,
+            template,
         )?
     };
     // The chain rides on the record now, so what is left of the caller's tail
@@ -2008,9 +2086,12 @@ pub fn instantiate_method(
         DefinitionKind::method(f.is_async, f.is_generator),
         source_info,
         None,
+        None,
         Vec::new().into(),
         PerIterationChain::default(),
         false,
+        None,
+        None,
     )
 }
 
@@ -2050,9 +2131,12 @@ pub fn instantiate_accessor(
         DefinitionKind::method(false, false),
         source_info,
         None,
+        None,
         Vec::new().into(),
         PerIterationChain::default(),
         false,
+        None,
+        None,
     )
 }
 
@@ -2125,9 +2209,12 @@ fn instantiate_class_constructor_with(
         },
         source_info,
         None,
+        None,
         Vec::new().into(),
         PerIterationChain::default(),
         false,
+        None,
+        None,
     )?;
     if default_derived
         && let Some(function) = function.as_function()
@@ -2249,6 +2336,9 @@ fn register_function(
     // `shared_source_info` / `source_info_with_slice`).
     source_info: Option<std::rc::Rc<SourceInfo>>,
     strict: Option<bool>,
+    // The body's own directive-prologue strictness, when the caller already
+    // resolved it (the site's first creation) — saves the scan per closure.
+    body_strict: Option<bool>,
     outer_chain: OuterChain,
     // The per-iteration head layouts at the creation site. Carried by the
     // record itself: installing it after the insert meant a second
@@ -2256,21 +2346,25 @@ fn register_function(
     // live function) on every closure creation.
     per_iteration_chain: PerIterationChain,
     named_expression: bool,
+    // The site's template cache (filled here on the first creation) and the
+    // template this call already read, if any.
+    site: Option<&SiteCell>,
+    template: Option<std::rc::Rc<SiteTemplate>>,
 ) -> Result<Value, JsError> {
     // `strict` overrides the body-directive check (CreateDynamicFunction
     // computes it against its assembled source, which the running context
     // cannot provide); `enclosing_strict` still forces strictness.
     let _self = phases::enter(phases::SELF);
-    let (strict, this_mode) = {
+    let (strict, this_mode, body_strict) = {
         let _phase = phases::enter(phases::STRICT);
-        let strict =
-            strict.unwrap_or_else(|| body_is_strict(agent, &body, None)) || enclosing_strict;
+        let body_strict = body_strict.unwrap_or_else(|| body_is_strict(agent, &body, None));
+        let strict = strict.unwrap_or(body_strict) || enclosing_strict;
         let this_mode = if strict {
             ThisMode::Strict
         } else {
             ThisMode::Sloppy
         };
-        (strict, this_mode)
+        (strict, this_mode, body_strict)
     };
     let realm = {
         let _phase = phases::enter(phases::REALM);
@@ -2291,6 +2385,16 @@ fn register_function(
     // fast pointer it feeds — runs once per site instead of once per
     // closure. The pointer is captured before `body` moves into the record.
     let body_key = std::rc::Rc::as_ptr(&body) as usize;
+    // The site-static `Rc`s for the template fill below, taken before they move
+    // into the record (three atomic-free bumps, and only on a site's first
+    // creation).
+    let template_facts = (site.is_some() && template.is_none()).then(|| {
+        (
+            std::rc::Rc::clone(&body),
+            std::rc::Rc::clone(&params),
+            source_info.clone(),
+        )
+    });
     let _record_phase = phases::enter(phases::RECORD);
     let mut data = EcmaFunction {
         name: name.clone(),
@@ -2367,13 +2471,31 @@ fn register_function(
     // The paired `this_writes` pattern is re-applied to each fresh
     // constructor record below (Cut 43: the compiled body is shared per
     // site, so the pattern is computed once and copied).
-    let entry = {
-        let _phase = phases::enter(phases::COMPILE);
-        shared_compiled_body(agent, &data, body_key)?
+    let entry = match template.as_deref() {
+        Some(template) => template.compiled.clone(),
+        None => {
+            let _phase = phases::enter(phases::COMPILE);
+            shared_compiled_body(agent, &data, body_key)?
+        }
     };
     let this_writes = entry.this_writes;
     function.set_body_site(entry.site_id);
-    data.set_compiled(entry.compiled);
+    data.set_compiled(std::rc::Rc::clone(&entry.compiled));
+    // The site's first creation resolves and stores the per-site facts; every
+    // later closure from the same site reads them instead of re-probing the
+    // three thread-local caches, rescanning the directive prologue and
+    // re-probing `compiled_bodies`.
+    if let (None, Some(cell), Some((body, params, source_info))) =
+        (template.as_deref(), site, template_facts)
+    {
+        cell.fill(SiteTemplate {
+            body,
+            params,
+            source_info,
+            body_strict,
+            compiled: entry.clone(),
+        });
+    }
     {
         let _phase = phases::enter(phases::REGISTER);
         agent.register_ecma_function(function.id(), data);
@@ -2570,6 +2692,7 @@ fn directive_is_use_strict(
 
 /// InstantiateOrdinaryFunctionExpression (spec 15.2.5): a named function
 /// expression additionally binds its name immutably in a fresh scope.
+#[allow(clippy::too_many_arguments)]
 pub fn instantiate_function_expression(
     agent: &mut Agent,
     f: &syntax::ast::Function,
@@ -2578,6 +2701,7 @@ pub fn instantiate_function_expression(
     outer_chain: OuterChain,
     per_iteration_chain: PerIterationChain,
     named: Option<JsString>,
+    site: Option<&SiteCell>,
 ) -> Result<Value, JsError> {
     let Some(name) = f.name else {
         return instantiate_function(
@@ -2589,6 +2713,7 @@ pub fn instantiate_function_expression(
             per_iteration_chain,
             false,
             named,
+            site,
         );
     };
     let name = crux::lookup(name);
@@ -2608,6 +2733,7 @@ pub fn instantiate_function_expression(
         per_iteration_chain,
         true,
         named,
+        site,
     )?;
     // spec 15.2.5 step 6: the self-binding is a non-strict immutable binding,
     // so a sloppy-mode assignment to the function's own name is ignored.
@@ -2686,9 +2812,12 @@ pub fn instantiate_function_from_source(
         DefinitionKind::function(f.is_async, f.is_generator),
         source_info,
         Some(strict),
+        None,
         Vec::new().into(),
         PerIterationChain::default(),
         false,
+        None,
+        None,
     )?;
     // GetPrototypeFromConstructor wins over the default %Function.prototype%.
     let ValueKind::Function(function) = value.kind() else {
@@ -2795,13 +2924,15 @@ pub fn instantiate_arrow(
     let this_writes = entry.this_writes;
     function.set_body_site(entry.site_id);
     data.set_compiled(entry.compiled);
-    let params = data.params.clone();
     agent.register_ecma_function(function.id(), data);
     crate::ir::store_construct_patterns(agent, function.id(), this_writes);
-    // Arrows never carry restricted `caller`/`arguments` (no fallback loop).
-    if !set_function_properties_batched(agent, &function, &params, display.as_ref(), false) {
-        set_function_properties(&function, &params, display.as_ref())?;
-    }
+    // An arrow's boilerplate own properties (`length`, `name`) are DEFERRED like
+    // a plain function's: `ensure_function_properties` materializes them from
+    // the record on the first own-property observation, deriving `restricted`
+    // from `[[ThisMode]]` (a lexical-this arrow never gets the sloppy
+    // `caller`/`arguments`). An arrow has no `prototype` to install
+    // (`prototype_pending` is false), so the deferred set is only those two.
+    function.set_props_pending(true);
     Ok(Value::Function(function))
 }
 
@@ -5262,6 +5393,7 @@ pub(crate) fn function_declaration_instantiation(
             Vec::new().into(),
             Vec::new().into(),
             false,
+            None,
             None,
         )?;
         variable_env.set_mutable_binding(&name, func_obj, false)?;

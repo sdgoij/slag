@@ -693,6 +693,11 @@ pub enum Step {
         /// open at this creation site (see
         /// [`crate::function::EcmaFunction::per_iteration_chain`]).
         per_iteration_chain: crate::function::PerIterationChain,
+        /// The site's lazily filled creation template (see
+        /// [`crate::function::SiteCell`]): the shared body/params/source, the
+        /// body's directive strictness and the compiled body, resolved by the
+        /// site's first closure instead of per closure.
+        site: crate::function::SiteCell,
     },
     /// Create an arrow function's closure: `[[ThisMode]]` is lexical and
     /// there is no `prototype` (spec 15.3.2). `outer_chain` is as in
@@ -22070,6 +22075,7 @@ impl Compiler {
                     named,
                     outer_chain,
                     per_iteration_chain,
+                    site: Default::default(),
                 });
                 Ok(())
             }

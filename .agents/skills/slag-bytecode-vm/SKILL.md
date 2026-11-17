@@ -925,6 +925,13 @@ by the fresh-function setup, and the fast paths have traps:
   hashed the key with SipHash before. Don't reintroduce a slow hasher on a
   per-append hot map; the keys (atom ids / symbol pointers) are not
   attacker-controlled.
+- **A creation site's static facts are cached once, not per closure**
+  (`SiteTemplate`/`SiteCell`): the shared body/params/source, the body-directive
+  strictness and the compiled body. See `.notes/perf.md` §2026-11-17 for the
+  numbers. Do not resolve any of them per closure again — and do not defer a
+  closure's boilerplate own properties without checking that
+  `ensure_function_properties` derives AddRestrictedFunctionProperties from
+  `[[ThisMode]]` (an arrow is lexical-this in both strictness modes).
 - The residual floor is `ecma_functions` insert (identity-hashed already)
   + the two per-closure object allocations; the JIT's per-closure FFI
   overhead (~0.4µs) is the other half. A closure-creation loop measures

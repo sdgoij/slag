@@ -662,6 +662,7 @@ pub fn global_declaration_instantiation(
             Vec::new().into(),
             false,
             None,
+            None,
         )?;
         global_env.create_global_function_binding(&name, func_obj, false)?;
     }
@@ -1082,6 +1083,7 @@ fn eval_declaration_instantiation(
             Vec::new().into(),
             Vec::new().into(),
             false,
+            None,
             None,
         )?;
         if variable_env_is_global {

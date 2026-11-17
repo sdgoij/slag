@@ -1889,6 +1889,7 @@ impl Vm {
                 named,
                 outer_chain,
                 per_iteration_chain,
+                site,
             } => {
                 let env = agent.running_context()?.lexical_environment;
                 let value = crate::function::instantiate_function_expression(
@@ -1899,6 +1900,7 @@ impl Vm {
                     outer_chain.clone(),
                     per_iteration_chain.clone(),
                     named.clone(),
+                    Some(site),
                 )?;
                 self.stack.push(value);
             }
@@ -2586,6 +2588,7 @@ impl Vm {
                     outer_chain.clone(),
                     per_iteration_chain.clone(),
                     false,
+                    None,
                     None,
                 )?;
                 if let Some(slot) = frame_slot {
