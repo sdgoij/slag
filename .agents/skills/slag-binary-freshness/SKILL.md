@@ -72,13 +72,37 @@ source refuses that lift (`refuses_update_context_slot` pins it).
 
 So, when abandoning an experiment:
 
-1. Delete the binaries built from it — rebuild from the reverted tree
-   (`cargo run -p xtask -- build`) rather than leaving the old copies.
-2. Delete its cache entry: `target/build-cache/<entry>` holds the artifacts and a
-   `meta.txt` whose `state dirty` (or a `tree`/`head` that no longer matches) is
-   the tell. Leaving it wastes ~60 MB and invites a future `--force` mix-up.
+1. Rebuild from the reverted tree: `cargo run -p xtask -- build`. If the reverted
+   tree is a commit you already built, this is a **0.6 s hit**, not a rebuild —
+   which is the whole point of the cache. (It is only instant if that commit's
+   tree has an entry; see "build after the last edit" below.)
+2. Delete its cache entry, but decide by the **tree**, not by `state dirty`. A
+   `meta.txt` reads `state dirty` whenever the tree was not `HEAD` at build time
+   — which includes a commit's own tree built before the commit object existed
+   (`d17579b7…` is `d3c5cd43`'s tree and says `dirty`). Compare `tree` against
+   `git log --format=%T` and delete only entries that match no commit, and only
+   for experiments you are actually abandoning; an entry for a commit you may
+   measure against later is the instrument, not waste.
 3. Only then run a gate, and say which tree the binary came from. A green sweep
-   from a `state dirty` entry is not evidence about the committed source.
+   from an entry whose tree matches no commit is not evidence about the source.
+
+## Build after the last edit, or the commit tree is never cached
+
+The cache keys on the working tree, so the build that lands in the cache must
+come **after** the last thing that changes a file — including `cargo fmt` and the
+pre-commit hook's `fmt --all`. A session that builds, then formats, then commits
+leaves the committed tree with no entry at all. Measured over one session: of 10
+builds, 3 matched a commit, 7 matched nothing (5 of those from building before
+the tree was final — a later edit, or the final `cargo fmt` — and 2 from reverted
+experiments), and **2 of the 4 commits had no entry** — the two that would have
+been the controls for the next measurement.
+The cost is the 3-minute rebuild you were trying to avoid, at the worst moment:
+when you are about to A/B against the previous commit.
+
+The order that keeps it: edit → `cargo fmt --all` → `cargo run -p xtask -- build`
+→ commit. A docs-only commit is a new tree and so a new (miss) key; it does not
+change the binaries, so build once after the code is final and do not rebuild for
+it.
 
 Conversely, a *legitimate* same-tree rebuild is cheap: a hit copies in well under
 a second, so there is never a reason to skip a rebuild before reporting results.
