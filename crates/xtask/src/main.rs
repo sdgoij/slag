@@ -48,6 +48,13 @@ const KEY_PATHS: [&str; 5] = [
     "crates",
 ];
 
+/// The `KEY_PATHS` entries the test below may find missing: `.cargo` is local
+/// build configuration, and a fresh clone (CI's included) has none. Every other
+/// entry must exist, so a typo in one is caught rather than silently narrowing
+/// the key.
+#[cfg(test)]
+const OPTIONAL_KEY_PATHS: [&str; 1] = [".cargo"];
+
 const USAGE: &str = "\
 usage: cargo run -p xtask -- <task> [options]
 
@@ -781,7 +788,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEY_PATHS, git_text};
+    use super::{KEY_PATHS, OPTIONAL_KEY_PATHS, git_text};
     use std::path::{Path, PathBuf};
 
     /// The workspace root from this crate's manifest directory.
@@ -839,11 +846,15 @@ mod tests {
     }
 
     /// A key path that does not exist is skipped at key time, so a typo would
-    /// silently narrow the key. Every declared path must exist here.
+    /// silently narrow the key. Every declared path must exist here unless it
+    /// is one of the paths that are absent from a fresh checkout by design.
     #[test]
     fn every_key_path_exists() {
         let root = root();
         for path in KEY_PATHS {
+            if OPTIONAL_KEY_PATHS.contains(&path) {
+                continue;
+            }
             assert!(
                 root.join(path).exists(),
                 "KEY_PATHS lists {path}, which is not in this checkout"
