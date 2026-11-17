@@ -1586,7 +1586,19 @@ fn join(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErro
     // Assemble in UTF-16. Each element appends its units directly, so nothing
     // is encoded to UTF-8 and decoded back per element — the same defect the
     // JSON stringifier carried (see `.notes/archive/perf/perf.md`'s string records).
-    let mut result: Vec<u16> = Vec::new();
+    //
+    // A floor on the result length (one unit per element plus one separator
+    // between each pair) sizes the buffer once for the common short-element
+    // case; it is capped because `length` is an arbitrary array-like length,
+    // and a sparse one must not turn into a huge reservation.
+    let hint = (length as usize)
+        .saturating_add(
+            separator
+                .len()
+                .saturating_mul(length.saturating_sub(1) as usize),
+        )
+        .min(4096);
+    let mut result: Vec<u16> = Vec::with_capacity(hint);
     for k in 0..length {
         if k > 0 {
             append_units(&mut result, &separator)?;

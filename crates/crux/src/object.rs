@@ -4253,6 +4253,51 @@ impl JsObject {
         self.create_data_property_key(&key, value)
     }
 
+    /// Append `value` at `index` on a *fresh, unreachable* dense array that is
+    /// still being filled, deferring the length mirror and the generation bump
+    /// to [`JsObject::publish_dense_length`].
+    ///
+    /// The mirror (`properties[0]`) and the generation are per-element costs in
+    /// [`dense_index_define`] because it must serve a live object. A builder
+    /// that owns the array (a `split` result, a from-list array) has no cached
+    /// reader to invalidate while it fills, and every boxing between appends can
+    /// collect, so it cannot batch into a local `Vec` — the array itself has to
+    /// root each element. This is that append: the authoritative
+    /// `slots.length`, the write barrier and one `Vec::push` per element, with
+    /// the publish done once at the end.
+    ///
+    /// Returns `false` (having written nothing) when the receiver is not a
+    /// dense, extensible array or `index` is not the next element — the caller
+    /// falls back to [`JsObject::create_data_property_index`].
+    pub fn dense_append_fresh(&self, index: u64, value: Value) -> bool {
+        let ObjectKind::Array(slots) = &self.kind else {
+            return false;
+        };
+        if !slots.dense.get() || !self.extensible.get() {
+            return false;
+        }
+        // The authoritative length is the next index of a builder-filled dense
+        // array; a sparse tail or an out-of-order index means this is not the
+        // shape the fast append can serve.
+        if slots.length.get() != index as f64 || index > 0xFFFF_FFFE {
+            return false;
+        }
+        crate::heap::write_barrier_element(&**slots, value, index);
+        slots.elements_mut().push(value);
+        slots.length.set(index as f64 + 1.0);
+        true
+    }
+
+    /// Publish a fresh dense array filled with [`JsObject::dense_append_fresh`]:
+    /// sync the length mirror and bump the generation, which the appends
+    /// deliberately deferred.
+    pub fn publish_dense_length(&self) {
+        if let ObjectKind::Array(slots) = &self.kind {
+            self.write_length_mirror(slots.length.get());
+        }
+        self.bump_generation();
+    }
+
     /// The write-side chain-cache generation (Cut 22): bumped by any
     /// own-property or prototype change, so a cached "the chain holds no
     /// accessor/non-writable for this key" verdict can be re-validated

@@ -960,6 +960,7 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         define_piece(&array, count, piece)?;
         count += 1;
         if count == lim as u64 {
+            array.publish_dense_length();
             return Ok(Value::Object(array));
         }
         search_start = match_position + separator_len;
@@ -970,6 +971,7 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
         count,
         substring(&string, search_start, string.len()),
     )?;
+    array.publish_dense_length();
     Ok(Value::Object(array))
 }
 
@@ -978,6 +980,12 @@ fn split(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value, JsErr
 /// the receiver declines the dense path.
 fn define_piece(array: &Handle<JsObject>, index: u64, piece: JsString) -> Result<(), JsError> {
     let value = Value::String(Handle::new(piece));
+    // The result array is fresh and unreachable: `dense_append_fresh` skips the
+    // per-element length mirror and generation bump, which the caller publishes
+    // once after the last piece.
+    if array.dense_append_fresh(index, value) {
+        return Ok(());
+    }
     if !array.create_data_property_index(index, value)? {
         array.create_data_property(&JsString::from_utf8(&index.to_string()), value)?;
     }

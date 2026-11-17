@@ -580,6 +580,52 @@ that already holds a `PropertyKey`/atom and hands it a string has thrown that
 away — the pattern shows up as `intern` + `ordinary_property_lookup` in a
 profile of a loop that only reads own data properties.
 
+### `strings/split_join`: the row is allocation-bound, and it splits ~12x
+
+The worst big row against node's *interpreter* (5.6x). Splitting it in two
+probes (600k iterations each) localizes it:
+
+| half | slag | node | node `--jitless` | vs interpreter |
+|---|---:|---:|---:|---:|
+| `"a,b,c,d,e,f,g,h".split(",")` | 690 ns | 32 ns | 58 ns | **12x** |
+| `parts.join(",")` | 508 ns | 125 ns | 163 ns | 3.1x |
+
+and the split half's own profile is flat rather than having one defect:
+`dense_index_define` 16.5%, `Gc::new<JsString>` 11.7% (one box per piece),
+split's own loop 10.6%, `collect_minor_inner` 8.1%, then `Heap::alloc`,
+`string_index_of`, `as_slice` and the array/slots/map construction. Eight
+pieces means eight string boxes plus the array, its slots and its empty-map
+lookup — about eleven arena allocations per call. Node does the same shape in
+32 ns because a V8 young-gen allocation is a pointer bump; these are 10-16 ns
+each here once the header, the young-registry push and GC amortization are
+counted.
+
+Two mechanical wins landed, both from removing work a *builder* does not need:
+
+- `JsObject::dense_append_fresh` + `publish_dense_length`. `dense_index_define`
+stores the length mirror (`properties[0]`) and bumps the generation **per
+element** because it must serve a live object. An array that a builtin is
+still filling is unreachable and has no cached reader, so those two are
+published once after the last element; the authoritative `slots.length`, the
+write barrier and one `Vec::push` remain per element (the element must be
+rooted against the boxing that follows). `String.prototype.split` fills its
+result this way, with the exact `create_data_property_index` fallback.
+- `Array.prototype.join` reserved its UTF-16 buffer from a floor
+(`length + separator*(length-1)`, capped at 4096 because the length is an
+arbitrary array-like property). It previously grew 4 -> 8 -> 16 units per call.
+
+Isolated, interleaved min-of-7 against the previous binary: the full row
+**−14.0%** (67.2 → 57.7 ms), the split half −15.0%, the join half −23.5%. The
+row moves from 5.6x to **4.7x** node's interpreter, and the eight-rep control
+on neighbouring rows holds within ±2% (a five-rep pass showed a spurious +28%
+on `opcost/string_indexof`; it is noise at that size).
+
+What is left on this row is the allocation itself. Eight boxes and a GC to
+sweep them are ~40% of the split half, and no builtin-level change removes
+them — a useful length of this row is spent in `Heap::alloc`,
+`with_alloc_state` and `note_alloc`. That, and not another builtin, is the
+next lever here.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at
