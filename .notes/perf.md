@@ -708,26 +708,50 @@ experiment available without changing that policy.
 - The `1 M closure creation` probe re-reads **377 ms at 256 / 175 ms at 8192**,
 with 100 ms of the latter inside collections.
 
-Inside one 45 µs minor (5113-box cohort, 8030 live, 1423 stack words) the split
-below is *estimated from the counts*, not measured — the per-minor total (45 µs)
-and the per-box cost (8.8 ns) are measured, the division is arithmetic:
+Inside one 45 µs minor (5113-box cohort, 8030 live, 1423 stack words):
 
-| step | estimate | basis |
+| step | measured | basis |
 |---|---:|---|
-| young-table rebuild | ~30 µs | 16384-slot `fill(0)` (131 KB) + 5113 hash-and-probe inserts |
-| conservative stack scan | ~4 µs | 1423 words, one probe each |
-| mark + sweep | ~8 µs | 5113 swept, ~2900 retained |
+| young-table `fill(0)` | 1.8 µs | `Instant` pair around the memset |
+| young-table insert loop | 3.7 µs | `Instant` pair around the probe-insert |
+| conservative stack scan | 1.4 µs | `Instant` pair around `scan_stack_young` |
+| **sweep** | **36.2 µs** | `Instant` pair around the sweep loop |
 
-So the young-table rebuild is the item to attack, and the insert loop (not the
-`fill(0)`) is its bulk: a probe-clear instead of the memset costs *more* (one
-probe per entry), an `O(n log n)` sort plus binary search is no better, and
-raising the load factor to shrink the memset makes the probe loop slower by
-about what it saves. The table exists to answer "is this stack word a young box
-start?" in O(1) — and since every arena slot start is `ARENA_GRANULARITY`-
-aligned, that question is answerable from a **bitset over the arena at slot
-granularity** (set one bit per young box, test one bit per candidate word):
-~1-2 ns per box instead of ~5, with the same exactness. That is the next cut
-here, and it is a collector change, not a knob.
+The estimate in the first draft of this section — table rebuild ~30 µs, stack scan
+~4, mark+sweep ~8 — was wrong by 5x in the one place it mattered. The table is
+**6.9 µs of 45 (15%)**, and the **sweep is 80%, at 7.1 ns per swept box**. That
+kills the obvious "replace the hash table with a granule bitset" plan before it
+was written: it would have bought ~4 µs of a 45 µs minor, under 5% of the row.
+
+Two sweep-loop optimizations were then implemented and measured, and **both are a
+no-op**, so neither is landed:
+
+- collapsing `set_live(false)` + `set_marked(false)` + `set_young(false)` into one
+  read-modify-write of the same flags word (the three setters are `#[inline]`, and
+  the compiler already merges the loads and stores);
+- not building the swept-address list when no weak handle, iterator table or
+  generator table will read it. `construct_churn` -0.2%, `head-let` -1.2%,
+  `object_keys` +0.8% at 9 reps against a +0.2% null control — i.e. nothing. The
+  push was already amortized and in-cache.
+
+That second attempt also carried a trap worth recording: the sweep **count** paces
+the collector (`note_minor_collection` sets `minor_disabled` when a collection
+swept nothing), and the count was derived from the address list's length. Eliding
+the list made every minor report zero swept, which disabled the minor level for
+the rest of the body — the row went **-28%** in *time* (8 collections of 500k
+boxes instead of 685 of 5k), and it took a `TRIGGER young=… minor_disabled=true`
+line to find it. A count that drives a policy must not be derived from an
+optional list.
+
+So ~7 ns per dead box is the payload `drop` plus the free-list push, and it is
+the **price of a non-moving nursery**: every dead box must be visited and
+destructed. V8's scavenger copies the survivors into the other semispace and
+abandons the dead cohort in O(1), never running a destructor per dead object —
+that, not a micro-optimization, is the ~2 ns vs ~8.8 ns per allocation gap. A
+copying nursery is the only cut that reaches it here, and it collides with the
+design this heap rests on: handles are raw addresses into a non-moving arena
+(stable across collections, which the FFI surface and the compiled cells both
+rely on).
 
 ## What the current design has taken as far as it goes
 
