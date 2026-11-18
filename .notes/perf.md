@@ -793,6 +793,54 @@ path inlines both, and an `InitContext` **per call** for a *nested* function bod
 (top-level `make` drops it and saves ~4 ms of 67, so it is the nested-function
 environment, ~6%). That, not the constructor, is the object-creation lever.
 
+### `{}` + stores is 21x the same shape spelled as a literal
+
+Following that: four provenance-free probes, 500k iterations, min of 3, one
+workload per process.
+
+| shape | slag | node | node `--jitless` | helpers per iteration |
+|---|---:|---:|---:|---|
+| `var o = { x: i, y: i }` | 3.0 ms | 0.16 | 14.0 | **none** |
+| `var o = {}; o.x = i;` | 43.5 ms | — | 37.6 | `ObjectBegin` + `SetMemberName` |
+| `var o = {}; o.x = i; o.y = i;` | 62.7 ms | — | 39.8 | `ObjectBegin` + 2x `SetMemberName` |
+
+The literal with its properties is **fully inlined machine code** — 6 ns per
+iteration, no helper call at all, 4.6x *faster* than node's interpreter. Adding
+one store to the empty-literal form costs **38 ns** by subtraction (62.7 - 43.5
+over 500k), against node's interpreter at 4.4 ns for the same store. So the same
+two-property object costs 6 ns one way and 125 ns the other: **21x**, entirely a
+matter of how it is spelled.
+
+The 38 ns is a map transition per first store. `{}` produces the canonical
+*empty* map, which describes no fields, so `o.x = i` cannot take the deferred
+field store; it runs the full assign path — profile of the two-store probe:
+`assign_member` 13.1%, `define_fresh` 6.3%, `member_store_cell_probe` 5.5%
+(a guaranteed miss: the cell is keyed by object id), `Map::find` 4.7%,
+`warm_store_put` 3.3%, `Map::get_or_create_child` 2.7%, `get_own_property_key`
+2.5%, `ordinary_property_lookup` 2.3%, `field_offset` 2.0%, `get_prototype_of`
+1.7%.
+
+The engine already contains the fast form of exactly this work: the constructor
+path gives its `this` object a **boilerplate map that describes the fields the
+body will store** (`ConstructMapCell`, built from `construct_property_patterns`),
+and then `this.x =` is an inlined deferred-field store
+(`emit_deferred_field_store`, see `slag-property-writes` §4). The gap is that
+the compiler records a store pattern for a constructor's `this.*` and not for a
+local object after an empty literal — it has the keys for `{ x: i, y: i }`
+because the literal carries them, and does not look at the steps that follow the
+literal for `{}`.
+
+So closing this is a compiler feature, not a tuning change: record the
+`SetMemberName(local, const atom)` steps immediately following an `ObjectBegin`
+site whose receiver has not escaped or been reassigned, build the same
+boilerplate map per site, and let the existing deferred-field-store gates fire.
+The preconditions are the ones `slag-property-writes` §5 states for any
+structural shortcut — own-key **order** must match what the stores would have
+produced, and a hole must stay indistinguishable from absence — plus the
+`MEMBER_CELLS`-style cost of a per-site cell. Worth doing on this evidence, but
+it changes how arbitrary code compiles, so it wants its own pass with the full
+sweep behind it.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at
