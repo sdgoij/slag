@@ -197,11 +197,23 @@ impl JitEngine {
                         eprintln!("--- IR ---\n{}", crate::opt::print::dump(&ir));
                         eprintln!("--- census ---\n{}", crate::opt::census::report(&ir));
                     }
-                    if crate::opt::verify::verify(&ir).is_ok()
-                        && let Some(compiled) =
-                            crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack)
-                    {
-                        return (Some(compiled), true);
+                    // A body that lifted but that the IR lowerer declines falls
+                    // through to the per-step tier. That is a distinct outcome
+                    // from a lift refusal, and it used to be silent — which is
+                    // how a body can be absent from the IR dump, absent from the
+                    // bail census, and still cost the optimizing tier (a helper
+                    // arity slip, or a shape `opt_lower` has no arm for).
+                    if crate::opt::verify::verify(&ir).is_ok() {
+                        match crate::opt_lower::compile(&*self.isa, &ir, helpers, body.max_stack) {
+                            Some(compiled) => return (Some(compiled), true),
+                            None => {
+                                if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                                    eprintln!("opt lower declined ({} steps)", body.steps.len());
+                                }
+                            }
+                        }
+                    } else if std::env::var("JIT_DUMP_CLIF").is_ok() {
+                        eprintln!("opt verify failed ({} steps)", body.steps.len());
                     }
                 }
                 Err(reason) => {
