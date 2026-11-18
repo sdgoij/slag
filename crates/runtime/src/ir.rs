@@ -3399,14 +3399,23 @@ mod value_stack_tests {
 /// The direct-mapped member-access cell count (P3): a power of two so the
 /// cache index is a mask. `pub` so the jit crate's inline member-cell probe
 /// indexes the same table.
-pub const MEMBER_CELLS: usize = 16;
+///
+/// 16 was chosen on the strength of a read-loop probe (64 distinct same-map
+/// objects at ~4.2 ns/op, because a read-cell miss only reaches the map
+/// live-field path). That reasoning does not hold for every reader of this
+/// table: `construct_this_object` resolves a constructor's `prototype` through
+/// it, and *that* miss is a full `[[Get]]` plus a fresh `"prototype"` string
+/// and an intern. Churn evicts it — `new Item(i).sum()` reads `this.x`/`this.y`
+/// on a fresh object, writing two fresh cells per construct — so at 16 the
+/// oracle missed nearly every construct. 256 measured -7.9% on
+/// `calls/construct_churn` and flat (+-2%) on the member-read rows; 1024 moved
+/// nothing further, so 256 is the knee.
+pub const MEMBER_CELLS: usize = 256;
 
 /// The write-side store-cell table size (L1a warm-store cell): a SEPARATE,
 /// larger direct-mapped table than the read cells, because a store-cell
 /// miss falls back to the full [[Set]] (~140ns) while a read-cell miss
-/// falls back to the map live-field path (~+1ns). The 16-entry read tables
-/// are fine at their working sets (probe 2026-09-04: 64 distinct same-map
-/// objects read at ~4.2ns/op, +0.7ns over warm); a 16-entry write table
+/// falls back to the map live-field path (~+1ns). A 16-entry write table
 /// aliases across any >16-object store loop and every store pays the full
 /// [[Set]] (probe: 64-object cycling stores ~140ns/store vs ~20ns warm).
 /// Mirrors the GLOBAL_CELLS 32->256 bump (Cut 35 slice 5). The JIT never

@@ -626,6 +626,43 @@ them — a useful length of this row is spent in `Heap::alloc`,
 `with_alloc_state` and `note_alloc`. That, and not another builtin, is the
 next lever here.
 
+### The allocation path has no removable chunk; a shared cell table did
+
+Following that lever, `Gc::new` -> `with_alloc_state` -> `Heap::alloc` ->
+`note_alloc` was read end to end. It is already lean: one `CURRENT` thread-local
+load, one `RefCell<Heap>` borrow, a size-classed free-list pop (or a bump), three
+header writes, one `Vec::push` into the young registry, and two cells (the
+pacing counter and the stress flag). ~10-16 ns per box against V8's 2-4 is the
+design (free list + young registry + borrow), not a missing optimization; there
+is no single item to remove. Recorded so the next attempt does not re-derive it.
+
+The same profile did pay off one level up, on `calls/construct_churn`:
+`construct_this_object` 9.0% plus `JsString::from_utf8` 2.7%, which is the
+signature of a *miss* on the constructor's `prototype` oracle (the miss path
+builds and interns a fresh `"prototype"` string).
+
+The cause is `MEMBER_CELLS = 16`. The constructor's `prototype` is served from
+the shared `(object id, atom)` member-value cell — deliberately, because only
+that cell is kept value-write-exact by the L1c record discipline — but the same
+table serves own-data read cells, and `new Item(i).sum()` reads `this.x` and
+`this.y` on a *fresh* object every iteration, writing two fresh cells per
+construct into a 16-entry table. The `(Item, "prototype")` cell was therefore
+nearly always evicted, and every construct re-resolved it.
+
+The size was chosen from a read-loop probe (64 distinct same-map objects,
+~4.2 ns/op) where a miss only reaches the map live-field path. That reasoning
+does not carry: this table has a reader whose miss is a full `[[Get]]` plus a
+fresh string and an intern, and a shared direct-mapped cache has to be sized for
+its *most expensive* miss, not its dominant one.
+
+256 entries (`MEMBER_CELLS`, 6 KB per agent) measured **-6.9%** on
+`calls/construct_churn` against a 0.1% same-binary null control, held at 9 reps.
+Flat everywhere else it was checked — `objects/{many_objects_read, own_read,
+proto_read, compound_assign, warm_store, destructure}` within +-2%,
+`opcost/{element_read, array_at, map_get, set_has, string_charat, num_valueof,
+regexp_test, typed_array_for_each}` within +-2.7%, and the other call rows
+unchanged. 1024 moved nothing further, so 256 is the knee.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at
