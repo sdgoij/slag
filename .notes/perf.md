@@ -671,6 +671,33 @@ proto_read, compound_assign, warm_store, destructure}` within +-2%,
 regexp_test, typed_array_for_each}` within +-2.7%, and the other call rows
 unchanged. 1024 moved nothing further, so 256 is the knee.
 
+This is a **state change** (a per-object cache), so the corpus is not the gate
+that matters for it — see `slag-perf-measurement`'s "A row measures a lowering,
+not the runtime's state machine". The gate is `tools/corpus/workloads/app` plus
+the real workload's frame time, with `SLAG_JIT_DEOPT_TRACE=1` to catch a deopt
+that a row cannot reach. Run against the same tree with the constant set to 16
+and to 256:
+
+| `MEMBER_CELLS` | `jit-deopt` lines | `jit-deopt-leaf` | `frame_render` |
+|---|---:|---:|---:|
+| 16 | 1 | 0 | 2.37-2.46 ms |
+| 256 | 1 | 0 | 2.27-2.47 ms |
+
+Interleaved min-of-7 the row is 2.335 vs 2.384 ms, against a **-2.4% same-binary
+null control** — no interaction. The one deopt is the same single
+`step=33 depth=2 steps=61 frame=3 arity=0` event either way, so the cache size
+neither creates nor masks a state-machine pathology.
+
+That gate also turned up something the corpus had hidden. Every binary built
+during this session — 16 or 256, all of them — printed **474-762** `jit-deopt`
+lines on `app`, all the identical `jit-deopt step=2 depth=1`: exactly the shape
+the skill warns about, a deopt per call that never converges, invisible to all
+81 rows. On the current HEAD the same run prints **one**. The commits in between
+are not from this work (`b7eaf97c fix(jit): report a body the IR lowerer
+declines` and three `test(runtime)` phase-instrument commits), so the fix is
+theirs — but the episode is the skill's point made concrete: this family is the
+only place that pathology shows, and a state change has to be gated on it.
+
 ### Pricing the minor collection: 8.8 ns per allocated box
 
 The GC block could not be priced because the knobs were inert. `--corpus` (and
