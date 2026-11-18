@@ -121,6 +121,69 @@ named itself that way (`arrays/push_pop`'s `ArrayPop` 1.44 M -> 0) while
 `index_loop` and `hof_methods`, which contain no `pop`, read +5.5% and +5.3%
 purely as layout.
 
+## A row measures a lowering, not the runtime's state machine
+
+Every row runs one body at rest for three timed calls in one process. That
+cannot falsify a change that adds per-object or per-body state: a site cache, a
+deferred property, a call record keyed by body site, a cache eviction policy, a
+guard planted per read. The blast radius is real but invisible — `ir_diff`
+reports `0 of 81 rows` for a lowering-only change, and for a state change the
+rows that move are layout, not the mechanism.
+
+The states a row cannot reach:
+
+- **Cache residency.** `MAX_CACHE_ENTRIES` is 1024 bodies; a row has tens. The
+  eviction path, its use-counter decay, and the consult-count reset never run.
+- **`in_flight` at a call site.** The timed body is the outermost run, so a
+  deopt can rebuild. A body called from compiled code (`agent.jit_depth > 0`)
+  can never rebuild: `JitCache::lookup` skips the stale-entry removal, returns
+  the same guarded code, and the body deopts again on the next call. One
+  deopt per call, forever, is a shape only a nested call can produce.
+- **A guard that fails.** A row with a failing guard is a row whose steady
+  state is bad, so it gets fixed or dropped rather than measured.
+- **State older than the sample.** A frame over a warm buffer, a warm style
+  cache and a warm dispatch table is a different program from a loop that
+  builds its operands in the loop head.
+
+So: `tools/corpus/workloads/app` is the family for that shape, and a nonzero
+`SLAG_JIT_DEOPT_TRACE` count on it is a tier defect, not a property of the row.
+The landing gate for a state-machine change is that family plus the real
+workload's frame time in the same session, not the corpus total.
+
+```
+SLAG_JIT_DEOPT_TRACE=1 target/debug/slag.exe --corpus tools/corpus/workloads/app
+```
+
+## Read the counters as counters, not as compiles
+
+`compiled` (`JIT_COMPILED_COUNT`) is incremented in `lookup_info`'s slow arm,
+i.e. by every consult that resolved to a code pointer — a cache hit counts, and
+so does the consult that follows a deopt. `jit_info` is cleared by exactly three
+things: a `run_jit_body` deopt (`deopt_retries` bumps and the pointer clears),
+a cache eviction, and a stale-entry rebuild. `evicted` counts the last two.
+Consequences that read as something else:
+
+- **`compiled ≈ deopted` is one deopt loop, not 100 compiles a frame.** A body
+  that deopts per call re-consults per call; at ~0.4 ms a Cranelift compile,
+  300k compiles in one run would be impossible, and that impossibility is the
+  tell.
+- **`evicted > 0` does not prove the cache overflowed.** A stale rebuild (the
+  body's `deopt_retries` moved past the entry's) is recorded as an eviction.
+  Compare `evicted` against the number of *independent* bodies, not against
+  `compiled`.
+- **A deopt in a leaf lane is not the same event.** `run_jit_leaf`'s deopt arm
+  counts `deopted` but neither clears `jit_info` nor bumps the retries, so the
+  body keeps its (speculative) code and the caches stay warm. A run whose
+  `deopted` is high and `compiled` low is deopting in the leaf lane.
+
+## Two pins on different lineages are not an A/B
+
+Check the topology before attributing anything:
+`git merge-base --is-ancestor <control> <variant>`. A sibling branch used as a
+"control binary" differs by every commit on both sides, including JIT design
+changes that move exactly the counters under discussion. A counter discontinuity
+between such pins says nothing about the commits on the variant's side.
+
 ## Do not judge on the corpus total
 
 `head-let` alone swings +-20% (about +-90 ms of a 2400 ms total), which swamps
