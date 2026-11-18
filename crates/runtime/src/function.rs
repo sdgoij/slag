@@ -6767,6 +6767,17 @@ pub(crate) mod phases {
                     );
                 }
             }
+            // The helper census, cumulatively, on the same cadence. Diffing two
+            // runs of the same scene with the loop's `n` changed is what
+            // attributes a per-iteration helper: everything the scene calls is
+            // in both totals, and only the loop's own traffic differs.
+            if std::env::var_os("JIT_HELPER_STATS").is_some() {
+                for (index, count) in crate::jit::JIT_HELPER_COUNTS.snapshot().iter().enumerate() {
+                    if *count > 0 {
+                        println!("call-helpers\t{index}\t{count}");
+                    }
+                }
+            }
         }
     }
 
