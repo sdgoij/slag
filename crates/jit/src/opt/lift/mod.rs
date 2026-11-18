@@ -42,8 +42,10 @@ pub enum Unsupported {
     /// The body is not certified (`CompiledBody::scope` is `None`): it has no
     /// frame slots to lift against.
     Uncertified,
-    /// A step outside the subset.
-    Step(&'static str),
+    /// A step outside the subset, named for the `opt bail` census. Owned
+    /// rather than `&'static str` because the fallback names the step's own
+    /// variant (see `step_name`), which is not a static string.
+    Step(String),
     /// The body reached its end without a `Return`, so the entry block has no
     /// terminator.
     NoReturn,
@@ -56,6 +58,14 @@ pub enum Unsupported {
     /// The lift produced a graph [`verify`](super::verify::verify) rejects.
     /// This is a lift bug; the caller keeps the current path either way.
     Invalid,
+}
+
+impl Unsupported {
+    /// A `Step` refusal. Anything convertible to a `String` is accepted, so a
+    /// call site can pass a literal or a name derived from the step itself.
+    fn step(name: impl Into<String>) -> Self {
+        Self::Step(name.into())
+    }
 }
 
 /// A diagnostic guard depth (tests only). When non-zero, [`lift`] emits a
@@ -343,7 +353,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
             Some(ti) => match &steps[ti] {
                 Step::Return => {
                     if has_for_of && ti + 1 != n {
-                        return Err(Unsupported::Step("Return"));
+                        return Err(Unsupported::step("Return"));
                     }
                     TermRec::Ret(stack.pop().ok_or(Unsupported::Stack)?)
                 }
@@ -358,7 +368,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                 }
                 other if is_fused_test(other) => TermRec::FusedTest { counter, stack },
                 other if is_for_fetch(other) => TermRec::Fetch { stack },
-                other => return Err(Unsupported::Step(step_name(other))),
+                other => return Err(Unsupported::step(step_name(other))),
             },
             None => {
                 if ends[bi] >= n {
@@ -511,7 +521,7 @@ fn lift_impl(body: &CompiledBody, guard_reads: bool) -> Result<Function, Unsuppo
                         back_stack.push(value);
                         (cond, back_stack)
                     }
-                    other => return Err(Unsupported::Step(step_name(other))),
+                    other => return Err(Unsupported::step(step_name(other))),
                 };
                 let then_args = edge_args(builder.func(), sb, &then_stack);
                 let else_args = edge_args(builder.func(), fb, stack);
@@ -732,7 +742,7 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::ForOfNext { .. }
         | Step::ForInNext { .. }
         | Step::ForOfNextBindLocal { .. } => 0,
-        other => return Err(Unsupported::Step(step_name(other))),
+        other => return Err(Unsupported::step(step_name(other))),
     })
 }
 
@@ -820,7 +830,7 @@ fn block_successors(
     }
     match &steps[last] {
         Step::Return => Ok(Vec::new()),
-        Step::Throw { .. } => Err(Unsupported::Step("Throw")),
+        Step::Throw { .. } => Err(Unsupported::step("Throw")),
         _ => Err(Unsupported::Invalid),
     }
 }
@@ -1097,7 +1107,7 @@ fn emit_step(
         // (a read-modify-write) are refused — their own slice.
         Step::AssignMemberName { name, op } => {
             if *op != AssignOp::Assign {
-                return Err(Unsupported::Step(step_name(step)));
+                return Err(Unsupported::step(step_name(step)));
             }
             let value = stack.pop().ok_or(Unsupported::Stack)?;
             let object = stack.pop().ok_or(Unsupported::Stack)?;
@@ -1116,7 +1126,7 @@ fn emit_step(
         // the inline element store. The compound form is refused.
         Step::AssignMemberComputed { op } => {
             if *op != AssignOp::Assign {
-                return Err(Unsupported::Step(step_name(step)));
+                return Err(Unsupported::step(step_name(step)));
             }
             let value = stack.pop().ok_or(Unsupported::Stack)?;
             let key = stack.pop().ok_or(Unsupported::Stack)?;
@@ -1642,17 +1652,17 @@ fn emit_step(
         // `BinStoreNum` leaf below models that RMW), so both forms are no-ops.
         Step::FastLoopBind { .. } | Step::FastLoopStore { .. } => {}
         Step::PushAcc => {
-            let slot = counter.ok_or(Unsupported::Step("PushAcc"))?;
+            let slot = counter.ok_or(Unsupported::step("PushAcc"))?;
             let v = emit_frame_load(builder, block, slot);
             stack.push(v);
         }
         Step::PopAcc => {
-            let slot = counter.ok_or(Unsupported::Step("PopAcc"))?;
+            let slot = counter.ok_or(Unsupported::step("PopAcc"))?;
             let value = stack.pop().ok_or(Unsupported::Stack)?;
             emit_frame_store(builder, block, slot, value);
         }
         Step::IncAcc | Step::DecAcc => {
-            let slot = counter.ok_or(Unsupported::Step("IncAcc"))?;
+            let slot = counter.ok_or(Unsupported::step("IncAcc"))?;
             let cur = emit_frame_load(builder, block, slot);
             let one = emit_number(builder, block, 1.0);
             let op = if matches!(step, Step::IncAcc) {
@@ -1877,7 +1887,7 @@ fn emit_step(
                 Imm::None,
             );
         }
-        other => return Err(Unsupported::Step(step_name(other))),
+        other => return Err(Unsupported::step(step_name(other))),
     }
     Ok(())
 }
@@ -2083,10 +2093,10 @@ fn emit_reg_operand(
             builder.emit(block, Op::Const, &[], ty, Effects::pure(), imm)
         }
         RegOperand::Counter => {
-            let slot = counter.ok_or(Unsupported::Step("RunRegBody"))?;
+            let slot = counter.ok_or(Unsupported::step("RunRegBody"))?;
             emit_frame_load(builder, block, slot)
         }
-        _ => return Err(Unsupported::Step("RunRegBody")),
+        _ => return Err(Unsupported::step("RunRegBody")),
     })
 }
 
@@ -2118,7 +2128,7 @@ fn emit_leaf_op(
     Ok(match op {
         LeafOp::LoadReg { slot, tdz: t } => load(builder, *slot, *t),
         LeafOp::LoadCounter => {
-            let slot = counter.ok_or(Unsupported::Step("RunRegBody"))?;
+            let slot = counter.ok_or(Unsupported::step("RunRegBody"))?;
             emit_frame_load(builder, block, slot)
         }
         LeafOp::LoadConst(value) => {
@@ -2172,7 +2182,7 @@ fn emit_leaf_op(
         // operand a Number, so the generic `bin` op is the f64 arithmetic the
         // interpreter's `num_arith` runs.
         LeafOp::BinStoreNum { op, slot, rhs } => {
-            let counter = || counter.ok_or(Unsupported::Step("RunRegBody"));
+            let counter = || counter.ok_or(Unsupported::step("RunRegBody"));
             let cur = emit_frame_load(builder, block, *slot);
             let right = match rhs {
                 NumRhs::Acc => acc,
@@ -2212,7 +2222,7 @@ fn emit_leaf_op(
             rhs,
             mask,
         } => {
-            let counter = || counter.ok_or(Unsupported::Step("RunRegBody"));
+            let counter = || counter.ok_or(Unsupported::step("RunRegBody"));
             let cur = emit_frame_load(builder, block, *slot);
             let to_i32 = |b: &mut Builder, v: ValueId| -> ValueId {
                 let zero = emit_int(b, block, 0);
@@ -2234,7 +2244,7 @@ fn emit_leaf_op(
                         BinaryOp::Add => Op::Add,
                         BinaryOp::Sub => Op::Sub,
                         BinaryOp::Mul => Op::Mul,
-                        _ => return Err(Unsupported::Step("RunRegBody")),
+                        _ => return Err(Unsupported::step("RunRegBody")),
                     };
                     let combined = builder.emit(
                         block,
@@ -2270,7 +2280,7 @@ fn emit_leaf_op(
                         BinaryOp::Add => Op::IntAdd,
                         BinaryOp::Sub => Op::IntSub,
                         BinaryOp::Mul => Op::IntMul,
-                        _ => return Err(Unsupported::Step("RunRegBody")),
+                        _ => return Err(Unsupported::step("RunRegBody")),
                     };
                     bin(builder, int, left, right)
                 }
@@ -2480,7 +2490,7 @@ fn emit_leaf_op(
         // BigInt case, the Route-B int form, and the context/per-iteration reads)
         // need their own slice; refuse so the body keeps the per-step path.
         // Name the refusing op: a family this coarse cannot be sized.
-        _ => return Err(Unsupported::Step(leaf_op_name(op))),
+        _ => return Err(Unsupported::step(leaf_op_name(op))),
     })
 }
 
@@ -2615,9 +2625,9 @@ fn emit_fused_test(
             ..
         } => {
             let slot = match var {
-                FastLoopVar::Counter => counter.ok_or(Unsupported::Step("FastLoopHead"))?,
+                FastLoopVar::Counter => counter.ok_or(Unsupported::step("FastLoopHead"))?,
                 FastLoopVar::Slot(slot) => *slot,
-                FastLoopVar::Global(_) => return Err(Unsupported::Step("FastLoopHead")),
+                FastLoopVar::Global(_) => return Err(Unsupported::step("FastLoopHead")),
             };
             let cur = slot_load(builder, slot);
             let next = if matches!(var, FastLoopVar::Counter) {
@@ -2682,9 +2692,9 @@ fn emit_fused_test(
         // facts (the guard's own payload, applied to the blocks its hit edge
         // dominates) — then the probe model above can come back unchanged.
         Step::HoistMemberGuard { .. } | Step::HoistGlobalGuard { .. } => {
-            return Err(Unsupported::Step(step_name(step)));
+            return Err(Unsupported::step(step_name(step)));
         }
-        other => return Err(Unsupported::Step(step_name(other))),
+        other => return Err(Unsupported::step(step_name(other))),
     })
 }
 
@@ -2749,7 +2759,7 @@ fn constant(value: &crux::Value) -> Result<(Imm, Type), Unsupported> {
     if value.is_string() {
         return Ok((Imm::U64(value.bits()), Type::String));
     }
-    Err(Unsupported::Step("Push"))
+    Err(Unsupported::step("Push"))
 }
 
 fn binary_op(op: BinaryOp) -> Result<Op, Unsupported> {
@@ -2775,7 +2785,7 @@ fn binary_op(op: BinaryOp) -> Result<Op, Unsupported> {
         // The negated forms are lowered by `emit_binary`, which has room for
         // the trailing `Not`; a *leaf* op that reaches here still refuses.
         BinaryOp::In | BinaryOp::Instanceof | BinaryOp::NotEqual | BinaryOp::StrictNotEqual => {
-            return Err(Unsupported::Step("Binary"));
+            return Err(Unsupported::step("Binary"));
         }
     })
 }
@@ -2787,7 +2797,7 @@ fn unary_op(op: UnaryOp) -> Result<Op, Unsupported> {
         UnaryOp::BitNot => Op::BitNot,
         UnaryOp::Not => Op::Not,
         UnaryOp::Delete | UnaryOp::Void | UnaryOp::Typeof => {
-            return Err(Unsupported::Step("Unary"));
+            return Err(Unsupported::step("Unary"));
         }
     })
 }
@@ -2813,8 +2823,8 @@ fn unary_type(op: Op) -> Type {
     }
 }
 
-fn step_name(step: &Step) -> &'static str {
-    match step {
+fn step_name(step: &Step) -> String {
+    let known: &'static str = match step {
         Step::Jump(_)
         | Step::JumpIfFalse(_)
         | Step::JumpIfTrue(_)
@@ -2875,7 +2885,16 @@ fn step_name(step: &Step) -> &'static str {
         | Step::PopAcc
         | Step::IncAcc
         | Step::DecAcc => "FusedLoop",
-        _ => "step",
+        // No catch-all name: a step this list has not grouped names itself from
+        // its own variant, so the `opt bail` census can still attribute it. The
+        // earlier `_ => "step"` collapsed every unlisted family into one bucket
+        // that the coverage probe could not act on.
+        _ => "",
+    };
+    if known.is_empty() {
+        variant_name(&format!("{step:?}")).to_string()
+    } else {
+        known.to_string()
     }
 }
 
@@ -3352,8 +3371,8 @@ mod tests {
     fn names_the_hoist_guard_refusal() {
         // The LICM hoist guards are refused by design (an always-miss opt body
         // is a measured pessimization — `emit_fused_test`), so a body blocked
-        // on one must report `Step("HoistGuard")`, not the anonymous
-        // `Step("step")` bucket the coverage probe cannot attribute.
+        // on one must report `Step("HoistGuard")` rather than falling into the
+        // anonymous bucket the coverage probe cannot attribute.
         let member = Step::HoistMemberGuard {
             reads: Vec::new(),
             prim_slots: Vec::new(),
@@ -3372,6 +3391,14 @@ mod tests {
         // precise `opt-blockers` list agree in kind.
         assert_eq!(step_name(&Step::SwitchDisc), "Switch");
         assert_eq!(step_name(&Step::LeaveBlock), "Try");
+    }
+
+    #[test]
+    fn an_unlisted_step_names_its_own_variant() {
+        // The fallback used to be the literal "step", which bucketed every
+        // unlisted family together and made the `opt bail` census useless.
+        assert_eq!(step_name(&Step::ArgsBase), "ArgsBase");
+        assert_eq!(step_name(&Step::ArgsSpread), "ArgsSpread");
     }
 
     #[test]
@@ -3609,7 +3636,7 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Throw"));
+        assert_eq!(lift(&b).unwrap_err(), Unsupported::step("Throw"));
     }
 
     #[test]
@@ -3642,7 +3669,7 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(lift(&b).unwrap_err(), Unsupported::Step("Push"));
+        assert_eq!(lift(&b).unwrap_err(), Unsupported::step("Push"));
     }
 
     #[test]
