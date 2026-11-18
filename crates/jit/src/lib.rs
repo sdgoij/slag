@@ -2591,6 +2591,36 @@ mod tests {
     }
 
     #[test]
+    fn opt_tier_lifts_a_for_head_update() {
+        // The loop-head `i++` is `Step::Inc`, which the lift refused, so every
+        // `for (let i = 0; ...; i++)` body ran the per-step tier — the shape of
+        // the Goats scene's hot loops. The value must be the interpreter's and
+        // the body must reach the optimizing tier.
+        let source = "function f(n) { let s = 0; for (let i = 0; i < n; i++) { s = s + i; } return s; } \
+                      var t = 0; \
+                      t += f(3); t += f(4); t += f(5); t += f(6); t += f(7); t += f(8); \
+                      t += f(9); t += f(10); t += f(11); t += f(12); t += f(13); t += f(14); \
+                      t += f(15); t += f(16); t += f(17); t += f(18); \
+                      t;";
+        let interp = {
+            let mut agent = runtime::Agent::new();
+            agent.initialize_host_defined_realm().expect("realm");
+            agent.run_script(source).expect("interp runs")
+        };
+        let (value, compiled, opt_compiled) =
+            with_opt_jit_agent_counts(|agent| agent.run_script(source).expect("runs"));
+        assert_eq!(
+            value, interp,
+            "the optimizing tier must match the interpreter"
+        );
+        assert!(compiled >= 1, "{compiled} bodies compiled");
+        assert!(
+            opt_compiled >= 1,
+            "a for-head update must not cost the body the optimizing tier"
+        );
+    }
+
+    #[test]
     fn opt_tier_leaf_body_matches_the_interpreter_without_a_read_guard() {
         // 9b4ce2b1: a leaf body is a call-site inline candidate, and a guard
         // marks a body `deopts` — which every machine-code inline lane refuses

@@ -653,6 +653,9 @@ fn stack_delta(step: &Step) -> Result<i32, Unsupported> {
         | Step::SaveCompletion
         | Step::RestoreCompletion
         | Step::FunctionDeclInit { .. } => 0,
+        // The value-discarding update (`i++` in a `for` head): a read-update-store
+        // that pushes nothing.
+        Step::Inc { .. } | Step::Dec { .. } => 0,
         // The `for (let ... in/of ...)` per-iteration environment family: the
         // enter/copy steps and the block exit are net-neutral, a slot read
         // pushes and a write pops, and `typeof` replaces the top.
@@ -1274,20 +1277,19 @@ fn emit_step(
         // (`built-ins/Iterator/zip/basic-longest.js`) that only appears with
         // the typer's read guard on.
         Step::UpdateLocal { slot, op, prefix } => {
-            if is_tdz(*slot) {
-                emit_tdz_check(builder, block, *slot);
-            }
-            let old = emit_frame_load(builder, block, *slot);
-            let new = builder.emit(
-                block,
-                Op::UpdateValue,
-                &[old],
-                Type::Unknown,
-                Op::UpdateValue.default_effects(),
-                Imm::Int(*op as i32),
-            );
-            emit_frame_store(builder, block, *slot, new);
+            let (old, new) = emit_slot_update(builder, block, *slot, *op, is_tdz(*slot));
             stack.push(if *prefix { new } else { old });
+        }
+        // `i++`/`i--` in a value-discarding position (the `for` update): the same
+        // read-update-store with no result pushed. These are the loop-head steps
+        // of every `for (let i = 0; ...; i++)` body, so a lift that refuses them
+        // leaves those bodies on the per-step tier — in the Goats scene, 26 of
+        // its 38 opt-tier refusals were this step.
+        Step::Inc { slot } => {
+            emit_slot_update(builder, block, *slot, UpdateOp::Increment, is_tdz(*slot));
+        }
+        Step::Dec { slot } => {
+            emit_slot_update(builder, block, *slot, UpdateOp::Decrement, is_tdz(*slot));
         }
         // Closure creation (`CreateFunction`): the helper reads the step's
         // payload by index and instantiates against the current environment.
@@ -1925,6 +1927,34 @@ fn emit_frame_store(builder: &mut Builder, block: BlockId, slot: usize, value: V
         Effects::write(Heap::Slots),
         Imm::Slot(slot as u32),
     );
+}
+
+/// The read-update-store shared by `UpdateLocal` and the discarded `Inc`/`Dec`
+/// forms: TDZ guard, frame load, `Op::UpdateValue` (the interpreter's BigInt and
+/// string-aware `update_value`), frame store. Returns `(old, new)` so the caller
+/// pushes whichever form the operator's prefix bit asks for — or neither, for the
+/// `for` head's value-discarding update.
+fn emit_slot_update(
+    builder: &mut Builder,
+    block: BlockId,
+    slot: usize,
+    op: UpdateOp,
+    tdz: bool,
+) -> (ValueId, ValueId) {
+    if tdz {
+        emit_tdz_check(builder, block, slot);
+    }
+    let old = emit_frame_load(builder, block, slot);
+    let new = builder.emit(
+        block,
+        Op::UpdateValue,
+        &[old],
+        Type::Unknown,
+        Op::UpdateValue.default_effects(),
+        Imm::Int(op as i32),
+    );
+    emit_frame_store(builder, block, slot, new);
+    (old, new)
 }
 
 fn emit_number(builder: &mut Builder, block: BlockId, v: f64) -> ValueId {
@@ -3345,6 +3375,40 @@ mod tests {
         // store each keep a live value.
         assert!(func.block(entry).insts[1].result.is_some());
         assert!(func.block(entry).insts[4].result.is_some());
+    }
+
+    #[test]
+    fn lifts_the_discarded_loop_update() {
+        // `for (let i = 0; ...; i++)`: the head's update is a value-discarding
+        // read-update-store. It must lift to the same three ops as
+        // `UpdateLocal` and push nothing — a lift that refuses it leaves every
+        // `for` body on the per-step tier.
+        let b = body(
+            vec![
+                Step::Push(Value::Number(0.0)),
+                Step::Inc { slot: 0 },
+                Step::Dec { slot: 0 },
+                Step::Return,
+            ],
+            1,
+        );
+        let func = lift(&b).expect("lifts");
+        let entry = func.entry();
+        assert_eq!(
+            ops(&func, entry),
+            vec![
+                Op::Const,
+                Op::FrameLoad,
+                Op::UpdateValue,
+                Op::FrameStore,
+                Op::FrameLoad,
+                Op::UpdateValue,
+                Op::FrameStore
+            ]
+        );
+        // The stores are effect-only: neither update leaves a value behind.
+        assert!(func.block(entry).insts[3].result.is_none());
+        assert!(func.block(entry).insts[6].result.is_none());
     }
 
     #[test]
