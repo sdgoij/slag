@@ -184,6 +184,13 @@ Consequences that read as something else:
   loses was buying tag-free arithmetic on *every* call. A guard's deopts and a
   guard's win are separate measurements, and the second one is the one a corpus
   row reports.
+- **An inclusive phase timer cannot attribute a call path.** `ordinary_call`
+  nests (the body's own calls re-enter it) and has two entry paths (the `fast`
+  slot set and the record fetch), so a phase that wraps the body's run measures a
+  *subtree*: `call_run` and `call_body` are larger than the call they sit under
+  and cannot be compared with each other. Only the disjoint siblings attribute
+  anything, and on Goats' `perf loop arith 1` they are ~600 cycles of an ~8 µs
+  call — enough to localise the cost to the run, not to say where inside it.
 
 ## Two pins on different lineages are not an A/B
 

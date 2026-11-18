@@ -3728,28 +3728,33 @@ fn ordinary_call(
     // text, params, body AST, compiled IR — on every call); only the slots
     // each branch reads are cloned, and the slow path's `params`/`body` AST
     // clones are skipped entirely for a fast call.
-    let (ir, old_env, realm, strict, parse_text) = match fast {
-        Some(fast) => (
-            fast.ir,
-            fast.environment,
-            fast.realm,
-            fast.strict,
-            fast.parse_text,
-        ),
-        None => {
-            let record = agent.ecma_function(&function.id()).ok_or_else(|| {
-                JsError::new(
-                    ErrorKind::TypeError,
-                    "Function body is not registered".into(),
+    let _call_total = phases::call_enter(phases::CALL_TOTAL);
+    phases::count_call_path();
+    let (ir, old_env, realm, strict, parse_text) = {
+        let _p = phases::call_enter(phases::CALL_FETCH);
+        match fast {
+            Some(fast) => (
+                fast.ir,
+                fast.environment,
+                fast.realm,
+                fast.strict,
+                fast.parse_text,
+            ),
+            None => {
+                let record = agent.ecma_function(&function.id()).ok_or_else(|| {
+                    JsError::new(
+                        ErrorKind::TypeError,
+                        "Function body is not registered".into(),
+                    )
+                })?;
+                (
+                    record.ir.clone(),
+                    record.environment,
+                    record.realm,
+                    record.strict,
+                    record.parse_text().cloned(),
                 )
-            })?;
-            (
-                record.ir.clone(),
-                record.environment,
-                record.realm,
-                record.strict,
-                record.parse_text().cloned(),
-            )
+            }
         }
     };
     if let Some(ir) = &ir
@@ -3770,30 +3775,36 @@ fn ordinary_call(
         // captured bindings (captured params initialized with the call
         // arguments) — so the closures can reach them after the call
         // returns. Bodies without capture keep the plain closure env.
-        let body_env = match scope.new_body_context(&old_env, args)? {
-            Some(context) => context,
-            None => old_env,
+        let body_env = {
+            let _p = phases::call_enter(phases::CALL_ENV);
+            match scope.new_body_context(&old_env, args)? {
+                Some(context) => context,
+                None => old_env,
+            }
         };
         // The context's `function` is what a frame reports, and a host's error
         // stack is the reader that wants it for every call (`at boom:1:26`),
         // not only for a sloppy body's mapped `arguments`. Filling it is one
         // `Value` store per certified call.
         let context_function = Some(Value::Function(*function));
-        agent.roots.execution_context_stack.push(ExecutionContext {
-            function: context_function,
-            realm,
-            script_or_module: None,
-            // A certified body reads only the lexical environment (its
-            // certification rejects the `variable_environment` readers —
-            // Annex B function hoisting and direct eval), so both slots can
-            // share one clone.
-            lexical_environment: body_env,
-            variable_environment: body_env,
-            private_environment: None,
-            source: parse_text,
-            annex_b_hoistable: Default::default(),
-            position: None,
-        });
+        {
+            let _p = phases::call_enter(phases::CALL_CONTEXT);
+            agent.roots.execution_context_stack.push(ExecutionContext {
+                function: context_function,
+                realm,
+                script_or_module: None,
+                // A certified body reads only the lexical environment (its
+                // certification rejects the `variable_environment` readers —
+                // Annex B function hoisting and direct eval), so both slots can
+                // share one clone.
+                lexical_environment: body_env,
+                variable_environment: body_env,
+                private_environment: None,
+                source: parse_text,
+                annex_b_hoistable: Default::default(),
+                position: None,
+            });
+        }
         // Cut 3 continuation (this slots): a non-arrow certified body gets
         // the OrdinaryCallBindThis result — strict keeps the call's `this`
         // as-is; sloppy coerces undefined/null to the global object and
@@ -3814,26 +3825,32 @@ fn ordinary_call(
         } else {
             Value::Undefined
         };
-        let result = run_compiled_body(
-            agent,
-            strict,
-            ir,
-            args,
-            Some(this_value),
-            Value::Function(*function),
-        );
+        let result = {
+            let _p = phases::call_enter(phases::CALL_RUN);
+            run_compiled_body(
+                agent,
+                strict,
+                ir,
+                args,
+                Some(this_value),
+                Value::Function(*function),
+            )
+        };
         // A kind-only engine error escapes the body with the function's realm
         // context still current; surface it as that realm's error object now,
         // so a caller from another realm sees the right constructor (mirrors
         // the slow path below).
-        let result = match result {
-            Err(e) if e.value.is_none() && !agent.pause_in_flight() => {
-                match crate::builtins::error::to_throwable(agent, &e) {
-                    Ok(value) => Err(e.with_value(value)),
-                    Err(conversion) => Err(conversion),
+        let result = {
+            let _p = phases::call_enter(phases::CALL_EXIT);
+            match result {
+                Err(e) if e.value.is_none() && !agent.pause_in_flight() => {
+                    match crate::builtins::error::to_throwable(agent, &e) {
+                        Ok(value) => Err(e.with_value(value)),
+                        Err(conversion) => Err(conversion),
+                    }
                 }
+                other => other,
             }
-            other => other,
         };
         agent.roots.execution_context_stack.pop();
         return result;
@@ -4004,20 +4021,26 @@ fn run_compiled_body(
     // activation's context (`Vm::set_site`), which is what makes the caller's
     // frame report the call the stop interrupted.
     let body_env = agent.running_context()?.lexical_environment;
-    let mut vm = agent.take_vm(body_env, strict);
+    let mut vm = {
+        let _p = phases::call_enter(phases::CALL_VM);
+        agent.take_vm(body_env, strict)
+    };
     // The declaring call step said this activation can be parked and resumed
     // (see `Agent::pause_resumable_call`); nothing else can be.
     vm.pause_ok = agent.take_pause_ticket().unwrap_or(false);
-    let result = run_compiled_body_on(
-        agent,
-        &mut vm,
-        ir,
-        args,
-        this_value,
-        function_value,
-        body_env,
-        false,
-    );
+    let result = {
+        let _p = phases::call_enter(phases::CALL_BODY);
+        run_compiled_body_on(
+            agent,
+            &mut vm,
+            ir,
+            args,
+            this_value,
+            function_value,
+            body_env,
+            false,
+        )
+    };
     // `ordinary_call` pushed this activation's context before the run and pops
     // it after, so it is still current here; the guard only keeps a defensive
     // path from building a level with no context.
@@ -4035,7 +4058,10 @@ fn run_compiled_body(
         });
         return result;
     }
-    agent.return_vm(vm);
+    {
+        let _p = phases::call_enter(phases::CALL_POOL);
+        agent.return_vm(vm);
+    }
     result
 }
 
@@ -4079,6 +4105,7 @@ pub(crate) fn run_compiled_body_on(
     // slot-by-slot setup is skipped entirely. A caller that already carved the
     // frame (C3.2) skips the whole setup too.
     if !frame_prepared && let Some(scope) = &ir.scope {
+        let _p = phases::call_enter(phases::CALL_SETUP);
         vm.setup_certified_frame(scope, args, this_value);
     }
     // The JIT path (when installed): the general path runs certified bodies
@@ -6579,7 +6606,22 @@ pub(crate) mod phases {
     /// The callee's tail: the generator `prototype` block and the return.
     pub const CALLEE_TAIL: usize = 17;
 
-    const NAMES: [&str; 18] = [
+    // The call-path phases (`SLAG_CALL_PHASES`): `ordinary_call`'s certified
+    // branch, the road every interpreted call site takes into a compiled body.
+    // Indices continue the closure set so one counter array serves both.
+    pub const CALL_TOTAL: usize = 18;
+    pub const CALL_FETCH: usize = 19;
+    pub const CALL_ENV: usize = 20;
+    pub const CALL_CONTEXT: usize = 21;
+    pub const CALL_RUN: usize = 22;
+    pub const CALL_EXIT: usize = 23;
+    pub const CALL_VM: usize = 24;
+    pub const CALL_BODY: usize = 25;
+    pub const CALL_POOL: usize = 26;
+    pub const CALL_SETUP: usize = 27;
+    const CALL_FIRST: usize = CALL_TOTAL;
+
+    const NAMES: [&str; 28] = [
         "total",
         "source_info",
         "body",
@@ -6598,14 +6640,32 @@ pub(crate) mod phases {
         "tail",
         "callee_total",
         "callee_tail",
+        "call_total",
+        "call_fetch",
+        "call_env",
+        "call_context",
+        "call_run",
+        "call_exit",
+        "call_vm",
+        "call_body",
+        "call_pool",
+        "call_setup",
     ];
 
-    static CYCLES: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+    static CYCLES: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
     static CALLS: AtomicU64 = AtomicU64::new(0);
+    static CALL_PATH_CALLS: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("SLAG_CLOSURE_PHASES").is_ok())
+    }
+
+    /// Whether the call-path instrument is on. Separate from [`enabled`] so the
+    /// closure table's rows and ratios stay what they were.
+    pub fn call_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SLAG_CALL_PHASES").is_ok())
     }
 
     #[inline]
@@ -6643,14 +6703,42 @@ pub(crate) mod phases {
         }
     }
 
-    /// Print one line per phase: total cycles and cycles per closure.
+    /// Start timing a call-path phase, or `None` when that instrument is off.
+    pub fn call_enter(phase: usize) -> Option<Phase> {
+        call_enabled().then(|| Phase(phase, now()))
+    }
+
+    /// One `ordinary_call` entry. Prints the table every 20,000 calls, so a host
+    /// needs no exit hook to read it (the game has no such hook) and the ratios
+    /// are cumulative from process start.
+    pub fn count_call_path() {
+        if !call_enabled() {
+            return;
+        }
+        let n = CALL_PATH_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(20_000) {
+            let per = n as f64;
+            println!("call-phase\tcalls\t{n}");
+            for index in CALL_FIRST..NAMES.len() {
+                let cycles = CYCLES[index].load(Ordering::Relaxed);
+                println!(
+                    "call-phase\t{}\t{cycles}\t{:.1}/call",
+                    NAMES[index],
+                    cycles as f64 / per
+                );
+            }
+        }
+    }
+
+    /// Print one line per phase: total cycles and cycles per closure. The
+    /// call-path rows are printed by [`count_call_path`] as they accrue.
     pub fn dump() {
         if !enabled() {
             return;
         }
         let calls = CALLS.load(Ordering::Relaxed).max(1);
         println!("closure-phase\tcalls\t{calls}");
-        for (index, name) in NAMES.iter().enumerate() {
+        for (index, name) in NAMES.iter().enumerate().take(CALL_FIRST) {
             let cycles = CYCLES[index].load(Ordering::Relaxed);
             println!(
                 "closure-phase\t{name}\t{cycles}\t{:.1}/call",
