@@ -15129,6 +15129,17 @@ impl Vm {
         if result == crate::jit::DISPATCH_DEOPT {
             crate::jit::JIT_DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let resume_ip = self.ip;
+            // A leaf deopt is a distinct event from the general path's: it
+            // neither clears the body's fast pointer nor bumps
+            // `deopt_retries`, so the body keeps deopting on the same code and
+            // the cache never rebuilds it. Tagged so a trace separates the two.
+            if crate::jit::JIT_DEOPT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "jit-deopt-leaf step={} {}",
+                    resume_ip,
+                    crate::jit::deopt_body_id(ir)
+                );
+            }
             let off = (ctx.suspend_sp as usize).saturating_sub(region_ptr as usize)
                 / std::mem::size_of::<Value>();
             self.stack.truncate(frame_base + off);

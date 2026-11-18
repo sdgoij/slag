@@ -7563,12 +7563,42 @@ pub(crate) fn run_jit_body(
             .set(ir.deopt_retries.get().saturating_add(1));
         ir.jit_info.set(0);
         if JIT_DEOPT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("jit-deopt step={} depth={}", vm.ip, depth);
+            eprintln!(
+                "jit-deopt step={} depth={} {}",
+                vm.ip,
+                depth,
+                deopt_body_id(ir)
+            );
         }
         return Ok(JitRunOutcome::Interp);
     }
     vm.stack.truncate(work_base);
     Ok(JitRunOutcome::Value(Value::from_bits(result)))
+}
+
+/// The body-identity fields the deopt trace prints. A `CompiledBody` has no
+/// name, so a storm is attributed by its shape: the step count, the frame size
+/// and arity the scope analysis certified, and the binding names it recorded.
+/// The names are sorted so two runs print the same line for the same body.
+pub(crate) fn deopt_body_id(ir: &CompiledBody) -> String {
+    match ir.scope.as_ref() {
+        Some(scope) => {
+            let mut names: Vec<String> = scope
+                .slots
+                .keys()
+                .map(|id| crux::lookup(*id).to_string_lossy())
+                .collect();
+            names.sort_unstable();
+            format!(
+                "steps={} frame={} arity={} idents=[{}]",
+                ir.steps.len(),
+                scope.frame_size,
+                scope.arity,
+                names.join(",")
+            )
+        }
+        None => format!("steps={} frame=- arity=- idents=[]", ir.steps.len()),
+    }
 }
 
 /// Drive a certified resumable body (async function / generator) through

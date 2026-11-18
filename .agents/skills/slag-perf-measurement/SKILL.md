@@ -175,6 +175,15 @@ Consequences that read as something else:
   counts `deopted` but neither clears `jit_info` nor bumps the retries, so the
   body keeps its (speculative) code and the caches stay warm. A run whose
   `deopted` is high and `compiled` low is deopting in the leaf lane.
+- **A deopt storm is not automatically expensive — price it before removing it.**
+  The Goats scene deopted 33k times in a 25 s window (~22 a frame) and it cost
+  ~0.13% of the frame, because each body's interpreted tail was a few steps.
+  Making a nested deopt rebuildable (old code retired until no frame is in
+  flight) removed the storm (27 deopts left) and measured **1.4-2.1% slower** on
+  the interleaved phase sum: the rebuilt body runs unguarded, and the guard it
+  loses was buying tag-free arithmetic on *every* call. A guard's deopts and a
+  guard's win are separate measurements, and the second one is the one a corpus
+  row reports.
 
 ## Two pins on different lineages are not an A/B
 
