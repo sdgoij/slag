@@ -302,10 +302,10 @@ fn run(command: Command) -> Result<(), u8> {
             #[cfg(feature = "jit")]
             {
                 if options.jit_bench {
-                    return run_jit_benchmarks();
+                    return run_jit_benchmarks(&options);
                 }
                 if let Some(dir) = &options.corpus {
-                    return run_corpus(dir, !options.jitless);
+                    return run_corpus(dir, !options.jitless, &options);
                 }
             }
             if options.bench {
@@ -793,7 +793,7 @@ fn run_benchmarks(context: &mut Context) -> Result<(), u8> {
 /// completion values are compared as a differential check that the machine
 /// code agrees with the interpreter.
 #[cfg(feature = "jit")]
-fn run_jit_benchmarks() -> Result<(), u8> {
+fn run_jit_benchmarks(options: &Options) -> Result<(), u8> {
     // Timed samples are batched to this floor (bench_once's `batch_target`):
     // a sample shorter than the floor would be a single call, and the
     // allocation-heavy rows (string concat builds a 100k-node rope per call)
@@ -882,8 +882,8 @@ fn run_jit_benchmarks() -> Result<(), u8> {
     println!("slag {VERSION} JIT vs interpreter micro-benchmarks");
     println!("(ratio < 1 means the JIT is faster; ~1 means the body did not JIT)");
     for (name, source) in benchmarks {
-        let (interp, interp_result, _) = bench_once(source, false, Some(SAMPLE_FLOOR))?;
-        let (jit, jit_result, _) = bench_once(source, true, Some(SAMPLE_FLOOR))?;
+        let (interp, interp_result, _) = bench_once(source, false, Some(SAMPLE_FLOOR), options)?;
+        let (jit, jit_result, _) = bench_once(source, true, Some(SAMPLE_FLOOR), options)?;
         let ratio = jit.as_secs_f64() / interp.as_secs_f64();
         let agrees = interp_result == jit_result;
         if agrees {
@@ -903,7 +903,7 @@ fn run_jit_benchmarks() -> Result<(), u8> {
 /// once, warmed, min of timed calls). One `bench\t<mode>\t<relpath>\t<ms>\t
 /// <result>` line per workload so a cross-engine runner can join the modes.
 #[cfg(feature = "jit")]
-fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
+fn run_corpus(dir: &std::path::Path, jit: bool, options: &Options) -> Result<(), u8> {
     // Timed samples should clear this floor on EVERY engine (a too-fast row
     // is quantization-dominated); bench_once batches calls to reach it and
     // reports the per-call min.
@@ -924,7 +924,8 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
             .map(|rel| rel.display().to_string())
             .unwrap_or_else(|_| path.display().to_string())
             .replace('\\', "/");
-        let (elapsed, result, steps_per_call) = bench_once(&source, jit, Some(TIMING_FLOOR))?;
+        let (elapsed, result, steps_per_call) =
+            bench_once(&source, jit, Some(TIMING_FLOOR), options)?;
         let ms = elapsed.as_secs_f64() * 1000.0;
         match result {
             Some(value) => println!("bench\t{mode}\t{name}\t{ms}\t{value}"),
@@ -957,6 +958,9 @@ fn run_corpus(dir: &std::path::Path, jit: bool) -> Result<(), u8> {
     // structural split of the dispatch boundary is drawn from. Same feature
     // gate, inert otherwise.
     runtime::step_stats::dump_variants(40);
+    // `--gc-trace`'s exit summary, aggregated over every row's collections (the
+    // records are thread-global and accumulate across the suite).
+    finish_gc_trace();
     Ok(())
 }
 
@@ -1047,6 +1051,7 @@ fn bench_once(
     source: &str,
     jit: bool,
     batch_target: Option<std::time::Duration>,
+    options: &Options,
 ) -> Result<(std::time::Duration, Option<f64>, f64), u8> {
     const WARMUP: u32 = 2;
     const TIMED: u32 = 3;
@@ -1058,6 +1063,15 @@ fn bench_once(
     // split the same way as the in-table rows.
     let source = source.trim_end();
     let mut context = Context::new().map_err(report)?;
+    // These are per-agent settings, and every row gets a fresh Context, so they
+    // have to be applied here rather than once by the caller. They used to be
+    // ignored entirely on this path: `--gc-trace`, `--gc-stress`, `--gc-verify`
+    // and `--nursery-*` were accepted and then never reached the row, which made
+    // a corpus-mode GC measurement compare a configuration against itself (see
+    // `.notes/perf.md` §2026-11-17).
+    context.set_gc_stress(options.gc_stress);
+    context.set_gc_verify(options.gc_verify || options.gc_stress);
+    apply_nursery_options(&mut context, options);
     // A corpus directory may exercise the host surface (`rl.*`): install it
     // when the build has it, so those workloads are timed on the same protocol
     // as everything else. Installing binds raylib's window thread and is safe

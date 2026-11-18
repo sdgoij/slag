@@ -281,9 +281,17 @@ closure, four things that cannot differ between closures of one site: the
 shared body, params and source texts (three thread-local `HashMap` probes), the
 body-directive strictness (an AST scan), and the compiled body (a per-agent
 `compiled_bodies` probe). None of them is large; together they are most of the
-row. A 1 M-creation probe with the nursery threshold swept from 256 to 65,536
-boxes moves by nothing (309 / 293 / 312 ms), so the cost is the work, not the
-collector.
+row.
+
+> **Correction (2026-11-17, later).** This section originally argued "the cost is
+the work, not the collector" from a nursery sweep that reported 309 / 293 / 312
+ms across 256 / 8192 / 65536 boxes. That sweep measured nothing: `--corpus`
+silently dropped `--nursery-threshold` (and `--gc-trace`, `--gc-stress`,
+`--gc-verify`) — every run used the same configuration, and the 6% spread was
+noise. With the option actually applied, a 1 M-creation probe reads **377 ms at
+256 boxes and 175 ms at 8192**, and `--gc-trace` puts 100 ms of that 175 ms
+inside collections (~57%). The creation work above is real and the cuts stand;
+the conclusion that the collector was not paying was not.
 
 `SiteTemplate`/`SiteCell` (`function.rs`), carried by `Step::CreateFunction`,
 now hold those five facts; the site's first closure resolves and fills them and
@@ -662,6 +670,64 @@ proto_read, compound_assign, warm_store, destructure}` within +-2%,
 `opcost/{element_read, array_at, map_get, set_has, string_charat, num_valueof,
 regexp_test, typed_array_for_each}` within +-2.7%, and the other call rows
 unchanged. 1024 moved nothing further, so 256 is the knee.
+
+### Pricing the minor collection: 8.8 ns per allocated box
+
+The GC block could not be priced because the knobs were inert. `--corpus` (and
+`--jit-bench`) build a **fresh `Context` per row** in `bench_once` and never
+applied the per-agent options, so `--gc-trace`, `--gc-stress`, `--gc-verify` and
+`--nursery-*` were parsed, accepted and dropped; `finish_gc_trace` was never
+reached on that path either. `bench_once`/`run_corpus`/`run_jit_benchmarks` now
+take `&Options` and apply them, and `run_corpus` calls `finish_gc_trace` at the
+exit. Any corpus-mode GC measurement before this compared a configuration
+against itself — which is how the closure section above came to claim a nursery
+sweep "moves by nothing". A same-binary null control does **not** catch that
+class of bug; the check that does is confirming the seam changes an *observable*
+(the collection count), which is now the first thing to look at.
+
+With `--gc-trace` working, `calls/construct_churn` (500k constructions, ~3.5M
+box allocations across the protocol's calls):
+
+| nursery | collections | avg pause | total pause | row |
+|---|---:|---:|---:|---:|
+| 64 | 3425 | 11 µs | 37.7 ms | 67.3 ms |
+| 8192 (default) | 685 | 45 µs | 30.8 ms | 51.3 ms |
+| 65536 | 685 | 45 µs | 30.8 ms | 51.3 ms |
+| 262144 | 685 | 45 µs | 30.8 ms | 51.3 ms |
+
+Three things fall out:
+
+- **The collector is ~60% of the row** (30.8 of 51.3 ms), and ~8.8 ns per
+allocated box (45 µs / 5113 boxes per minor). At a 64-box nursery the per-box
+cost is *worse* (10.8 ns), so the cadence is not too rare.
+- **The knob only turns one way.** `--nursery-threshold` above the default
+changes nothing because the safe point also fires on `young_dominated`
+(`young > 2 * last_collected_live`, `agent.rs`) and that trips first at ~5.8k
+boxes. Lowering it works and is harmful. There is no "bigger nursery"
+experiment available without changing that policy.
+- The `1 M closure creation` probe re-reads **377 ms at 256 / 175 ms at 8192**,
+with 100 ms of the latter inside collections.
+
+Inside one 45 µs minor (5113-box cohort, 8030 live, 1423 stack words) the split
+below is *estimated from the counts*, not measured — the per-minor total (45 µs)
+and the per-box cost (8.8 ns) are measured, the division is arithmetic:
+
+| step | estimate | basis |
+|---|---:|---|
+| young-table rebuild | ~30 µs | 16384-slot `fill(0)` (131 KB) + 5113 hash-and-probe inserts |
+| conservative stack scan | ~4 µs | 1423 words, one probe each |
+| mark + sweep | ~8 µs | 5113 swept, ~2900 retained |
+
+So the young-table rebuild is the item to attack, and the insert loop (not the
+`fill(0)`) is its bulk: a probe-clear instead of the memset costs *more* (one
+probe per entry), an `O(n log n)` sort plus binary search is no better, and
+raising the load factor to shrink the memset makes the probe loop slower by
+about what it saves. The table exists to answer "is this stack word a young box
+start?" in O(1) — and since every arena slot start is `ARENA_GRANULARITY`-
+aligned, that question is answerable from a **bitset over the arena at slot
+granularity** (set one bit per young box, test one bit per candidate word):
+~1-2 ns per box instead of ~5, with the same exactness. That is the next cut
+here, and it is a collector change, not a knob.
 
 ## What the current design has taken as far as it goes
 
