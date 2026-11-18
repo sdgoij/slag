@@ -768,8 +768,11 @@ min of 3 (500k iterations):
 | full `construct_churn` (`new` + `.sum()`) | 48.7 ms | 11.8 | 28.2 | 1.73x |
 
 `new` is **1.7x faster than the factory function that does the same work**, so
-the construct path is not the defect it looked like from a symbol table. The
-census says why: the certified base-constructor leaf runs with the cached
+the construct path is not the defect it looked like from a symbol table. (Re-read
+at min of 7 on 500k, the same pair is 46.4 vs 78.6 ms, ratio 1.69 — the
+*direction* is the finding; the absolute ratios in the table are single-run and
+soft, see the measurement lesson two sections down.) The census says why: the
+certified base-constructor leaf runs with the cached
 boilerplate map and a vector-free receiver, so `this.x =` and `this.y =` are
 **inlined machine stores** (`JIT_HELPER_STATS` on the `new` probe shows no
 member-store helper at all, one construct helper per iteration). The factory
@@ -793,53 +796,59 @@ path inlines both, and an `InitContext` **per call** for a *nested* function bod
 (top-level `make` drops it and saves ~4 ms of 67, so it is the nested-function
 environment, ~6%). That, not the constructor, is the object-creation lever.
 
-### `{}` + stores is 21x the same shape spelled as a literal
+### The `{}`-plus-stores probe that lied: escape analysis, not the literal path
 
-Following that: four provenance-free probes, 500k iterations, min of 3, one
-workload per process.
+This section first claimed that `{}` + stores costs **21x** the same object
+written as `{ x: i, y: i }`, and was about to justify a compiler feature on it.
+The claim was an artifact of the probe, and the correction is worth more than the
+claim would have been.
 
-| shape | slag | node | node `--jitless` | helpers per iteration |
-|---|---:|---:|---:|---|
-| `var o = { x: i, y: i }` | 3.0 ms | 0.16 | 14.0 | **none** |
-| `var o = {}; o.x = i;` | 43.5 ms | — | 37.6 | `ObjectBegin` + `SetMemberName` |
-| `var o = {}; o.x = i; o.y = i;` | 62.7 ms | — | 39.8 | `ObjectBegin` + 2x `SetMemberName` |
+The first probe created the object, read it, and dropped it **inside the loop**:
 
-The literal with its properties is **fully inlined machine code** — 6 ns per
-iteration, no helper call at all, 4.6x *faster* than node's interpreter. Adding
-one store to the empty-literal form costs **38 ns** by subtraction (62.7 - 43.5
-over 500k), against node's interpreter at 4.4 ns for the same store. So the same
-two-property object costs 6 ns one way and 125 ns the other: **21x**, entirely a
-matter of how it is spelled.
+```js
+for (var i = 0; i < N; i++) { var o = { x: i, y: i }; s = (s + (o.x|0)) | 0; }
+```
 
-The 38 ns is a map transition per first store. `{}` produces the canonical
-*empty* map, which describes no fields, so `o.x = i` cannot take the deferred
-field store; it runs the full assign path — profile of the two-store probe:
-`assign_member` 13.1%, `define_fresh` 6.3%, `member_store_cell_probe` 5.5%
-(a guaranteed miss: the cell is keyed by object id), `Map::find` 4.7%,
-`warm_store_put` 3.3%, `Map::get_or_create_child` 2.7%, `get_own_property_key`
-2.5%, `ordinary_property_lookup` 2.3%, `field_offset` 2.0%, `get_prototype_of`
-1.7%.
+It measured 3.0 ms per 500k (6 ns/iteration) with **no helper call at all**, and
+that is not the literal path — it is the optimizing tier's escape analysis
+removing the object. It is the Slag-side twin of the trap the Measuring section
+already records for node's own micro-probes ("V8 deletes the work"). A probe for
+an allocation must make the value **escape**; `return { x: i, y: i }` from a
+called function does, and the same literal then costs 125 ns/iteration.
 
-The engine already contains the fast form of exactly this work: the constructor
-path gives its `this` object a **boilerplate map that describes the fields the
-body will store** (`ConstructMapCell`, built from `construct_property_patterns`),
-and then `this.x =` is an inlined deferred-field store
-(`emit_deferred_field_store`, see `slag-property-writes` §4). The gap is that
-the compiler records a store pattern for a constructor's `this.*` and not for a
-local object after an empty literal — it has the keys for `{ x: i, y: i }`
-because the literal carries them, and does not look at the steps that follow the
-literal for `{}`.
+With both variants escaping (2M iterations, min of 5; single runs of these rows
+swing 30-50%, see below):
 
-So closing this is a compiler feature, not a tuning change: record the
-`SetMemberName(local, const atom)` steps immediately following an `ObjectBegin`
-site whose receiver has not escaped or been reassigned, build the same
-boilerplate map per site, and let the existing deferred-field-store gates fire.
-The preconditions are the ones `slag-property-writes` §5 states for any
-structural shortcut — own-key **order** must match what the stores would have
-produced, and a hole must stay indistinguishable from absence — plus the
-`MEMBER_CELLS`-style cost of a per-site cell. Worth doing on this evidence, but
-it changes how arbitrary code compiles, so it wants its own pass with the full
-sweep behind it.
+| shape | slag | node | node `--jitless` | slag ns/iter |
+|---|---:|---:|---:|---:|
+| `{ x: i, y: i }` returned from `mk` | 250.8 ms | 113.8 | 193.3 | 125 |
+| `var o = {}; o.x = i;` returned | 212.5 ms | 103.4 | 190.9 | 106 |
+| `var o = {}; o.x = i; o.y = i;` returned | 314.1 ms | 101.6 | 274.4 | 157 |
+
+The escaping literal is **~20% cheaper**, not 21x — and it is not even the
+cheapest of the three on this shape. Per store, the subtraction gives ~51 ns
+(Slag) against ~41 ns for node's interpreter: **1.6x, not 8.6x**. Against node's
+interpreter per iteration the whole family sits at 1.1-1.3x.
+
+So there is no compiler feature to build here. The map transition per first
+store is real work (profile of the two-store probe: `assign_member` 13.1%,
+`define_fresh` 6.3%, `member_store_cell_probe` 5.5% — a guaranteed miss, the cell
+is keyed by object id — `Map::find` 4.7%, `warm_store_put` 3.3%,
+`Map::get_or_create_child` 2.7%, `get_own_property_key` 2.5%,
+`ordinary_property_lookup` 2.3%, `field_offset` 2.0%, `get_prototype_of` 1.7%)
+and the engine is within 60% of V8's *interpreter* on it. The boilerplate-map
+idea (give an `ObjectBegin` site the same per-site map the constructor path gets
+from `construct_property_patterns`) would recover part of the literal's ~20%, at
+the cost of a shape change to how arbitrary code compiles. Not worth it on these
+numbers; recorded so the idea is not re-derived from the same bad probe.
+
+**The measurement lesson** (the reason this section is kept): these rows are
+GC-paced, and the `bench_once` protocol's rep batching plus one GC landing badly
+makes a single run swing 30-50%. One probe measured 83, 521 and 415 ms on three
+consecutive runs of the *same binary and workload*; the 500k-iteration table that
+produced the 21x claim differed from the 2M one by ~35% on every row. Minimum of
+five at 2M iterations is the floor for this shape, and an allocation probe needs
+an escape or it measures the optimizer.
 
 ## What the current design has taken as far as it goes
 
