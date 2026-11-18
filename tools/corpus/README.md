@@ -164,6 +164,10 @@ excluded on both sides.
   gate is the fixture's own asserts throwing on divergence (the run fails
   loudly), not the returned value.
 - Result values must be integers < 2^53 (compared exactly across modes).
+- `calls/interpreted_caller.js` is **deliberately** over the compile cap: its
+  subject is the interpreted call lane, so its `jit` column is the caller's
+  interpreted time by design. Do not read it as a JIT row, and do not "fix" its
+  size.
 - **One process per engine/mode makes a row's absolute number
   context-sensitive.** Running every workload in the same process is what
   keeps per-file startup out of the numbers and keeps both engines' sides
