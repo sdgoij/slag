@@ -753,6 +753,46 @@ design this heap rests on: handles are raw addresses into a non-moving arena
 (stable across collections, which the FFI surface and the compiled cells both
 rely on).
 
+### The construct path is already the fast path (measured against a factory)
+
+`calls/construct_churn` was the next lever queued after the GC pricing, and the
+first thing worth doing was to find out how much of it is the construct
+machinery at all. Built with the same shape two ways, one workload per process,
+min of 3 (500k iterations):
+
+| shape | slag | node | node `--jitless` | vs interpreter |
+|---|---:|---:|---:|---:|
+| `new Item(i)` (+ `.x` read) | 38.3 ms | 10.2 | 20.6 | 1.86x |
+| `make(i)` — `{}` + 2 stores + `.x` read, nested | 66.5 ms | 1.5 | 17.2 | 3.9x |
+| same, `make` at top level | 63.3 ms | — | — | 3.7x |
+| full `construct_churn` (`new` + `.sum()`) | 48.7 ms | 11.8 | 28.2 | 1.73x |
+
+`new` is **1.7x faster than the factory function that does the same work**, so
+the construct path is not the defect it looked like from a symbol table. The
+census says why: the certified base-constructor leaf runs with the cached
+boilerplate map and a vector-free receiver, so `this.x =` and `this.y =` are
+**inlined machine stores** (`JIT_HELPER_STATS` on the `new` probe shows no
+member-store helper at all, one construct helper per iteration). The factory
+shape pays `ObjectBegin` once and `SetMemberName` once per store — 7.0M helper
+calls for 3.5M iterations.
+
+Within `construct_churn` the remaining cost is therefore not the construct
+machinery: GC is ~60% (priced above) and `.sum()` on a fresh receiver is ~21
+ns/iteration (the map-keyed chain read, whose identity cell can never hit on a
+fresh object, plus the leaf-call lane probe). The per-construct items are all
+small — `step_construct_from_args` 11.5%, object allocation 13.7% combined,
+`construct_this_object` 3.7% (it was 9.0% before `MEMBER_CELLS`), `bind_this_value`
+2.8%, `lookup_info` 2.1% — and the largest of them would be worth 1-2% of the row
+if removed. Nothing here is worth a code change.
+
+What the same probes did find is the shape that *is* slow: a function that builds
+an object literal and stores into it, at 127 ns/iteration and 3.7x node's
+interpreter against the construct's 1.86x. Two census facts there are worth
+following up — `ObjectBegin` + one `SetMemberName` per store where the construct
+path inlines both, and an `InitContext` **per call** for a *nested* function body
+(top-level `make` drops it and saves ~4 ms of 67, so it is the nested-function
+environment, ~6%). That, not the constructor, is the object-creation lever.
+
 ## What the current design has taken as far as it goes
 
 The register and materialization work is exhausted, and it is exhausted at
