@@ -11,8 +11,21 @@ standing "corpus probe" the perf notes keep gating deferred work on.
 - `workloads/<family>/<name>.js` — the corpus. Each file defines
   `function bench() {...}` and ends with `bench();`, returns a Number,
   and is self-contained (no engine-specific globals). Families bucket the
-  mechanism under test (`arrays`, `builtins`, `calls`, `control`,
+  mechanism under test (`app`, `arrays`, `builtins`, `calls`, `control`,
   `globals`, `language`, `objects`, `strings`).
+- `workloads/app/...` — the application-shape rows. A micro-row times one
+  body at rest; these time a *frame* of a program whose state is older than
+  the sample and whose helpers are reached nested. They exist because a
+  steady-state row cannot falsify a state-machine regression at all: the
+  JIT cache's working set, `in_flight` at a call site, a guard that fails on
+  every call, and per-frame closure creation are all unreachable in a
+  three-sample loop over one body. `app/frame_render` (a text-UI frame:
+  long-lived cell buffer, per-row closures at stable sites, a string-keyed
+  style cache, a dispatch table, and a field that is a Number on some rows
+  and a String on others) named 858 nested deopts on one step of one body
+  and 0 after the guard was pruned — a shape every other family reported as
+  clean. Treat a nonzero `SLAG_JIT_DEOPT_TRACE` count on these rows as a
+  defect in the tier, not as a property of the row.
 - `workloads/language/...` — workloads generated from test262 fixtures by
   `amplify.js` (see below); the fixture's own `assert` calls guard
   correctness inside the timed region.
