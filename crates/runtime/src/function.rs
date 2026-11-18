@@ -6619,9 +6619,16 @@ pub(crate) mod phases {
     pub const CALL_BODY: usize = 25;
     pub const CALL_POOL: usize = 26;
     pub const CALL_SETUP: usize = 27;
+    /// Inside `run_jit_body`: the working-region reserve, the frame/global
+    /// resolution and the intrinsic snapshots.
+    pub const BODY_PREP: usize = 28;
+    /// The `JitCallContext` build.
+    pub const BODY_CTX: usize = 29;
+    /// The entry call itself (`with_jit_run` + the machine code).
+    pub const BODY_ENTRY: usize = 30;
     const CALL_FIRST: usize = CALL_TOTAL;
 
-    const NAMES: [&str; 28] = [
+    const NAMES: [&str; 31] = [
         "total",
         "source_info",
         "body",
@@ -6650,11 +6657,15 @@ pub(crate) mod phases {
         "call_body",
         "call_pool",
         "call_setup",
+        "body_prep",
+        "body_ctx",
+        "body_entry",
     ];
 
-    static CYCLES: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
+    static CYCLES: [AtomicU64; 31] = [const { AtomicU64::new(0) }; 31];
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static CALL_PATH_CALLS: AtomicU64 = AtomicU64::new(0);
+    static SMALL_CALLS: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -6666,6 +6677,23 @@ pub(crate) mod phases {
     pub fn call_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("SLAG_CALL_PHASES").is_ok())
+    }
+
+    /// `SLAG_CALL_PHASES_SMALL=<steps>`: the only bodies whose run is timed by
+    /// the `body_*` phases. A process-wide average mixes a harness's tiny loop
+    /// with the application's frame bodies, which is useless for both; a step
+    /// cap isolates the small body.
+    pub fn small_limit() -> Option<usize> {
+        static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            std::env::var("SLAG_CALL_PHASES_SMALL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+    }
+
+    pub fn count_small_call() {
+        SMALL_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -6719,13 +6747,25 @@ pub(crate) mod phases {
         if n.is_multiple_of(20_000) {
             let per = n as f64;
             println!("call-phase\tcalls\t{n}");
-            for index in CALL_FIRST..NAMES.len() {
+            for index in CALL_FIRST..BODY_PREP {
                 let cycles = CYCLES[index].load(Ordering::Relaxed);
                 println!(
                     "call-phase\t{}\t{cycles}\t{:.1}/call",
                     NAMES[index],
                     cycles as f64 / per
                 );
+            }
+            let small = SMALL_CALLS.load(Ordering::Relaxed);
+            if small > 0 {
+                println!("call-phase\tsmall_bodies\t{small}");
+                for index in BODY_PREP..NAMES.len() {
+                    let cycles = CYCLES[index].load(Ordering::Relaxed);
+                    println!(
+                        "call-phase\t{}\t{cycles}\t{:.1}/small",
+                        NAMES[index],
+                        cycles as f64 / small as f64
+                    );
+                }
             }
         }
     }

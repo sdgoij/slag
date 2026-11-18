@@ -7404,6 +7404,18 @@ pub(crate) fn run_jit_body(
         "run_jit_body addresses `vm.frame`/`leaf_frame_base` directly, so a nested_frame pointer would disagree with the frame the entry is handed"
     );
     let work_len = info.stack_usage + JIT_STACK_SLACK + JIT_INLINE_HEADROOM;
+    // `SLAG_CALL_PHASES_SMALL` times the run of bodies at or below this many
+    // steps only: a process-wide average mixes a harness's tiny loop with the
+    // application's frame bodies, and neither number then means anything.
+    let small = crate::function::phases::small_limit().is_some_and(|n| ir.steps.len() <= n);
+    if small {
+        crate::function::phases::count_small_call();
+    }
+    let _prep = if small {
+        crate::function::phases::call_enter(crate::function::phases::BODY_PREP)
+    } else {
+        None
+    };
     // C0a (mechanism 1): the working region is a segment of `vm.stack`, and
     // the stack is reserved to `stack_cap` here so no helper push during the
     // run can reallocate it — the baked region pointer stays valid, so the
@@ -7451,56 +7463,71 @@ pub(crate) fn run_jit_body(
     } else {
         [0; INTRINSIC_COUNT]
     };
-    let mut ctx = JitCallContext {
-        pending: false,
-        error: None,
-        agent: agent as *mut Agent,
-        vm: vm as *mut Vm,
-        global_object: global.as_ptr() as *mut c_void,
-        global_value_cells: agent.roots.global_value_cell_base(),
-        member_value_cells: agent.roots.member_value_cell_base(),
-        computed_read_cells: agent.roots.computed_read_cell_base(),
-        member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
-        member_chain_cells: agent.member_chain_cells.as_mut_ptr() as *mut c_void,
-        member_chain_map_cells: agent.member_chain_map_cells.as_mut_ptr() as *mut c_void,
-        globals_unshadowed,
-        buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
-        leaf_epoch: 0,
-        leaf_records: agent.leaf_records.as_mut_ptr(),
-        leaf_gen: agent.leaf_gen,
-        body: std::rc::Rc::as_ptr(ir),
-        tail: false,
-        current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
-        self_entry: if self_call_ok { info.entry as u64 } else { 0 },
-        self_stack_usage: info.stack_usage as u64,
-        self_inline_ok: self_call_ok && !info.deopts,
-        apply_builtin_bits,
-        call_builtin_bits,
-        intrinsic_bits,
-        string_prototype_bits: string_prototype_bits(agent),
-        dispatch_value: 0,
-        suspension: None,
-        suspend_sp: 0,
-        global_bits: Value::Object(global).bits(),
-        resume_kind: 0,
-        resume_ip: 0,
-        reg_resume: 0,
-        resume_sp: 0,
-        resume_value: 0,
-        gc_ticks: JIT_GC_PROBE_INTERVAL,
+    drop(_prep);
+    let mut ctx = {
+        let _p = if small {
+            crate::function::phases::call_enter(crate::function::phases::BODY_CTX)
+        } else {
+            None
+        };
+        JitCallContext {
+            pending: false,
+            error: None,
+            agent: agent as *mut Agent,
+            vm: vm as *mut Vm,
+            global_object: global.as_ptr() as *mut c_void,
+            global_value_cells: agent.roots.global_value_cell_base(),
+            member_value_cells: agent.roots.member_value_cell_base(),
+            computed_read_cells: agent.roots.computed_read_cell_base(),
+            member_map_cells: agent.member_map_cells.as_ptr() as *mut c_void,
+            member_chain_cells: agent.member_chain_cells.as_mut_ptr() as *mut c_void,
+            member_chain_map_cells: agent.member_chain_map_cells.as_mut_ptr() as *mut c_void,
+            globals_unshadowed,
+            buf_end: (work_ptr as usize + work_len * std::mem::size_of::<Value>()) as *mut c_void,
+            leaf_epoch: 0,
+            leaf_records: agent.leaf_records.as_mut_ptr(),
+            leaf_gen: agent.leaf_gen,
+            body: std::rc::Rc::as_ptr(ir),
+            tail: false,
+            current_function: vm.current_function.map(|value| value.bits()).unwrap_or(0),
+            self_entry: if self_call_ok { info.entry as u64 } else { 0 },
+            self_stack_usage: info.stack_usage as u64,
+            self_inline_ok: self_call_ok && !info.deopts,
+            apply_builtin_bits,
+            call_builtin_bits,
+            intrinsic_bits,
+            string_prototype_bits: string_prototype_bits(agent),
+            dispatch_value: 0,
+            suspension: None,
+            suspend_sp: 0,
+            global_bits: Value::Object(global).bits(),
+            resume_kind: 0,
+            resume_ip: 0,
+            reg_resume: 0,
+            resume_sp: 0,
+            resume_value: 0,
+            gc_ticks: JIT_GC_PROBE_INTERVAL,
+        }
     };
     // Register the vm (its trace covers `vm.frame` and `vm.stack`, which
     // carries the working region) for the call's duration: a helper can
     // allocate and trigger a collection, and a heap value only the region
     // references must survive until the JIT stores or returns it.
     agent.jit_depth += 1;
-    let result = crate::ir::with_jit_run(vm, ir, || unsafe {
-        (entry)(
-            frame_ptr as *mut c_void,
-            work_ptr,
-            (&mut ctx as *mut JitCallContext) as *mut c_void,
-        )
-    });
+    let result = {
+        let _p = if small {
+            crate::function::phases::call_enter(crate::function::phases::BODY_ENTRY)
+        } else {
+            None
+        };
+        crate::ir::with_jit_run(vm, ir, || unsafe {
+            (entry)(
+                frame_ptr as *mut c_void,
+                work_ptr,
+                (&mut ctx as *mut JitCallContext) as *mut c_void,
+            )
+        })
+    };
     agent.jit_depth -= 1;
     // C0a: release the working region back to the stack bottom. A tail-call
     // loop re-enters this `Vm` (the driver recalls `run_jit_body` on the same
