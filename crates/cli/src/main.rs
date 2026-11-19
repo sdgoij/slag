@@ -1412,6 +1412,47 @@ mod tests {
     }
 
     #[test]
+    fn a_declarative_cell_store_records_the_barrier() {
+        // A global `let` written from a certified body's `StoreIdent` takes
+        // the global value cell's cached binding index
+        // (`try_declarative_cell_store`). The binding lives in the global
+        // environment record, which the first minor promotes, so a later write
+        // of a fresh string is an old->young edge whose only reachable path is
+        // that record — a rope, not a global-object property.
+        let mut context = Context::new().unwrap();
+        jit::install(context.agent_mut()).unwrap();
+        context.set_nursery_stress(true);
+        context
+            .eval(
+                "let consoleInput = ''; \
+                 function tick(n) { \
+                   for (let i = 0; i < n; i++) { consoleInput = consoleInput + 'x'; } \
+                 } \
+                 tick(5000); \
+                 if (consoleInput.length !== 5000) { throw new Error('len ' + consoleInput.length); }",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_compiled_global_cell_store_records_the_barrier() {
+        // `StoreGlobal`'s compiled fast path writes the global object's
+        // property slot in place (`set_global_slot`). A top-level `var` is an
+        // own data property of the global object, which is old after the first
+        // minor, so storing a fresh object through it is an old->young edge.
+        let mut context = Context::new().unwrap();
+        jit::install(context.agent_mut()).unwrap();
+        context.set_nursery_stress(true);
+        context
+            .eval(
+                "var g = null; \
+                 for (var i = 0; i < 2000; i++) { g = { i: i }; } \
+                 if (g.i !== 1999) { throw new Error('i ' + g.i); }",
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn missing_script_file_reports_an_error() {
         let result = run_file("definitely-not-a-real-file.js", &[], &Options::default());
         assert_eq!(result, Err(1));

@@ -3652,6 +3652,11 @@ extern "C" fn set_global_slot(ctx: *mut c_void, name: u64, slot: u64, value: u64
                 value: cell,
             } = &mut property.kind
         {
+            // The stored value can be younger than the global object itself,
+            // which the first minor promotes — an old->young edge the
+            // remembered set must learn about, exactly as the interpreter's
+            // `try_global_cell_store` and `JsObject::write_data_property` do.
+            crux::heap::write_barrier(global, value);
             *cell = value;
             true
         } else {
