@@ -780,6 +780,58 @@ design this heap rests on: handles are raw addresses into a non-moving arena
 (stable across collections, which the FFI surface and the compiled cells both
 rely on).
 
+### A0: 182 ns per closure, and half of the collector's share was slot scanning
+
+A0 (function-object creation) is the corpus's largest single term, so it got the
+same treatment as the construct path: measure the components before cutting.
+Same-shape probes, 300k iterations, min of 5, one workload per process:
+
+| probe | ms | ns/iteration |
+|---|---:|---:|
+| `let i` + `var f = function () { return 1; }` | 56.8 | 189 |
+| `var i` + the same closure | 57.5 | 191 |
+| `let i` + `var f = 1` | 2.0 | 6.8 |
+| `var i` + `var f = 1` | 2.0 | 6.5 |
+
+So **the closure is 182 ns and the loop is nothing without it** (6.8 → 189), and
+`let` vs `var` changes nothing — the per-iteration environment family is *not*
+what these rows pay, because a closure that captures nothing needs no per-iteration
+copy. That retires one hypothesis for A1/A1b's ordering.
+
+The flat profile of the 1.8 M-iteration version (624 ms) then put **21.5% in
+`register_function`**, 12.3% in allocation (`Function::allocate`, `new_in_place`,
+`Heap::alloc`), ~8% in the instantiation glue, ~8% in drops, and **18% in tracing
+the function table** (`FunctionTable::trace` 12.0% + `EcmaFunction::trace` 6.1%).
+
+That last share was the surprise, and instrumenting it found a real defect.
+`FunctionChunk::iter` walked all 256 slots and called `get` on each, and the
+table is sparse in practice — a cohort of ~5 500 live records spread over ~100
+chunks, a few dozen each — so the collector paid ~256 slot checks per chunk to
+visit ~50 records, once per collection. Worse, `FunctionTable` is a slab indexed
+by the never-reused function id, so the *directory* walks 8 204 entries by the
+end of a 300k-iteration loop (5 500 live records): the linear form cost 62 us per
+trace on a 1 284-entry directory and **120 us** on a 7 684-entry one.
+
+`iter` now walks the chunk's live bitmap (`trailing_zeros` + `bits &= bits - 1`),
+which is `count` iterations instead of 256 and cannot read an uninitialized slot
+(a set live bit is written exactly by `insert` and cleared by `remove`). Same
+probe, same measurement point: **120 us → 62.7 us** at an 8 204-entry directory,
+and flat (61-63 us) from 8 164 to 8 204 entries instead of growing with it. The
+row reads 50.8 → 48.7 ms (**-4.2%**, and -4.0% on the `var` form, 5 reps), but
+that is inside this host's +-7% null-control floor for these rows, so the
+mechanism number is the claim and the row number is the direction.
+
+Gates: `sweep all` 48,633/48,633, `cargo test --workspace`, clippy `-D warnings`,
+and the `app` family shows 1 deopt / 0 leaf (unchanged).
+
+**What is left, in the order the profile puts it:** `register_function` (21.5%)
+— the plan's A0c names a dense `Vec` indexed by the sequential id as the shape
+that removes the record insert, and it is a table-wide change; allocation 12.3%
+(A0d says there is little there beyond not allocating); and the *directory*
+growth, which this cut made cheaper but not bounded — a live-chunk list would
+make `iter` O(live chunks) and stop it growing with the id space over a long
+session.
+
 ### The construct path is already the fast path (measured against a factory)
 
 `calls/construct_churn` was the next lever queued after the GC pricing, and the
