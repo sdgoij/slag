@@ -6389,16 +6389,16 @@ impl Vm {
         let Some(env) = self.global_env_record() else {
             return Ok(false);
         };
-        let crate::env::EnvRecord::Global(global_env) = &*env else {
+        if !matches!(&*env, crate::env::EnvRecord::Global(_)) {
             return Ok(false);
-        };
+        }
         let index = cell.slot as usize;
         let name_string = crux::lookup(name);
-        let Some(stored) =
-            global_env
-                .declarative
-                .set_value_at(index, &name_string, value, self.strict)?
-        else {
+        // The record-level call is what carries the write barrier: a write
+        // through `declarative` would name an interior address, so the
+        // remembered set would never learn about an old global env gaining a
+        // young value (a rope from `consoleInput = consoleInput + ...`).
+        let Some(stored) = env.set_value_at(index, &name_string, value, self.strict)? else {
             return Ok(false);
         };
         Self::record_declarative_cell(agent, name, stored, &global, index);

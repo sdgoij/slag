@@ -190,6 +190,31 @@ impl EnvRecord {
         }
     }
 
+    /// Write the binding at a cached index — the global declarative cell's
+    /// fast path (`StoreIdent`) — with the same record-level barrier
+    /// [`set_slot`](Self::set_slot) uses, for the same reason: the binding
+    /// vector is a variant of this enum, so a target derived from the
+    /// `DeclarativeEnv` payload would name an interior address.
+    ///
+    /// The barrier runs even when the write is then refused (a stale index, a
+    /// const): that is the imprecise-but-safe side, never a missing edge.
+    pub fn set_value_at(
+        &self,
+        index: usize,
+        name: &JsString,
+        value: Value,
+        strict: bool,
+    ) -> Result<Option<Value>, JsError> {
+        crux::heap::write_barrier(self, value);
+        match self {
+            EnvRecord::Declarative(e) => e.set_value_at(index, name, value, strict),
+            EnvRecord::Function(e) => e.declarative.set_value_at(index, name, value, strict),
+            EnvRecord::Global(e) => e.declarative.set_value_at(index, name, value, strict),
+            EnvRecord::Module(e) => e.declarative.set_value_at(index, name, value, strict),
+            EnvRecord::Object(_) => Ok(None),
+        }
+    }
+
     /// spec 9.2.1.6 GetBindingValue.
     pub fn get_binding_value(&self, name: &JsString, strict: bool) -> Result<Value, JsError> {
         match self {
