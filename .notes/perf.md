@@ -832,6 +832,33 @@ growth, which this cut made cheaper but not bounded — a live-chunk list would
 make `iter` O(live chunks) and stop it growing with the id space over a long
 session.
 
+All three were then investigated, and only the first paid:
+
+- **`register_function`, the phase guards.** Eleven `phases::enter` calls per
+closure, each re-reading a `OnceLock` to learn the instrument is off. Ceiling
+measured first by making `enter` return `None` outright: **-4.9%** on the
+closure row (-2.8% on the `var` form). A `phases::Tracer` snapshots `enabled()`
+once per creation and the eleven sites use it: **-1.7% / -2.9%** against a
+-0.2% / -0.9% same-binary null control, i.e. most of the ceiling. Landed.
+- **Allocation (12.3%) is already the fast shape.** `Function::allocate` uses
+`Handle::new_in_place` and writes the 600-byte payload straight into the arena
+slot — no stack temp, no memcpy — and `canonical_empty_map` is resolved before
+the borrow. What remains is the field initialization a `JsObject` + function
+slots require (`size_of::<Function>() = 600`), which is `slag-object-layout`'s
+"layout is speed-neutral" case, not a missing fast path. Nothing to cut.
+- **The directory walk is negligible, and the live-chunk list is not worth its
+state.** Instrumented in the same warm context: 8 204 directory entries of which
+**436 hold a chunk**, and the pure directory scan is **1.1 us of a 57 us trace
+(2%)**. The trace is now ~10 ns per live record — memory latency on records that
+are 208 bytes apart and ~13 to a 53 KB chunk, not iteration overhead. A
+live-chunk list would remove 1 us and add a position field plus `insert`/`remove`
+maintenance; refused on the measurement.
+
+The remaining A0 term is `register_function`'s own body (the `EcmaFunction`
+build and its ~5 `Rc` clones, the three execution-context walks) and the
+per-record trace latency. The first is a struct-shape question and the second is
+a locality question; neither is a cache-size knob.
+
 ### The construct path is already the fast path (measured against a factory)
 
 `calls/construct_churn` was the next lever queued after the GC pricing, and the
