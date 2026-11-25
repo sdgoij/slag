@@ -1138,6 +1138,7 @@ dependencies = [
  "cranelift-native",
  "region",
  "target-lexicon",
+ "wat",
 ]
 
 [[package]]
