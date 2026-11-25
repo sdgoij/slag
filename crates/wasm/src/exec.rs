@@ -2916,6 +2916,16 @@ fn global_op(store: &mut Store, instance: u64, mode: u64, x: u64, scratch: *mut 
     crate::compile::TRAP_NONE
 }
 
+/// The inputs of the host-reachability walk, bundled so the recursive step
+/// keeps a short argument list (see [`Store::host_reachable_bodies`]).
+#[cfg(feature = "compile")]
+struct HostWalk<'a> {
+    module: &'a Module,
+    funcs: &'a [FuncTarget],
+    imported: usize,
+    has_external_host: bool,
+}
+
 impl Store {
     pub fn new() -> Self {
         Store {
@@ -3154,21 +3164,29 @@ impl Store {
         // an earlier instance, whose answers are already final.
         let mut result = vec![false; module.bodies.len()];
         let mut state = vec![0u8; module.bodies.len()];
+        // An indirect or ref call can reach any table entry, so the direct-graph
+        // walk cannot clear a body while the store holds an external host.
+        let walk = HostWalk {
+            module,
+            funcs,
+            imported,
+            has_external_host: self.host_funcs.iter().any(|host| host.token.is_some()),
+        };
         for defined in 0..module.bodies.len() {
-            self.host_reachable_of(module, funcs, imported, defined, &mut state, &mut result);
+            self.host_reachable_of(&walk, defined, &mut state, &mut result);
         }
         result
     }
 
     /// Whether executing body `defined` (of the instance `host_reachable_bodies`
     /// is analyzing) can reach an external host, following `Call`/`ReturnCall`
-    /// through the resolved function index space.
+    /// through the resolved function index space. An indirect or ref call is
+    /// treated as reaching one whenever `has_external_host`, because its target
+    /// is not known here.
     #[cfg(feature = "compile")]
     fn host_reachable_of(
         &self,
-        module: &Module,
-        funcs: &[FuncTarget],
-        imported: usize,
+        walk: &HostWalk<'_>,
         defined: usize,
         state: &mut [u8],
         result: &mut [bool],
@@ -3183,13 +3201,23 @@ impl Store {
         }
         state[defined] = 1;
         let mut reachable = false;
-        for instr in &module.bodies[defined].body {
+        for instr in &walk.module.bodies[defined].body {
             let index = match instr {
                 Instr::Call(index) | Instr::ReturnCall(index) => *index as usize,
+                Instr::CallIndirect { .. }
+                | Instr::ReturnCallIndirect { .. }
+                | Instr::CallRef(_)
+                | Instr::ReturnCallRef(_) => {
+                    if walk.has_external_host {
+                        reachable = true;
+                        break;
+                    }
+                    continue;
+                }
                 _ => continue,
             };
-            if index < imported {
-                match funcs.get(index) {
+            if index < walk.imported {
+                match walk.funcs.get(index) {
                     // A direct call to a token'd host import (a JS-API
                     // closure) would park the run; the compiled path cannot.
                     Some(FuncTarget::Host(id))
@@ -3214,14 +3242,7 @@ impl Store {
                     }
                     Some(_) | None => {}
                 }
-            } else if self.host_reachable_of(
-                module,
-                funcs,
-                imported,
-                index - imported,
-                state,
-                result,
-            ) {
+            } else if self.host_reachable_of(walk, index - walk.imported, state, result) {
                 reachable = true;
             }
             if reachable {
@@ -7354,5 +7375,49 @@ mod tests {
             .instantiate(&module, &mut resolve)
             .expect_err("instantiate should refuse a host call during start");
         assert!(matches!(error, InstantiateError::Unsupported(_)));
+    }
+
+    /// The host-reachability analysis cannot follow an indirect call, so a
+    /// store that owns an external host must keep such a body interpreted. A
+    /// compiled body would reach the host through the non-resumable runner and
+    /// trap instead of parking the run.
+    #[test]
+    fn an_indirect_tail_call_reaches_a_host_from_a_resumable_run() {
+        let bytes = wat::parse_str(
+            r#"
+            (module
+              (import "env" "print" (func $print (param i32)))
+              (table 1 funcref)
+              (elem (i32.const 0) $target)
+              (func $target (param i32) (call $print (local.get 0)))
+              (func (export "go") (param i32)
+                (return_call_indirect (param i32) (local.get 0) (i32.const 0))))
+            "#,
+        )
+        .expect("wat");
+        let module = crate::binary::decode(&bytes).expect("decode");
+        let mut store = Store::new();
+        let host = store.external_host(
+            FuncType {
+                params: vec![ValType::I32],
+                results: Vec::new(),
+            },
+            9,
+        );
+        let mut resolve = |_module: &str, _name: &str| Some(ExternVal::HostFunc(host));
+        let (instance, progress) = store
+            .instantiate_deferred(&module, &mut resolve)
+            .expect("instantiate");
+        assert!(progress.is_none(), "the module has no start function");
+
+        let go = store.exported_func(instance, "go").expect("go export");
+        let progress = store.start(instance, go, &[Value::I32(7)]).expect("start");
+        let RunProgress::Host(request) = progress else {
+            panic!("the host call should park the run");
+        };
+        assert_eq!(request.token, 9);
+        assert_eq!(request.args, vec![Value::I32(7)]);
+        let progress = store.resume(Ok(Vec::new())).expect("resume");
+        assert!(matches!(progress, RunProgress::Finished(_)));
     }
 }
