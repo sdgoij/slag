@@ -288,7 +288,17 @@ impl Context {
         }
         let depth = isolate.entry_depth.get() + 1;
         isolate.entry_depth.set(depth);
-        let result = self.with_agent(body);
+        // A Context whose realm is not the isolate's current one is the
+        // multi-context case: push this context's bootstrap context for the
+        // entry so eval/call/construct run in the realm the handle names. The
+        // push is popped before the job drain below, because a job carries its
+        // own realm and `current_realm` prefers the stack over it.
+        let result = self.with_agent(|agent| {
+            agent.push_bootstrap_context(self.realm);
+            let result = body(agent);
+            agent.pop_bootstrap_context();
+            result
+        });
         isolate.entry_depth.set(depth - 1);
         if depth == 1 {
             // The post-collection drain happens at the outermost exit, whatever
@@ -530,5 +540,28 @@ mod tests {
             seen.iter().all(|call| call == "resolve"),
             "only the installed slot ran: {seen:?}"
         );
+    }
+
+    /// A second realm must not move where the first handle evaluates: the
+    /// entry pushes the handle's own bootstrap context, so a context still sees
+    /// its own global after another context exists.
+    #[test]
+    fn eval_is_scoped_to_its_contexts_realm() {
+        let mut isolate = Isolate::new();
+        let realm_a = Context::new(&mut isolate).expect("realm A");
+        realm_a
+            .try_eval("globalThis.marker = 'a';")
+            .expect("realm A write");
+
+        let realm_b = Context::new(&mut isolate).expect("realm B");
+        realm_b
+            .try_eval("globalThis.marker = 'b';")
+            .expect("realm B write");
+
+        let seen_a = realm_a.try_eval("globalThis.marker").expect("realm A read");
+        assert_eq!(seen_a.as_string().as_deref(), Some("a"));
+
+        let seen_b = realm_b.try_eval("globalThis.marker").expect("realm B read");
+        assert_eq!(seen_b.as_string().as_deref(), Some("b"));
     }
 }
