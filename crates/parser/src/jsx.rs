@@ -243,7 +243,7 @@ fn name_key(name: &JsxName, single_atom: AtomId) -> PropertyName {
     if name.parts.len() == 1 && !name.is_member {
         PropertyName::Ident(single_atom)
     } else {
-        PropertyName::Str(JsString::from_utf16(&name.text))
+        PropertyName::Str(crux::intern(&name.text))
     }
 }
 

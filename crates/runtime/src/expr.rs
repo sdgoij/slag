@@ -948,7 +948,7 @@ pub(crate) fn eval_property_name(
 ) -> Result<PropertyKey, JsError> {
     match key {
         PropertyName::Ident(id) => Ok(PropertyKey::String(*id)),
-        PropertyName::Str(text) => Ok(PropertyKey::from_js_string(text)),
+        PropertyName::Str(atom) => Ok(PropertyKey::String(*atom)),
         PropertyName::Number(n) => Ok(PropertyKey::String(crux::intern(
             to_string(&Value::Number(*n))?.as_slice(),
         ))),

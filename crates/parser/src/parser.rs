@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crux::{AtomId, JsError, JsString, Span, intern_utf8};
+use crux::{AtomId, JsError, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
     ArrayBindingElement, ArrayElement, AssignOp, BindingElement, BindingPattern, Expr, ExprKind,
@@ -931,7 +931,7 @@ impl<'s> Parser<'s> {
             }
             TokenKind::StringLiteral { value, .. } => {
                 self.next()?;
-                Ok(PropertyName::Str(value))
+                Ok(PropertyName::Str(crux::intern(value.as_slice())))
             }
             TokenKind::NumericLiteral(value) => {
                 self.next()?;
@@ -942,7 +942,7 @@ impl<'s> Parser<'s> {
                     // 12.9.3, 13.2.6), which may exceed f64 precision.
                     syntax::NumericLiteral::BigInt(b) => {
                         let text = crux::bigint::to_string(&b, 10);
-                        return Ok(PropertyName::Str(JsString::from_utf8(&text)));
+                        return Ok(PropertyName::Str(intern_utf8(&text)));
                     }
                 }))
             }

@@ -1432,7 +1432,7 @@ fn is_proto_data_property(prop: &ObjectProperty) -> bool {
     }
     match key {
         PropertyName::Ident(atom) => *atom == intern_utf8("__proto__"),
-        PropertyName::Str(s) => s == &JsString::from_utf8("__proto__"),
+        PropertyName::Str(atom) => *atom == intern_utf8("__proto__"),
         _ => false,
     }
 }

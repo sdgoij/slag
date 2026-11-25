@@ -16539,11 +16539,11 @@ fn fast_object_names(literal: &ObjectLiteral) -> Option<Box<[crux::AtomId]>> {
                 }
                 *id
             }
-            PropertyName::Str(text) => {
-                if crux::intern(text.as_slice()) == crux::proto_atom() {
+            PropertyName::Str(atom) => {
+                if *atom == crux::proto_atom() {
                     return None;
                 }
-                crux::intern(text.as_slice())
+                *atom
             }
             PropertyName::Number(n) => {
                 // The canonical decimal text (the same text the step path's
@@ -16671,7 +16671,7 @@ pub(crate) fn object_init(
             }
             crux::lookup(*id)
         }
-        PropertyName::Str(text) => text.clone(),
+        PropertyName::Str(atom) => crux::lookup(*atom),
         PropertyName::Number(n) => crux::convert::to_string(&Value::Number(*n))?,
         PropertyName::Computed(_) => {
             unreachable!("computed keys use the ObjectInitComputed step")
@@ -23114,8 +23114,8 @@ impl Compiler {
                                     self.emit(Step::DestructureObjKey { key: key.clone() });
                                     excluded.push(key);
                                 }
-                                PropertyName::Str(text) => {
-                                    let key = crux::property::PropertyKey::from_js_string(text);
+                                PropertyName::Str(atom) => {
+                                    let key = crux::property::PropertyKey::String(*atom);
                                     self.emit(Step::DestructureObjKey { key: key.clone() });
                                     excluded.push(key);
                                 }
@@ -23218,8 +23218,8 @@ impl Compiler {
                                     self.emit(Step::DestructureObjKey { key: key.clone() });
                                     excluded.push(key);
                                 }
-                                PropertyName::Str(text) => {
-                                    let key = crux::property::PropertyKey::from_js_string(text);
+                                PropertyName::Str(atom) => {
+                                    let key = crux::property::PropertyKey::String(*atom);
                                     self.emit(Step::DestructureObjKey { key: key.clone() });
                                     excluded.push(key);
                                 }
@@ -23776,7 +23776,7 @@ impl Compiler {
     fn static_property_atom(key: &PropertyName) -> Result<Option<crux::AtomId>, JsError> {
         match key {
             PropertyName::Ident(id) => Ok(Some(*id)),
-            PropertyName::Str(text) => Ok(Some(crux::intern(text.as_slice()))),
+            PropertyName::Str(atom) => Ok(Some(*atom)),
             PropertyName::Number(n) => Ok(Some(crux::intern(
                 crux::convert::to_string(&Value::Number(*n))?.as_slice(),
             ))),
@@ -24667,11 +24667,10 @@ impl Compiler {
                             self.compile_expr(value)?;
                             self.emit(Step::ObjectInitComputed { set_name });
                         }
-                        PropertyName::Str(text) => {
+                        PropertyName::Str(atom) => {
                             self.compile_expr(value)?;
-                            let id = crux::intern(text.as_slice());
                             self.emit(Step::ObjectInitName {
-                                name: id,
+                                name: *atom,
                                 set_name,
                                 shorthand: false,
                             });
@@ -24701,10 +24700,9 @@ impl Compiler {
                             function: function.clone(),
                         });
                     }
-                    PropertyName::Str(text) => {
-                        let id = crux::intern(text.as_slice());
+                    PropertyName::Str(atom) => {
                         self.emit(Step::ObjectMethodName {
-                            name: id,
+                            name: *atom,
                             function: function.clone(),
                         });
                     }
@@ -24771,10 +24769,9 @@ impl Compiler {
                     span,
                 });
             }
-            PropertyName::Str(text) => {
-                let id = crux::intern(text.as_slice());
+            PropertyName::Str(atom) => {
                 self.emit(Step::ObjectAccessorName {
-                    name: id,
+                    name: *atom,
                     get,
                     param,
                     body: body.clone(),

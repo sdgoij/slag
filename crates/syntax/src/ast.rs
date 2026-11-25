@@ -551,7 +551,9 @@ pub enum ObjectProperty {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropertyName {
     Ident(AtomId),
-    Str(JsString),
+    /// A string-literal key, interned: a key is an atom, and keeping the atom
+    /// (rather than a `JsString`) keeps the AST free of heap handles.
+    Str(AtomId),
     Number(f64),
     Computed(Expr),
 }

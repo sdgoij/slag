@@ -1372,7 +1372,7 @@ fn property_name_key(
 ) -> Result<PropertyKey, JsError> {
     match name {
         PropertyName::Ident(id) => Ok(PropertyKey::String(*id)),
-        PropertyName::Str(text) => Ok(PropertyKey::from_js_string(text)),
+        PropertyName::Str(atom) => Ok(PropertyKey::String(*atom)),
         PropertyName::Number(n) => Ok(PropertyKey::from_js_string(&to_string(&Value::Number(*n))?)),
         PropertyName::Computed(expr) => {
             let key = eval_expr(agent, expr, strict)?;

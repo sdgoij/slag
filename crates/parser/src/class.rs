@@ -131,9 +131,7 @@ fn is_plain_constructor(name: &ClassElementName, function: &Function) -> bool {
 fn is_name(name: &ClassElementName, text: &str) -> bool {
     match name {
         ClassElementName::Property(syntax::PropertyName::Ident(atom)) => atom == &intern_utf8(text),
-        ClassElementName::Property(syntax::PropertyName::Str(value)) => {
-            value == &crux::JsString::from_utf8(text)
-        }
+        ClassElementName::Property(syntax::PropertyName::Str(atom)) => atom == &intern_utf8(text),
         _ => false,
     }
 }

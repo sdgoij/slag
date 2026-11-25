@@ -308,7 +308,7 @@ fn property_name_to_key(
 ) -> Result<PropertyKey, JsError> {
     match name {
         PropertyName::Ident(id) => Ok(PropertyKey::String(*id)),
-        PropertyName::Str(text) => Ok(PropertyKey::from_js_string(text)),
+        PropertyName::Str(atom) => Ok(PropertyKey::String(*atom)),
         PropertyName::Number(n) => Ok(PropertyKey::from_js_string(&crux::convert::to_string(
             &Value::Number(*n),
         )?)),
