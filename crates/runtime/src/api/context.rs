@@ -564,4 +564,54 @@ mod tests {
         let seen_b = realm_b.try_eval("globalThis.marker").expect("realm B read");
         assert_eq!(seen_b.as_string().as_deref(), Some("b"));
     }
+
+    /// A host object hears every way script can make its identity outlive the
+    /// references to it (Ladybird's `preserve_identity` trigger).
+    #[test]
+    fn weak_holding_tells_a_host_object_to_preserve_its_identity() {
+        use std::cell::Cell;
+
+        use crux::host::HostOps;
+        use crux::object::JsObject;
+
+        #[derive(Debug)]
+        struct Counter {
+            count: Rc<Cell<u32>>,
+        }
+
+        impl HostOps for Counter {
+            fn preserve_identity(&self, _object: &JsObject) {
+                self.count.set(self.count.get() + 1);
+            }
+        }
+
+        let mut isolate = Isolate::new();
+        let context = Context::new(&mut isolate).expect("context");
+        let global = context.global().as_object().expect("global");
+        let count = Rc::new(Cell::new(0));
+        let host = JsObject::host_object_create(
+            Rc::new(Counter {
+                count: count.clone(),
+            }),
+            None,
+        );
+        global
+            .create_data_property_or_throw(&JsString::from_utf8("__host"), Value::Object(host))
+            .expect("install the host object");
+
+        for (source, expected) in [
+            ("new WeakRef(globalThis.__host)", 1),
+            ("new WeakMap().set(globalThis.__host, 1)", 2),
+            ("new WeakSet().add(globalThis.__host)", 3),
+            (
+                "new FinalizationRegistry(function () {}).register(globalThis.__host, 1)",
+                4,
+            ),
+        ] {
+            context
+                .try_eval(source)
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert_eq!(count.get(), expected, "{source}");
+        }
+    }
 }

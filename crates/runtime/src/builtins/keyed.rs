@@ -19,7 +19,7 @@ use crux::value::{Value, ValueKind, is_callable};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::agent::{Agent, MapCollection, MapEntry, SetCollection, SetEntry};
+use crate::agent::{Agent, MapCollection, MapEntry, SetCollection, SetEntry, preserve_weak_target};
 use crate::context::{as_object, get_property};
 use crate::expr::IteratorRecord;
 use crate::realm::Realm;
@@ -1370,6 +1370,7 @@ fn weak_map_set(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             "Invalid value used as weak map key".into(),
         ));
     }
+    preserve_weak_target(&key);
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let data = agent.weak_map_entries(object.id()).unwrap();
     let mut data = data.borrow_mut();
@@ -1444,6 +1445,7 @@ fn weak_map_get_or_insert(
             "Invalid value used as weak map key".into(),
         ));
     }
+    preserve_weak_target(&key);
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let data = agent.weak_map_entries(object.id()).unwrap();
     let mut data = data.borrow_mut();
@@ -1472,6 +1474,7 @@ fn weak_map_get_or_insert_computed(
             "Invalid value used as weak map key".into(),
         ));
     }
+    preserve_weak_target(&key);
     let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
     if !is_callable(&callback) {
         return Err(JsError::new(
@@ -1518,6 +1521,7 @@ fn weak_set_add(agent: &mut Agent, this: &Value, args: &[Value]) -> Result<Value
             "Invalid value used in weak set".into(),
         ));
     }
+    preserve_weak_target(&value);
     let data = agent.weak_set_entries(object.id()).unwrap();
     let mut data = data.borrow_mut();
     if find_set_index(&data, &value).is_none() {

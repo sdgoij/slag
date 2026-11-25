@@ -171,6 +171,19 @@ pub trait HostOps: std::fmt::Debug {
     /// gets the same news through that handle; this callback is for a host whose
     /// objects have host state to release rather than a value to watch.
     fn finalize(&self, _object_id: u64) {}
+
+    /// Called when script makes the object's identity outlive the references to
+    /// it: it is held by a `WeakRef`, a `WeakMap`, a `WeakSet`, or a
+    /// `FinalizationRegistry`, or it gains a private element
+    /// (`JsObject::preserve_identity`). Ladybird's `preserve_identity` hook has
+    /// the same trigger and passes the object for the same reason.
+    ///
+    /// A host that drops an object it can recreate from the wrapped
+    /// implementation must keep this one from then on; `object.self_value()`
+    /// plus `crux::heap::pin` is how it pins one. The hook may run more than
+    /// once, so it must be idempotent. Like Ladybird's, it must not run code;
+    /// it runs at an ordinary point, so allocating is allowed.
+    fn preserve_identity(&self, _object: &JsObject) {}
 }
 
 /// A host exotic object's engine-owned state: the host's behaviour, plus the
@@ -342,6 +355,41 @@ mod tests {
         let result =
             crate::function::call(&value, Value::Undefined, &[Value::Number(7.0)]).unwrap();
         assert_eq!(result, Value::Number(7.0));
+    }
+
+    #[derive(Debug)]
+    struct PreserveCounter {
+        count: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl HostOps for PreserveCounter {
+        fn preserve_identity(&self, _object: &JsObject) {
+            self.count.set(self.count.get() + 1);
+        }
+    }
+
+    /// Gaining a private element makes the identity observable, so the host
+    /// must stop recreating the wrapper; a duplicate name adds no element and
+    /// must not report one.
+    #[test]
+    fn a_private_element_tells_a_host_object_to_preserve_its_identity() {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let object = JsObject::host_object_create(
+            std::rc::Rc::new(PreserveCounter {
+                count: count.clone(),
+            }),
+            None,
+        );
+        let element = || crate::object::PrivateElement {
+            name_id: 1,
+            kind: crate::object::PrivateElementKind::Field(Value::Number(1.0)),
+        };
+        object
+            .private_element_add(element())
+            .expect("private element");
+        assert_eq!(count.get(), 1);
+        assert!(object.private_element_add(element()).is_err());
+        assert_eq!(count.get(), 1, "a rejected element reported a new one");
     }
 
     /// The box address a string value points at.

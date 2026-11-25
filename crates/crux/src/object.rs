@@ -1931,6 +1931,20 @@ impl JsObject {
         }
     }
 
+    /// Tell a host object that script made its identity outlive the references
+    /// to it: it is now held by a `WeakRef`, a `WeakMap`, a `WeakSet`, or a
+    /// `FinalizationRegistry`, or it just gained a private element. A no-op for
+    /// every other kind of object.
+    ///
+    /// This is the engine's counterpart of Ladybird's `preserve_identity` hook:
+    /// a host whose object can be recreated from the wrapped implementation must
+    /// stop doing that once script can observe the wrapper's identity.
+    pub fn preserve_identity(&self) {
+        if let ObjectKind::Host(object) = &self.kind {
+            object.behaviour().preserve_identity(self);
+        }
+    }
+
     /// The ordinary field layout with `kind` replaced (the `External`/`Host`
     /// constructors' common body). A `Drop` impl makes the struct-update
     /// spread (`..Self::basic_object_create(..)`) illegal — moving fields out
@@ -4690,6 +4704,9 @@ impl JsObject {
             }
         }
         elements.push(element);
+        // The object now carries a private element, which script can use to
+        // observe its identity, so a host must stop recreating it.
+        self.preserve_identity();
         Ok(())
     }
 

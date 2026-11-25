@@ -151,6 +151,16 @@ pub fn value_box_addr(value: &Value) -> Option<crux::heap::GcAny> {
     }
 }
 
+/// Tell a value that script is about to hold it weakly (a `WeakRef`, a weak
+/// collection key, or a `FinalizationRegistry` target). A host object's
+/// behaviour hears it through `HostOps::preserve_identity`; every other value
+/// is a no-op.
+pub(crate) fn preserve_weak_target(value: &Value) {
+    if let ValueKind::Object(object) = value.kind() {
+        object.preserve_identity();
+    }
+}
+
 /// The surrounding agent: the execution context stack, the job queues, and
 /// the Agent Record fields of spec 9.7.
 #[derive(Debug)]

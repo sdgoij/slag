@@ -18,7 +18,7 @@ use crux::property::{PropertyDescriptor, PropertyKey};
 use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, preserve_weak_target};
 use crate::context::as_object;
 use crate::realm::Realm;
 
@@ -357,6 +357,7 @@ pub fn dispatch_construct(
         return Some((|| {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
             weakly_holdable(agent, &target)?;
+            preserve_weak_target(&target);
             let proto = instance_proto(agent, new_target, WEAK_REF_PROTO)?;
             let object = JsObject::ordinary_object_create(Some(proto));
             agent
@@ -411,6 +412,7 @@ fn finalization_register(
     };
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     weakly_holdable(agent, &target)?;
+    preserve_weak_target(&target);
     let held_value = args.get(1).cloned().unwrap_or(Value::Undefined);
     if same_value(&target, &held_value) {
         return Err(JsError::new(
@@ -423,6 +425,7 @@ fn finalization_register(
         v if v.is_undefined() => None,
         _ => {
             weakly_holdable(agent, &token)?;
+            preserve_weak_target(&token);
             Some(token)
         }
     };
