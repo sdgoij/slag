@@ -3236,11 +3236,44 @@ impl Store {
     /// Instantiate `module`, resolving each import through `resolve` (module
     /// name, field name) to an [`ExternVal`] or `None` for an unknown import.
     /// Returns the new instance's id.
+    ///
+    /// The start function runs to completion here, so an external host call
+    /// during start is refused: this form has no way to deliver host results.
+    /// Use [`Store::instantiate_deferred`] when the embedder can resume.
     pub fn instantiate(
         &mut self,
         module: &Module,
         resolve: &mut dyn FnMut(&str, &str) -> Option<ExternVal>,
     ) -> Result<usize, InstantiateError> {
+        let (id, progress) = self.instantiate_deferred(module, resolve)?;
+        if let Some(progress) = progress {
+            match progress {
+                RunProgress::Finished(_) => {}
+                RunProgress::Host(_) => {
+                    self.suspended.pop();
+                    return Err(InstantiateError::Unsupported(
+                        "external host function in a non-resumable run",
+                    ));
+                }
+            }
+        }
+        Ok(id)
+    }
+
+    /// Instantiate `module` and begin its start function without running it.
+    ///
+    /// Returns the instance id and the start function's progress: `None` when
+    /// the module has no start function, `Some(Finished)` when it ran to
+    /// completion, and `Some(Host(..))` when it parked at an external host
+    /// call, which the caller resumes with [`Store::resume`]. The instance is
+    /// registered and its segments are initialized before the start function
+    /// begins, so a parked instance is visible to the store; a caller that
+    /// abandons the run should discard the instance (or the store) itself.
+    pub fn instantiate_deferred(
+        &mut self,
+        module: &Module,
+        resolve: &mut dyn FnMut(&str, &str) -> Option<ExternVal>,
+    ) -> Result<(usize, Option<RunProgress>), InstantiateError> {
         let self_id = self.instances.len();
         let mut funcs = Vec::with_capacity(module.imports.len() + module.functions.len());
         let mut tables = Vec::with_capacity(module.imports.len());
@@ -3591,17 +3624,24 @@ impl Store {
             }
         }
 
-        // Run the start function, if any.
-        if let Some(start) = module.start {
-            let target = *self.instances[self_id]
-                .funcs
-                .get(start as usize)
-                .ok_or(ExecFail::Trap(Trap::UnknownFunction))
-                .map_err(InstantiateError::from)?;
-            self.run_target(target, &[])
-                .map_err(InstantiateError::from)?;
-        }
-        Ok(self_id)
+        // Begin the start function, if any, and hand its progress back: a
+        // host call during start is resumable by an embedder that drives the
+        // run, and a non-resumable caller rejects it in `instantiate`.
+        let progress = match module.start {
+            Some(start) => {
+                let target = *self.instances[self_id]
+                    .funcs
+                    .get(start as usize)
+                    .ok_or(ExecFail::Trap(Trap::UnknownFunction))
+                    .map_err(InstantiateError::from)?;
+                Some(
+                    self.start_target(target, &[])
+                        .map_err(InstantiateError::from)?,
+                )
+            }
+            None => None,
+        };
+        Ok((self_id, progress))
     }
 
     /// The export `name` of `instance` as an importable value.
@@ -4173,6 +4213,12 @@ impl Store {
     /// A memory cell's current bytes (the whole linear memory).
     pub fn memory_bytes(&self, cell: usize) -> Option<&[u8]> {
         self.memories.get(cell).map(|memory| &*memory.bytes)
+    }
+
+    /// A memory cell's current bytes, mutably: an embedder that owns a
+    /// standalone memory cell writes guest memory through this.
+    pub fn memory_bytes_mut(&mut self, cell: usize) -> Option<&mut [u8]> {
+        self.memories.get_mut(cell).map(|memory| &mut *memory.bytes)
     }
 
     /// A memory cell's byte block, so the JS-API can present `buffer` as a view
@@ -7234,5 +7280,79 @@ mod tests {
             memory.block().mark_shared(),
             "a shared memory's block can be published to another agent"
         );
+    }
+
+    fn host_calling_start_module() -> Module {
+        let bytes = wat::parse_str(
+            r#"
+            (module
+              (import "env" "tick" (func $tick))
+              (global $seen (mut i32) (i32.const 0))
+              (func $start (global.set $seen (i32.const 1)) (call $tick))
+              (start $start)
+              (func (export "seen") (result i32) (global.get $seen)))
+            "#,
+        )
+        .expect("wat");
+        crate::binary::decode(&bytes).expect("decode")
+    }
+
+    /// A start function may call an imported host function. The resumable form
+    /// parks at that boundary, and the caller's reply finishes instantiation.
+    #[test]
+    fn a_start_functions_host_call_is_resumable() {
+        let module = host_calling_start_module();
+        let mut store = Store::new();
+        let tick = store.external_host(
+            FuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            },
+            7,
+        );
+        let mut served = false;
+        let mut resolve = |_module: &str, _name: &str| -> Option<ExternVal> {
+            if served {
+                return None;
+            }
+            served = true;
+            Some(ExternVal::HostFunc(tick))
+        };
+
+        let (instance, progress) = store
+            .instantiate_deferred(&module, &mut resolve)
+            .expect("instantiate");
+        let Some(RunProgress::Host(request)) = progress else {
+            panic!("the start function should park at the host call");
+        };
+        assert_eq!(request.token, 7);
+        let progress = store.resume(Ok(Vec::new())).expect("resume");
+        assert!(matches!(progress, RunProgress::Finished(_)));
+
+        let seen = store.exported_func(instance, "seen").expect("seen export");
+        let RunProgress::Finished(values) = store.start(instance, seen, &[]).expect("seen") else {
+            panic!("seen parked");
+        };
+        assert!(matches!(values.as_slice(), [Value::I32(1)]));
+    }
+
+    /// Without a resume path the same module is refused, rather than run with a
+    /// host the caller cannot answer.
+    #[test]
+    fn instantiate_refuses_a_host_call_during_start() {
+        let module = host_calling_start_module();
+        let mut store = Store::new();
+        let tick = store.external_host(
+            FuncType {
+                params: Vec::new(),
+                results: Vec::new(),
+            },
+            7,
+        );
+        let mut resolve = |_module: &str, _name: &str| Some(ExternVal::HostFunc(tick));
+        let error = store
+            .instantiate(&module, &mut resolve)
+            .expect_err("instantiate should refuse a host call during start");
+        assert!(matches!(error, InstantiateError::Unsupported(_)));
     }
 }

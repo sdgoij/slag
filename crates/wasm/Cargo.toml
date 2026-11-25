@@ -27,6 +27,11 @@ compile = [
 # §7 item 8). A leaf crate, so the engine stays free of the JS value model.
 byteblock = { path = "../byteblock" }
 
+[dev-dependencies]
+# Engine tests write modules in text. The `.wast` corpus already depends on this
+# parser, so the lock gains no new package.
+wat = { version = "1.258.0", default-features = false }
+
 # Cranelift's executable-memory allocator (`region`) has no wasm32 backend, so
 # the native-code path is native-only by construction. Scoping these to
 # non-wasm targets keeps a wasm build that turns the feature on from dying
