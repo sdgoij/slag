@@ -1902,25 +1902,26 @@ impl Context {
         source: &str,
         name: Option<&str>,
     ) -> Result<CompiledScript, JsError> {
-        let realm = self.agent.current_realm()?;
-        crate::script::parse_script(source, realm, None)?;
+        // A compile is a context-scoped operation (`v8::Script::Compile`), so a
+        // context without a realm still fails here rather than at the run.
+        self.agent.current_realm()?;
         Ok(CompiledScript {
+            code: parser::parse_script(source)?,
             source: source.to_string(),
             name: name.filter(|name| !name.is_empty()).map(str::to_string),
         })
     }
 
     /// Run a script [`compile_script`](Self::compile_script) parsed
-    /// (`v8::Script::Run`). The source is re-parsed by the engine's eval path;
-    /// the compile made the syntax failure a separate event, which is the
-    /// property a host's `TryCatch` needs.
+    /// (`v8::Script::Run`). The parse is not repeated: the artifact keeps the
+    /// program `compile_script` produced, so the run only builds the script
+    /// record and evaluates. A syntax error was already reported at compile, so
+    /// a failure here is a runtime one.
     pub fn run_compiled_script(&mut self, script: &CompiledScript) -> Result<JsValue, JsError> {
-        let Some(name) = script.name.as_deref() else {
-            return self.eval_script(&script.source);
-        };
+        let name = script.name.as_deref().map(JsString::from_utf8);
         let value = self
             .agent
-            .run_script_named(&script.source, Some(JsString::from_utf8(name)))?;
+            .run_parsed_script(script.code.clone(), &script.source, name)?;
         Ok(JsValue(value))
     }
 
@@ -3860,8 +3861,14 @@ fn describe_value(value: &Value) -> String {
 }
 
 /// A script that parsed and did not run (`v8::Script::Compile`).
+///
+/// It keeps the parsed program, not just the text: a run costs no lexing or
+/// parsing, and the program is plain data (atoms, spans, interned text), so an
+/// artifact can be produced on a compile-pool worker and run on the thread that
+/// owns the isolate.
 #[derive(Debug, Clone)]
 pub struct CompiledScript {
+    code: syntax::ast::Program,
     source: String,
     /// The `ScriptOrigin` name the host compiled it under, which the run keeps
     /// in the script record so a frame can answer it.
@@ -4567,6 +4574,55 @@ mod tests {
 
     fn eval(source: &str) -> JsValue {
         Context::new().unwrap().eval(source).unwrap()
+    }
+
+    #[test]
+    fn a_compiled_script_keeps_its_parse_and_runs_more_than_once() {
+        let mut context = Context::new().unwrap();
+
+        // A syntax error is a compile-time event, which is what lets a host
+        // report it apart from a runtime failure.
+        let error = context.compile_script("var = ;").unwrap_err();
+        assert_eq!(error.kind, crux::error::ErrorKind::SyntaxError);
+
+        let source = "var total = 0; for (var i = 1; i <= 4; i++) total += i; total";
+        let script = context
+            .compile_script_named(source, Some("sum.js"))
+            .unwrap();
+        assert_eq!(script.name(), Some("sum.js"));
+        assert_eq!(script.source(), source);
+        // The artifact is reused, so the run cannot depend on a parse having
+        // just happened, and a failure stays a runtime one.
+        assert_eq!(
+            context.run_compiled_script(&script).unwrap().as_number(),
+            Some(10.0)
+        );
+        assert_eq!(
+            context.run_compiled_script(&script).unwrap().as_number(),
+            Some(10.0)
+        );
+        let error = context
+            .run_compiled_script(&context.compile_script("null.x").unwrap())
+            .unwrap_err();
+        assert_eq!(error.kind, crux::error::ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn a_compiled_script_can_cross_a_thread() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CompiledScript>();
+        let mut context = Context::new().unwrap();
+        // Parsed on a worker, run here: the artifact is plain data.
+        let script = std::thread::spawn(|| {
+            Context::new()
+                .unwrap()
+                .compile_script("'from a worker'")
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        let value = context.run_compiled_script(&script).unwrap();
+        assert_eq!(context.to_string(&value).unwrap(), "from a worker");
     }
 
     #[test]

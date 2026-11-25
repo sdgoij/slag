@@ -4235,6 +4235,50 @@ impl Agent {
         jsx: bool,
         name: Option<JsString>,
     ) -> Result<Value, JsError> {
+        self.run_script_boundary(|agent| {
+            let realm = agent.current_realm()?;
+            if jsx {
+                crate::script::parse_script_jsx(source, realm, name)
+            } else {
+                crate::script::parse_script(source, realm, name)
+            }
+        })
+    }
+
+    /// Run a program the host already parsed (a [`CompiledScript`]), so a run
+    /// costs no lexing or parsing. The program is plain data — atoms, spans, and
+    /// interned text — which is why it can be handed over from the thread that
+    /// parsed it.
+    ///
+    /// [`CompiledScript`]: crate::embed::CompiledScript
+    pub fn run_parsed_script(
+        &mut self,
+        code: syntax::ast::Program,
+        source: &str,
+        name: Option<JsString>,
+    ) -> Result<Value, JsError> {
+        self.run_script_boundary(|agent| {
+            let realm = agent.current_realm()?;
+            // A run is a fresh site space for the template-object cache, exactly
+            // as a re-parse would be: two runs of one artifact keep the current
+            // behaviour rather than sharing template objects.
+            crate::expr::bump_template_parse_generation();
+            Ok(Handle::new(crate::script::ScriptRecord {
+                realm,
+                code,
+                source: JsString::from_utf8(source),
+                name,
+                jsx: false,
+            }))
+        })
+    }
+
+    /// The script-boundary work every run shares: the allocation budget and the
+    /// dead-function queues are per-script, and a quiescent boundary may collect.
+    fn run_script_boundary<F>(&mut self, build: F) -> Result<Value, JsError>
+    where
+        F: FnOnce(&mut Agent) -> Result<Handle<crate::script::ScriptRecord>, JsError>,
+    {
         crux::function::with_agent(self as *mut Agent as *mut (), || {
             // GC-5: a fresh script is a fresh execution unit — the safe-point
             // allocation budget must not leak in from the previous script.
@@ -4244,12 +4288,7 @@ impl Agent {
             // entry and collection trigger).
             self.reap_dead_functions();
             self.reap_dead_wrappers();
-            let realm = self.current_realm()?;
-            let script = if jsx {
-                crate::script::parse_script_jsx(source, realm, name)?
-            } else {
-                crate::script::parse_script(source, realm, name)?
-            };
+            let script = build(self)?;
             let result = crate::script::script_evaluation(self, &script);
             // GC-1 slice 3: a script boundary with no pending jobs is a
             // quiescent point — every live value is reachable from the
