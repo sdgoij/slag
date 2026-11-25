@@ -6552,18 +6552,17 @@ impl Vm {
     /// serve: plain/array objects and functions (a function's own data
     /// properties — `length`/`name`/`prototype` — live in the ordinary
     /// object's property vector, so `C.prototype` caches like any own data
-    /// read), plus a host object whose class answers no read itself
-    /// ([`crux::object::JsObject::host_reads_are_ordinary`]), whose own data
-    /// reads are the ordinary ones. Every other kind (typed arrays, proxies,
-    /// boxed primitives, a host object with a `get` hook) stays on the full Get
-    /// path.
+    /// read), plus a host object whose class declares a read-caching contract
+    /// ([`crux::object::JsObject::host_read_caching`]), whose own data reads are
+    /// then the ordinary ones. Every other kind (typed arrays, proxies, boxed
+    /// primitives, a host object with no contract) stays on the full Get path.
     fn cell_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
         match value.kind() {
             ValueKind::Object(object)
                 if matches!(
                     object.kind,
                     crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
-                ) || object.host_reads_are_ordinary() =>
+                ) || object.host_read_caching().is_some() =>
             {
                 // `kind()` already reconstructed the handle; move it out
                 // rather than cloning again (the hot member-read path pays
@@ -6588,9 +6587,11 @@ impl Vm {
     /// [`Self::cell_object`]: an Integer-Indexed receiver is exotic only for
     /// canonical numeric index keys (and `length`, which has its own
     /// shortcut); every other name uses the ordinary own check and prototype
-    /// walk. A host object whose class answers no read is admitted on the same
-    /// terms — its chain walk is the ordinary one. The own-DATA cells stay
-    /// narrower because typed-array elements live outside the property vector.
+    /// walk. A host object with a read-caching contract is admitted on the same
+    /// terms — its chain walk is the ordinary one, and the contract forbids its
+    /// hook from shadowing a resolution the walk can find. The own-DATA cells
+    /// stay narrower because typed-array elements live outside the property
+    /// vector.
     fn chain_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
         match value.kind() {
             ValueKind::Object(object)
@@ -6599,7 +6600,7 @@ impl Vm {
                     crux::object::ObjectKind::Ordinary
                         | crux::object::ObjectKind::Array(_)
                         | crux::object::ObjectKind::IntegerIndexed(_)
-                ) || object.host_reads_are_ordinary() =>
+                ) || object.host_read_caching().is_some() =>
             {
                 Some(object)
             }
@@ -33278,13 +33279,36 @@ mod tests {
     }
 
     /// A host class whose reads are all the engine's ordinary internal method,
-    /// which is the shape the member read cells may treat as an ordinary object.
+    /// which is the first read-caching level.
     #[derive(Debug)]
     struct OrdinaryReadsHost;
 
     impl crux::host::HostOps for OrdinaryReadsHost {
-        fn reads_are_ordinary(&self) -> bool {
-            true
+        fn read_caching(&self) -> Option<crux::host::ReadCaching> {
+            Some(crux::host::ReadCaching::Ordinary)
+        }
+    }
+
+    /// A host class with a `get` that answers only a key resolving nowhere on
+    /// its storage or chain, which is the contract the second level states.
+    #[derive(Debug)]
+    struct NeverShadowingHost {
+        dynamic: std::cell::Cell<u32>,
+    }
+
+    impl crux::host::HostOps for NeverShadowingHost {
+        fn read_caching(&self) -> Option<crux::host::ReadCaching> {
+            Some(crux::host::ReadCaching::NeverShadowing)
+        }
+
+        fn get(
+            &self,
+            _object: &crux::object::JsObject,
+            key: &crux::property::PropertyKey,
+            _receiver: &Value,
+        ) -> Option<Result<Value, crux::error::JsError>> {
+            (key.display_string() == "dynamic")
+                .then(|| Ok(Value::Number(f64::from(self.dynamic.get()))))
         }
     }
 
@@ -33305,7 +33329,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_receiver_is_cached_only_when_its_reads_are_ordinary() {
+    fn a_host_receiver_is_cached_only_under_a_read_caching_level() {
         // A host object is outside the member cells unless its class declares
         // that it answers no read, because a record is produced from the
         // engine's own storage and would hide a hook's answer. The declared
@@ -33379,6 +33403,63 @@ mod tests {
             Vm::member_cell_get(&mut agent, &receiver, name),
             Some(Value::Number(2.0)),
             "the generation mismatch must not leave the pre-write value servable"
+        );
+    }
+
+    #[test]
+    fn a_get_hook_that_never_shadows_leaves_the_chain_cache_usable() {
+        // The second level admits a class that answers `get` for keys nothing
+        // resolves, because such an answer is never recorded: `resolve_*_cell`
+        // records only a resolution of the object's own storage or a plain
+        // chain link, so a key the hook answers leaves both cells cold. A key
+        // that does resolve is cached, and the hook — which the contract keeps
+        // from shadowing it — is skipped on the hit.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let name = crux::intern_utf8("m");
+        let value = Value::Number(1.5);
+
+        let proto = crux::object::JsObject::ordinary_object_create(None);
+        proto
+            .create_data_property_or_throw(&crux::string::JsString::from_utf8("m"), value)
+            .unwrap();
+        let ops = std::rc::Rc::new(NeverShadowingHost {
+            dynamic: std::cell::Cell::new(7),
+        });
+        let host = crux::object::JsObject::host_object_create(ops.clone(), Some(proto));
+        let receiver = host.self_value();
+
+        let resolved =
+            crate::context::get_property(&mut agent, &receiver, &crux::lookup(name), receiver)
+                .expect("the prototype read");
+        assert_eq!(resolved, value);
+        Vm::resolve_chain_cell(&mut agent, &receiver, name);
+        assert_eq!(
+            Vm::member_chain_get(&mut agent, &receiver, name),
+            Some(value),
+            "a resolved key is cached although the class has a get hook"
+        );
+
+        // A key the hook answers resolves nowhere, so recording it is a no-op
+        // and the answer stays live across a change the engine never sees.
+        let dynamic = crux::intern_utf8("dynamic");
+        let first =
+            crate::context::get_property(&mut agent, &receiver, &crux::lookup(dynamic), receiver)
+                .expect("the dynamic read");
+        assert_eq!(first, Value::Number(7.0));
+        Vm::resolve_member_cell(&mut agent, &receiver, dynamic);
+        Vm::resolve_chain_cell(&mut agent, &receiver, dynamic);
+        assert_eq!(Vm::member_cell_get(&mut agent, &receiver, dynamic), None);
+        assert_eq!(Vm::member_chain_get(&mut agent, &receiver, dynamic), None);
+
+        ops.dynamic.set(9);
+        let second =
+            crate::context::get_property(&mut agent, &receiver, &crux::lookup(dynamic), receiver)
+                .expect("the second dynamic read");
+        assert_eq!(
+            second,
+            Value::Number(9.0),
+            "nothing was recorded for a hook-answered key, so the read is live"
         );
     }
 

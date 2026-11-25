@@ -1945,17 +1945,17 @@ impl JsObject {
         }
     }
 
-    /// Whether this object's host class answers no property read itself
-    /// ([`HostOps::reads_are_ordinary`]), so a member read of it is the
-    /// ordinary internal method and can be cached as one. False for every
-    /// non-host object — the caller already knows an ordinary object's answer.
+    /// This object's host class's read-caching contract
+    /// ([`HostOps::read_caching`]), or `None` for an object the member read
+    /// cells must not serve. Always `None` for a non-host object — the caller
+    /// already knows an ordinary object's answer.
     ///
-    /// [`HostOps::reads_are_ordinary`]: crate::host::HostOps::reads_are_ordinary
-    pub fn host_reads_are_ordinary(&self) -> bool {
-        matches!(
-            &self.kind,
-            ObjectKind::Host(object) if object.behaviour().reads_are_ordinary()
-        )
+    /// [`HostOps::read_caching`]: crate::host::HostOps::read_caching
+    pub fn host_read_caching(&self) -> Option<crate::host::ReadCaching> {
+        match &self.kind {
+            ObjectKind::Host(object) => object.behaviour().read_caching(),
+            _ => None,
+        }
     }
 
     /// The ordinary field layout with `kind` replaced (the `External`/`Host`

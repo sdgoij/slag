@@ -14,7 +14,7 @@ use crate::object::{JsObject, Property};
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::value::Value;
 
-/// Where a host `get` or `set` is running: the object is the receiver itself,
+/// Whether a host `get` or `set` is running: the object is the receiver itself,
 /// or it is on the receiver's prototype chain. The counterpart of Ladybird's
 /// `JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY` and
 /// `JS_PROPERTY_LOOKUP_PHASE_PROTOTYPE_CHAIN`.
@@ -24,6 +24,28 @@ pub enum LookupPhase {
     OwnProperty,
     /// The object being asked is on the receiver's prototype chain.
     PrototypeChain,
+}
+
+/// How a host class's property reads may be cached, if at all
+/// ([`HostOps::read_caching`]).
+///
+/// A class that returns a level must implement neither
+/// [`HostOps::get_own_property`] nor [`HostOps::get_indexed_value`]: both change
+/// the ordinary resolution itself, which is what a record holds. Its own
+/// storage and its prototype must also change only through engine operations,
+/// which bump `generation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadCaching {
+    /// The class answers no property read at all: [`HostOps::get`] and
+    /// [`HostOps::get_with_phase`] are absent, so every read of the object is
+    /// the engine's ordinary internal method.
+    Ordinary,
+    /// The class may answer a read, but only a key that resolves nowhere on its
+    /// own storage or its prototype chain. A recorded resolution then never
+    /// disagrees with the hook, and a key the hook does answer has no
+    /// resolution to record — so an answer that changes without an engine
+    /// mutation cannot go stale.
+    NeverShadowing,
 }
 
 /// The host-defined behaviour of an `ObjectKind::Host` object. Each method
@@ -154,26 +176,23 @@ pub trait HostOps: std::fmt::Debug {
         false
     }
 
-    /// Whether every property read of this object is the engine's ordinary
-    /// internal method, which is what lets the engine cache the reads as it
-    /// caches an ordinary object's.
+    /// Whether the engine may cache this class's property reads, and under
+    /// which contract. `None` (the default) keeps every read on the full
+    /// [[Get]], which is what every existing host class gets.
     ///
-    /// Return true only when the class implements none of [`HostOps::get`],
-    /// [`HostOps::get_with_phase`], [`HostOps::get_own_property`], or
-    /// [`HostOps::get_indexed_value`]. The engine then admits the object, as a
-    /// *receiver*, to the member read cells: an own data read is recorded from
-    /// the object's own storage and a prototype resolution from its chain, and
-    /// a repeat read is answered from the cell without asking the host. Every
-    /// write to that storage through an engine operation bumps the object's
-    /// generation, which invalidates the record, exactly as for an ordinary
-    /// object.
+    /// A level admits the object, as a *receiver*, to the member read cells: an
+    /// own data read is recorded from the object's own storage and a prototype
+    /// resolution from its chain, and a repeat read is answered from the cell
+    /// without asking the host, exactly as for an ordinary object. Every write
+    /// to that storage through an engine operation bumps the object's
+    /// generation, which invalidates the record.
     ///
-    /// The flag is a promise the engine cannot check. A class that answers a
-    /// read itself and still returns true makes that answer invisible, because
-    /// the cell serves the engine's storage instead; the store-side cells stay
-    /// closed to host objects either way.
-    fn reads_are_ordinary(&self) -> bool {
-        false
+    /// The contract a level states is one the engine cannot check. A class that
+    /// breaks it makes its own answers invisible, because the cell serves the
+    /// engine's storage instead; the store-side cells stay closed to host
+    /// objects either way.
+    fn read_caching(&self) -> Option<ReadCaching> {
+        None
     }
 
     /// Called once, after a collection swept the object this behaviour was
