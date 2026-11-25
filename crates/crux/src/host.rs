@@ -154,6 +154,28 @@ pub trait HostOps: std::fmt::Debug {
         false
     }
 
+    /// Whether every property read of this object is the engine's ordinary
+    /// internal method, which is what lets the engine cache the reads as it
+    /// caches an ordinary object's.
+    ///
+    /// Return true only when the class implements none of [`HostOps::get`],
+    /// [`HostOps::get_with_phase`], [`HostOps::get_own_property`], or
+    /// [`HostOps::get_indexed_value`]. The engine then admits the object, as a
+    /// *receiver*, to the member read cells: an own data read is recorded from
+    /// the object's own storage and a prototype resolution from its chain, and
+    /// a repeat read is answered from the cell without asking the host. Every
+    /// write to that storage through an engine operation bumps the object's
+    /// generation, which invalidates the record, exactly as for an ordinary
+    /// object.
+    ///
+    /// The flag is a promise the engine cannot check. A class that answers a
+    /// read itself and still returns true makes that answer invisible, because
+    /// the cell serves the engine's storage instead; the store-side cells stay
+    /// closed to host objects either way.
+    fn reads_are_ordinary(&self) -> bool {
+        false
+    }
+
     /// Called once, after a collection swept the object this behaviour was
     /// installed on, with that object's identity (`JsObject::id`).
     ///

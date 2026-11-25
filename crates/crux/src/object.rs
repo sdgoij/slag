@@ -1945,6 +1945,19 @@ impl JsObject {
         }
     }
 
+    /// Whether this object's host class answers no property read itself
+    /// ([`HostOps::reads_are_ordinary`]), so a member read of it is the
+    /// ordinary internal method and can be cached as one. False for every
+    /// non-host object — the caller already knows an ordinary object's answer.
+    ///
+    /// [`HostOps::reads_are_ordinary`]: crate::host::HostOps::reads_are_ordinary
+    pub fn host_reads_are_ordinary(&self) -> bool {
+        matches!(
+            &self.kind,
+            ObjectKind::Host(object) if object.behaviour().reads_are_ordinary()
+        )
+    }
+
     /// The ordinary field layout with `kind` replaced (the `External`/`Host`
     /// constructors' common body). A `Drop` impl makes the struct-update
     /// spread (`..Self::basic_object_create(..)`) illegal — moving fields out

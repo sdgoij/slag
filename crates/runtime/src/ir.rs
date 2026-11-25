@@ -6552,15 +6552,18 @@ impl Vm {
     /// serve: plain/array objects and functions (a function's own data
     /// properties — `length`/`name`/`prototype` — live in the ordinary
     /// object's property vector, so `C.prototype` caches like any own data
-    /// read). Every other kind (typed arrays, proxies, boxed primitives)
-    /// stays on the full Get path.
+    /// read), plus a host object whose class answers no read itself
+    /// ([`crux::object::JsObject::host_reads_are_ordinary`]), whose own data
+    /// reads are the ordinary ones. Every other kind (typed arrays, proxies,
+    /// boxed primitives, a host object with a `get` hook) stays on the full Get
+    /// path.
     fn cell_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
         match value.kind() {
             ValueKind::Object(object)
                 if matches!(
                     object.kind,
                     crux::object::ObjectKind::Ordinary | crux::object::ObjectKind::Array(_)
-                ) =>
+                ) || object.host_reads_are_ordinary() =>
             {
                 // `kind()` already reconstructed the handle; move it out
                 // rather than cloning again (the hot member-read path pays
@@ -6585,8 +6588,9 @@ impl Vm {
     /// [`Self::cell_object`]: an Integer-Indexed receiver is exotic only for
     /// canonical numeric index keys (and `length`, which has its own
     /// shortcut); every other name uses the ordinary own check and prototype
-    /// walk. The own-DATA cells stay narrower because typed-array elements
-    /// live outside the property vector.
+    /// walk. A host object whose class answers no read is admitted on the same
+    /// terms — its chain walk is the ordinary one. The own-DATA cells stay
+    /// narrower because typed-array elements live outside the property vector.
     fn chain_object(value: &Value) -> Option<Handle<crux::object::JsObject>> {
         match value.kind() {
             ValueKind::Object(object)
@@ -6595,7 +6599,7 @@ impl Vm {
                     crux::object::ObjectKind::Ordinary
                         | crux::object::ObjectKind::Array(_)
                         | crux::object::ObjectKind::IntegerIndexed(_)
-                ) =>
+                ) || object.host_reads_are_ordinary() =>
             {
                 Some(object)
             }
@@ -33270,6 +33274,111 @@ mod tests {
             (vcell.id, vcell.name, vcell.generation),
             (proto.id(), name, proto.generation()),
             "a chain hit through the slot re-warms the derived value cell"
+        );
+    }
+
+    /// A host class whose reads are all the engine's ordinary internal method,
+    /// which is the shape the member read cells may treat as an ordinary object.
+    #[derive(Debug)]
+    struct OrdinaryReadsHost;
+
+    impl crux::host::HostOps for OrdinaryReadsHost {
+        fn reads_are_ordinary(&self) -> bool {
+            true
+        }
+    }
+
+    /// A host class that answers every read itself, so no member cell may
+    /// describe its storage.
+    #[derive(Debug)]
+    struct AnswersReadsHost;
+
+    impl crux::host::HostOps for AnswersReadsHost {
+        fn get(
+            &self,
+            _object: &crux::object::JsObject,
+            _key: &crux::property::PropertyKey,
+            _receiver: &Value,
+        ) -> Option<Result<Value, crux::error::JsError>> {
+            Some(Ok(Value::Number(9.0)))
+        }
+    }
+
+    #[test]
+    fn a_host_receiver_is_cached_only_when_its_reads_are_ordinary() {
+        // A host object is outside the member cells unless its class declares
+        // that it answers no read, because a record is produced from the
+        // engine's own storage and would hide a hook's answer. The declared
+        // class caches exactly like an ordinary receiver; the answering class
+        // records nothing, so every read still runs its hook.
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        let name = crux::intern_utf8("m");
+        let value = Value::Number(1.5);
+
+        let proto = crux::object::JsObject::ordinary_object_create(None);
+        proto
+            .create_data_property_or_throw(&crux::string::JsString::from_utf8("m"), value)
+            .unwrap();
+
+        for (ops, cacheable) in [
+            (
+                std::rc::Rc::new(OrdinaryReadsHost) as std::rc::Rc<dyn crux::host::HostOps>,
+                true,
+            ),
+            (
+                std::rc::Rc::new(AnswersReadsHost) as std::rc::Rc<dyn crux::host::HostOps>,
+                false,
+            ),
+        ] {
+            let host = crux::object::JsObject::host_object_create(ops, Some(proto));
+            let receiver = host.self_value();
+            let read =
+                crate::context::get_property(&mut agent, &receiver, &crux::lookup(name), receiver)
+                    .expect("the prototype read");
+            assert_eq!(read, if cacheable { value } else { Value::Number(9.0) });
+            Vm::resolve_chain_cell(&mut agent, &receiver, name);
+            let served = Vm::member_chain_get(&mut agent, &receiver, name);
+            assert_eq!(
+                served.is_some(),
+                cacheable,
+                "a host receiver is a chain-cache receiver only when it declared \
+                 that its reads are ordinary"
+            );
+            if cacheable {
+                assert_eq!(served, Some(value), "the record re-reads the link's slot");
+            }
+        }
+
+        // The own-data lane: the same admission, and an engine write invalidates
+        // the recorded value instead of leaving the pre-write one to be served.
+        let own =
+            crux::object::JsObject::host_object_create(std::rc::Rc::new(OrdinaryReadsHost), None);
+        own.create_data_property_or_throw(&crux::string::JsString::from_utf8("m"), value)
+            .unwrap();
+        let receiver = own.self_value();
+        let first =
+            crate::context::get_property(&mut agent, &receiver, &crux::lookup(name), receiver)
+                .expect("the own read");
+        assert_eq!(first, value);
+        Vm::resolve_member_cell(&mut agent, &receiver, name);
+        assert_eq!(
+            Vm::member_cell_get(&mut agent, &receiver, name),
+            Some(value)
+        );
+
+        let generation = own.generation();
+        own.set_key(
+            &crux::property::PropertyKey::String(name),
+            Value::Number(2.0),
+            true,
+        )
+        .expect("the write");
+        assert_ne!(own.generation(), generation, "a store bumps the generation");
+        assert_eq!(
+            Vm::member_cell_get(&mut agent, &receiver, name),
+            Some(Value::Number(2.0)),
+            "the generation mismatch must not leave the pre-write value servable"
         );
     }
 
