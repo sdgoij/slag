@@ -633,15 +633,17 @@ struct Interner {
 }
 
 impl Interner {
-    fn intern(&mut self, units: &[u16]) -> AtomId {
+    /// Interns `units`, also handing back the stored key so a caller's cache can
+    /// share it instead of building a second copy of the text.
+    fn intern(&mut self, units: &[u16]) -> (AtomId, Arc<[u16]>) {
         if let Some(&id) = self.map.get(units) {
-            return id;
+            return (id, self.atoms[id as usize].clone());
         }
         let id = self.atoms.len() as AtomId;
         let key: Arc<[u16]> = units.into();
         self.atoms.push(key.clone());
-        self.map.insert(key, id);
-        id
+        self.map.insert(key.clone(), id);
+        (id, key)
     }
 
     fn lookup(&self, id: AtomId) -> &[u16] {
@@ -663,30 +665,116 @@ fn with_interner<R>(f: impl FnOnce(&mut Interner) -> R) -> R {
 /// `JsString`→`AtomId` (intern) several times per identifier read. Both take
 /// the global interner lock and re-hash/copy the units every call; the
 /// interpreter does this for the same handful of names in a loop, so a small
-/// per-thread memo turns those into linear scans over a few cached entries.
-/// The memo is a pure cache of the append-only interner: entries can never go
-/// stale, so eviction is just a size cap.
-const MEMO_CAP: usize = 64;
+/// per-thread memo turns those into cached entries. The memo is a pure cache of
+/// the append-only interner: entries can never go stale, so eviction only ever
+/// costs a re-lookup.
+///
+/// A scan over the cache does not work here, because the two callers want
+/// opposite things. A running interpreter interns one name (or a handful) over
+/// and over, which a scan serves in a single compare; a parser interns a stream
+/// of *distinct* names and literals, which a scan pays in full before the
+/// interner is even reached — 64 slots of that cost ~110 ns per new literal —
+/// and a bounded scan cannot hold a stream at all. So the memo has two tiers: the
+/// most recent key is compared directly, so a tight loop's hot name never pays
+/// for a hash, and everything else sits in a direct-mapped table probed by a
+/// length-independent fingerprint. Measured per call (same binary, interleaved):
+/// one repeated name 5.3 ns, where the scan read 5.1; an eight-name cycle 7.4,
+/// where it read 6.5; sixteen names 7.4, where it read 10.0; and a stream of new
+/// literals 55 ns, where it read 118.
+const RECENT_CAP: usize = 1;
+const MEMO_SLOTS: usize = 256;
+
+/// `lookup`'s memo is a different shape from `intern`'s: it is read with the
+/// same handful of ids in a loop, so a scan suits it, and it caps by clearing.
+const LOOKUP_MEMO_CAP: usize = 64;
+
+/// One table slot. `fingerprint` is compared first and `key` decides: a
+/// collision that returned another atom's id would silently rename a program's
+/// identifier.
+struct InternSlot {
+    fingerprint: u64,
+    key: Arc<[u16]>,
+    id: AtomId,
+}
+
+struct InternMemo {
+    recent: Vec<(Arc<[u16]>, AtomId)>,
+    slots: Vec<Option<InternSlot>>,
+}
+
+impl InternMemo {
+    fn new() -> Self {
+        Self {
+            recent: Vec::with_capacity(RECENT_CAP),
+            slots: (0..MEMO_SLOTS).map(|_| None).collect(),
+        }
+    }
+
+    fn find_recent(&self, units: &[u16]) -> Option<AtomId> {
+        self.recent
+            .iter()
+            .find(|(key, _)| key.as_ref() == units)
+            .map(|(_, id)| *id)
+    }
+
+    fn find_table(&self, units: &[u16], fingerprint: u64) -> Option<AtomId> {
+        let slot = self.slots[(fingerprint as usize) & (MEMO_SLOTS - 1)].as_ref()?;
+        (slot.fingerprint == fingerprint && slot.key.as_ref() == units).then_some(slot.id)
+    }
+
+    fn insert(&mut self, units_fingerprint: u64, key: Arc<[u16]>, id: AtomId) {
+        if self.recent.len() == RECENT_CAP {
+            self.recent.pop();
+        }
+        self.recent.insert(0, (key.clone(), id));
+        self.slots[(units_fingerprint as usize) & (MEMO_SLOTS - 1)] = Some(InternSlot {
+            fingerprint: units_fingerprint,
+            key,
+            id,
+        });
+    }
+}
 
 thread_local! {
     static LOOKUP_MEMO: std::cell::RefCell<Vec<(AtomId, JsString)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static INTERN_MEMO: std::cell::RefCell<Vec<(Arc<[u16]>, AtomId)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static INTERN_MEMO: std::cell::RefCell<InternMemo> =
+        std::cell::RefCell::new(InternMemo::new());
+}
+
+/// The table's fingerprint: the length, the first two units, and the last two,
+/// avalanched. It deliberately does not read the whole string — an intern should
+/// cost the same for a 4-unit name and a 4,000-unit literal, and the content is
+/// compared on a fingerprint match, so a weak fingerprint costs a fall-through
+/// to the interner, never a wrong answer.
+fn memo_fingerprint(units: &[u16]) -> u64 {
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+    let head = units.first().copied().unwrap_or(0) as u64
+        | (units.get(1).copied().unwrap_or(0) as u64) << 16;
+    let tail = units.last().copied().unwrap_or(0) as u64
+        | (units.get(units.len().wrapping_sub(2)).copied().unwrap_or(0) as u64) << 16;
+    let mut hash = (units.len() as u64)
+        .wrapping_mul(SEED)
+        .wrapping_add(head.rotate_left(17))
+        .wrapping_add(tail.rotate_left(41));
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(SEED);
+    hash ^ (hash >> 32)
 }
 
 /// Interns `units`, returning a stable id for it.
 pub fn intern(units: &[u16]) -> AtomId {
     INTERN_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
-        if let Some((_, id)) = memo.iter().rev().find(|(key, _)| key.as_ref() == units) {
-            return *id;
+        if let Some(id) = memo.find_recent(units) {
+            return id;
         }
-        let id = with_interner(|i| i.intern(units));
-        memo.push((units.into(), id));
-        if memo.len() > MEMO_CAP {
-            memo.clear();
+        let fingerprint = memo_fingerprint(units);
+        if let Some(id) = memo.find_table(units, fingerprint) {
+            return id;
         }
+        let (id, key) = with_interner(|i| i.intern(units));
+        memo.insert(fingerprint, key, id);
         id
     })
 }
@@ -789,7 +877,7 @@ pub fn lookup(id: AtomId) -> JsString {
             JsString::from_utf16(&units)
         };
         memo.push((id, text.clone()));
-        if memo.len() > MEMO_CAP {
+        if memo.len() > LOOKUP_MEMO_CAP {
             memo.clear();
         }
         text
