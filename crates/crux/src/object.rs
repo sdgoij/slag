@@ -19,6 +19,7 @@ use crate::function::call;
 use crate::handle::Handle;
 use crate::heap::{GcAny, Trace};
 use crate::host::LookupPhase;
+use crate::host_array::HostArrayOps;
 use crate::map::canonical_empty_map;
 use crate::map::{Map, MapAttrs};
 use crate::ops::{same_value, same_value_zero};
@@ -813,6 +814,11 @@ pub struct ArraySlots {
     /// ever over-traces, never under-traces: the bound is the minimum over the
     /// interval, so a stale (too low) value visits a superset.
     pub dirty_from: Cell<(u32, u32)>,
+    /// The host behaviour answering this array's structural operations, or
+    /// `None` for an engine array. It is host state, not a language value, so
+    /// it has no trace edge (a host that must keep a value alive retains it on
+    /// a companion host object).
+    host: RefCell<Option<std::rc::Rc<dyn HostArrayOps>>>,
 }
 
 impl ArraySlots {
@@ -828,7 +834,15 @@ impl ArraySlots {
             elem_len: Cell::new(elem_len),
             elem_cap: Cell::new(elem_cap),
             dirty_from: Cell::new((0, 0)),
+            host: RefCell::new(None),
         }
+    }
+
+    /// The host behaviour answering this array's structural operations, if it
+    /// is a host array. Cloned out of the cell so a hook may delegate back into
+    /// the array (which re-enters this accessor) with no borrow held.
+    pub fn host_ops(&self) -> Option<std::rc::Rc<dyn HostArrayOps>> {
+        self.host.borrow().clone()
     }
 
     /// Bring the backing Vec's length up to the cursor: the compiled append
@@ -2118,6 +2132,60 @@ impl JsObject {
             Property::data(Value::Number(length), true, false, false),
         ));
         Ok(array)
+    }
+
+    /// A host array: an Array exotic object whose [[DefineOwnProperty]], [[Set]],
+    /// and [[Delete]] consult `ops` first (Ladybird's `JS_HOST_CLASS_ARRAY`).
+    ///
+    /// The array starts in the generic element form — no dense buffer and no
+    /// compiled element lane — so every element operation runs the interpreter
+    /// and therefore reaches the three hooks; the dense buffer would let an
+    /// element write or a `push` mutate the array without asking. Indexed reads
+    /// are consequently the generic properties lookup, and a host that needs to
+    /// keep a value alive retains it on a companion host object
+    /// ([`JsObject::host_object_retain`]), since an Array has no edge list.
+    pub fn host_array_create(
+        prototype: Option<Handle<JsObject>>,
+        ops: std::rc::Rc<dyn HostArrayOps>,
+    ) -> Handle<JsObject> {
+        let array = Self::array_create(prototype, 0.0)
+            .unwrap_or_else(|_| unreachable!("zero is a valid Array length"));
+        let ObjectKind::Array(slots) = &array.kind else {
+            unreachable!("array_create returns an Array");
+        };
+        *slots.host.borrow_mut() = Some(ops);
+        slots.dense.set(false);
+        array.array_dense.set(None);
+        array
+    }
+
+    /// The Array exotic's own [[DefineOwnProperty]] (spec 10.4.2.1), for a host
+    /// array hook that adds a property rather than replacing the operation
+    /// (Ladybird's `js_host_array_array_define_own_property`).
+    pub fn host_array_delegate_define_own_property(
+        &self,
+        key: &PropertyKey,
+        desc: &PropertyDescriptor,
+    ) -> Result<bool, JsError> {
+        array_define_own_property(self, key, desc)
+    }
+
+    /// The Array exotic's own [[Set]] (spec 10.4.2.5), for a host array hook
+    /// that adds to the array rather than replacing the operation.
+    pub fn host_array_delegate_set(
+        &self,
+        key: &PropertyKey,
+        value: Value,
+        receiver: Value,
+        throw: bool,
+    ) -> Result<bool, JsError> {
+        ordinary_set(self, key, value, receiver, throw)
+    }
+
+    /// The Array exotic's own [[Delete]] (spec 10.4.2.6), for a host array hook
+    /// that adds to the array rather than replacing the operation.
+    pub fn host_array_delegate_delete(&self, key: &PropertyKey) -> Result<bool, JsError> {
+        self.array_delete(key)
     }
 
     /// Bulk-append a fully-materialized element run to a fresh, dense Array
@@ -4089,6 +4157,22 @@ impl JsObject {
         receiver: Value,
         throw: bool,
     ) -> Result<bool, JsError> {
+        if let ObjectKind::Array(slots) = &self.kind
+            && let Some(ops) = slots.host_ops()
+            && let Some(result) = ops.set(self, key, &value, &receiver, throw)
+        {
+            let success = result?;
+            return if success {
+                Ok(true)
+            } else if throw {
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    format!("Cannot set property {:?}", key.display_string()),
+                ))
+            } else {
+                Ok(false)
+            };
+        }
         match &self.kind {
             ObjectKind::Proxy(slots) => {
                 // spec 7.3.5 Set step 4: a false [[Set]] result with Throw
@@ -4160,6 +4244,14 @@ impl JsObject {
         // verdicts that include this object as a chain link (Cut 22). A
         // no-op define over-bumps — only cache hits are lost.
         self.bump_generation();
+        // A host array answers its own structural defines; `None` from the
+        // hook is the Array internal method in the match below.
+        if let ObjectKind::Array(slots) = &self.kind
+            && let Some(ops) = slots.host_ops()
+            && let Some(result) = ops.define_property(self, key, desc)
+        {
+            return result;
+        }
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::define_own_property(slots, key, desc),
             ObjectKind::IntegerIndexed(slots) => {
@@ -4773,22 +4865,18 @@ impl JsObject {
     }
 
     pub fn delete_key(&self, key: &PropertyKey) -> Result<bool, JsError> {
+        if let ObjectKind::Array(slots) = &self.kind
+            && let Some(ops) = slots.host_ops()
+            && let Some(result) = ops.delete(self, key)
+        {
+            return result;
+        }
         match &self.kind {
             ObjectKind::Proxy(slots) => return crate::proxy::delete(slots, key),
             ObjectKind::IntegerIndexed(slots) => return typed_array_delete(self, slots, key),
-            // A dense index element is configurable (w/e/c): delete becomes
-            // a hole in the buffer. A non-index key falls through to the
-            // generic properties removal below.
-            ObjectKind::Array(slots) if slots.dense.get() => {
-                if let Some(index) = array_index_of(key) {
-                    let mut elements = slots.elements_mut();
-                    if let Some(slot) = elements.get_mut(index as usize) {
-                        *slot = Value::hole();
-                        self.bump_generation();
-                    }
-                    return Ok(true);
-                }
-            }
+            // A dense index element is configurable (w/e/c): delete becomes a
+            // hole in the buffer. A non-index key is the generic removal.
+            ObjectKind::Array(_) => return self.array_delete(key),
             // A module namespace never deletes an export or @@toStringTag
             // (non-configurable); deleting anything else succeeds (spec
             // 10.4.6.6).
@@ -4851,29 +4939,47 @@ impl JsObject {
             }
             _ => {}
         }
-        // The ordinary delete below removes from the vector: a vector-free
-        // object materializes first (its own properties exist as map
-        // descriptors, so deleting from the empty vector would no-op and
+        self.ordinary_delete_key(key)
+    }
+
+    /// The Array exotic's own [[Delete]] (spec 10.4.2.6): a dense index element
+    /// becomes a hole; every other key is the generic own-property removal.
+    fn array_delete(&self, key: &PropertyKey) -> Result<bool, JsError> {
+        if let ObjectKind::Array(slots) = &self.kind
+            && slots.dense.get()
+            && let Some(index) = array_index_of(key)
+        {
+            let mut elements = slots.elements_mut();
+            if let Some(slot) = elements.get_mut(index as usize) {
+                *slot = Value::hole();
+                self.bump_generation();
+            }
+            return Ok(true);
+        }
+        self.ordinary_delete_key(key)
+    }
+
+    /// The generic own-property removal every exotic [[Delete]] method ends in.
+    fn ordinary_delete_key(&self, key: &PropertyKey) -> Result<bool, JsError> {
+        // A vector-free object materializes first (its own properties exist as
+        // map descriptors, so deleting from the empty vector would no-op and
         // leave the map describing a deleted key).
         self.materialize_properties();
-        let result = {
-            let mut props = self.properties.borrow_mut();
-            if let Some(index) = props.iter().position(|(name, _)| name == key) {
-                if props[index].1.configurable {
-                    props.remove(index);
-                    *self.property_index.borrow_mut() = None;
-                    self.drop_map_if_mapped(key);
-                    self.bump_generation();
-                    self.bump_named_version();
-                    true
-                } else {
-                    false
-                }
+        let mut props = self.properties.borrow_mut();
+        if let Some(index) = props.iter().position(|(name, _)| name == key) {
+            if props[index].1.configurable {
+                props.remove(index);
+                *self.property_index.borrow_mut() = None;
+                self.drop_map_if_mapped(key);
+                self.bump_generation();
+                self.bump_named_version();
+                Ok(true)
             } else {
-                true
+                Ok(false)
             }
-        };
-        Ok(result)
+        } else {
+            Ok(true)
+        }
     }
 
     /// [[OwnPropertyKeys]] (spec 10.1.12.1): array indices ascending, then

@@ -10,6 +10,7 @@ pub mod function;
 pub mod handle;
 pub mod heap;
 pub mod host;
+pub mod host_array;
 pub mod inline_array;
 pub mod job;
 pub mod map;
