@@ -18,6 +18,7 @@ use crate::error::{ErrorKind, JsError};
 use crate::function::call;
 use crate::handle::Handle;
 use crate::heap::{GcAny, Trace};
+use crate::host::LookupPhase;
 use crate::map::canonical_empty_map;
 use crate::map::{Map, MapAttrs};
 use crate::ops::{same_value, same_value_zero};
@@ -3656,7 +3657,8 @@ impl JsObject {
                 }
             }
             ObjectKind::Host(ops) => {
-                if let Some(result) = ops.get(self, key, &receiver) {
+                let phase = self.lookup_phase(&receiver);
+                if let Some(result) = ops.get_with_phase(self, key, &receiver, phase) {
                     return result;
                 }
             }
@@ -4040,6 +4042,17 @@ impl JsObject {
         *self.property_index.borrow_mut() = None;
     }
 
+    /// Whether `receiver` is this object, which is the phase a host hook is
+    /// told: Ladybird's own-property phase for the receiver itself and the
+    /// prototype-chain phase for an object reached from it.
+    fn lookup_phase(&self, receiver: &Value) -> LookupPhase {
+        if same_value(receiver, &self.self_value()) {
+            LookupPhase::OwnProperty
+        } else {
+            LookupPhase::PrototypeChain
+        }
+    }
+
     /// [[Set]] (P, V, Receiver): the arguments-exotic mapping (spec 10.4.4.6)
     /// followed by OrdinarySet.
     pub fn set_with_receiver_key(
@@ -4079,7 +4092,9 @@ impl JsObject {
                 }
             }
             ObjectKind::Host(ops) => {
-                if let Some(result) = ops.set(self, key, &value, &receiver, throw) {
+                let phase = self.lookup_phase(&receiver);
+                if let Some(result) = ops.set_with_phase(self, key, &value, &receiver, throw, phase)
+                {
                     let success = result?;
                     return if success {
                         Ok(true)

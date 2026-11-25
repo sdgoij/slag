@@ -14,6 +14,18 @@ use crate::object::{JsObject, Property};
 use crate::property::{PropertyDescriptor, PropertyKey};
 use crate::value::Value;
 
+/// Where a host `get` or `set` is running: the object is the receiver itself,
+/// or it is on the receiver's prototype chain. The counterpart of Ladybird's
+/// `JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY` and
+/// `JS_PROPERTY_LOOKUP_PHASE_PROTOTYPE_CHAIN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupPhase {
+    /// The object being asked is the receiver.
+    OwnProperty,
+    /// The object being asked is on the receiver's prototype chain.
+    PrototypeChain,
+}
+
 /// The host-defined behaviour of an `ObjectKind::Host` object. Each method
 /// returns `Option<Result<..>>`: `None` falls back to the ordinary internal
 /// method, `Some(Err(..))` surfaces an error, `Some(Ok(..))` overrides.
@@ -71,6 +83,32 @@ pub trait HostOps: std::fmt::Debug {
         _throw: bool,
     ) -> Option<Result<bool, JsError>> {
         None
+    }
+
+    /// [[Get]] with the lookup phase. The default forwards to [`HostOps::get`],
+    /// discarding the phase; a host whose answer differs between an own and an
+    /// inherited lookup overrides this.
+    fn get_with_phase(
+        &self,
+        object: &JsObject,
+        key: &PropertyKey,
+        receiver: &Value,
+        _phase: LookupPhase,
+    ) -> Option<Result<Value, JsError>> {
+        self.get(object, key, receiver)
+    }
+
+    /// [[Set]] with the lookup phase, defaulting to [`HostOps::set`] as above.
+    fn set_with_phase(
+        &self,
+        object: &JsObject,
+        key: &PropertyKey,
+        value: &Value,
+        receiver: &Value,
+        throw: bool,
+        _phase: LookupPhase,
+    ) -> Option<Result<bool, JsError>> {
+        self.set(object, key, value, receiver, throw)
     }
 
     /// [[Delete]].
