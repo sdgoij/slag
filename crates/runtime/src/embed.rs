@@ -1906,7 +1906,7 @@ impl Context {
         // context without a realm still fails here rather than at the run.
         self.agent.current_realm()?;
         Ok(CompiledScript {
-            code: parser::parse_script(source)?,
+            code: Some(parser::parse_script(source)?),
             source: source.to_string(),
             name: name.filter(|name| !name.is_empty()).map(str::to_string),
         })
@@ -1916,12 +1916,15 @@ impl Context {
     /// (`v8::Script::Run`). The parse is not repeated: the artifact keeps the
     /// program `compile_script` produced, so the run only builds the script
     /// record and evaluates. A syntax error was already reported at compile, so
-    /// a failure here is a runtime one.
+    /// a failure here is a runtime one — unless the parse was released by
+    /// [`CompiledScript::compact`], in which case it is parsed again here.
     pub fn run_compiled_script(&mut self, script: &CompiledScript) -> Result<JsValue, JsError> {
         let name = script.name.as_deref().map(JsString::from_utf8);
-        let value = self
-            .agent
-            .run_parsed_script(script.code.clone(), &script.source, name)?;
+        let code = match &script.code {
+            Some(code) => code.clone(),
+            None => parser::parse_script(&script.source)?,
+        };
+        let value = self.agent.run_parsed_script(code, &script.source, name)?;
         Ok(JsValue(value))
     }
 
@@ -3868,7 +3871,8 @@ fn describe_value(value: &Value) -> String {
 /// owns the isolate.
 #[derive(Debug, Clone)]
 pub struct CompiledScript {
-    code: syntax::ast::Program,
+    /// The parse, or `None` once [`compact`](Self::compact) released it.
+    code: Option<syntax::ast::Program>,
     source: String,
     /// The `ScriptOrigin` name the host compiled it under, which the run keeps
     /// in the script record so a frame can answer it.
@@ -3876,6 +3880,24 @@ pub struct CompiledScript {
 }
 
 impl CompiledScript {
+    /// Release the parse, keeping only the source text.
+    ///
+    /// A parsed program is many times the size of the text it came from — a
+    /// real script measured 33x — and a host that keeps a compiled script for as
+    /// long as its document lives pays that for every script in the document.
+    /// Once a script has run, its parse is only needed to run it *again*; a host
+    /// that is done with re-runs can drop it here and pay the parse a second
+    /// time if it does. The syntax error a compile reported stays reported: a
+    /// run of a compacted script parses again and would surface one only if the
+    /// text had changed.
+    pub fn compact(&mut self) {
+        self.code = None;
+    }
+
+    /// Whether the artifact still holds its parse.
+    pub fn keeps_parse(&self) -> bool {
+        self.code.is_some()
+    }
     /// The `ScriptOrigin` name the host compiled it under, if any.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
@@ -4605,6 +4627,18 @@ mod tests {
             .run_compiled_script(&context.compile_script("null.x").unwrap())
             .unwrap_err();
         assert_eq!(error.kind, crux::error::ErrorKind::TypeError);
+
+        // Compacting releases the parse: the artifact keeps only its text, and a
+        // run parses again rather than failing.
+        let mut compacted = context.compile_script(source).unwrap();
+        assert!(compacted.keeps_parse());
+        compacted.compact();
+        assert!(!compacted.keeps_parse());
+        assert_eq!(compacted.source(), source);
+        assert_eq!(
+            context.run_compiled_script(&compacted).unwrap().as_number(),
+            Some(10.0)
+        );
     }
 
     #[test]
