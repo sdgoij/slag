@@ -609,6 +609,23 @@ impl Trace for PausedRun {
         self.levels.trace(visit);
     }
 }
+
+/// A dynamic import whose module a host is loading asynchronously. Kept until
+/// [`crate::agent::Agent::finish_dynamic_import`] settles it, so the `import()`
+/// promise and phase survive across turns. Rooted through [`AgentRoots`].
+pub struct PendingDynamicImport {
+    pub capability: crux::promise::PromiseCapability,
+    pub phase: syntax::ast::ImportPhase,
+    pub realm: Handle<Realm>,
+}
+
+impl Trace for PendingDynamicImport {
+    fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
+        self.capability.trace(visit);
+        self.realm.trace(visit);
+    }
+}
+
 pub(crate) struct AgentRoots {
     /// The registry this agent registered in, for `Drop` to release the entry
     /// when no heap is entered. Null when it registered in this thread's own
@@ -617,6 +634,10 @@ pub(crate) struct AgentRoots {
     /// The execution-context stack (spec 9.4); see [`ContextStack`].
     pub(crate) execution_context_stack: ContextStack,
     pub(crate) promise_jobs: RefCell<VecDeque<Job>>,
+    /// Dynamic imports a host is loading asynchronously, by the token it will
+    /// finish them with (see `finish_dynamic_import`).
+    pub(crate) pending_dynamic_imports:
+        RefCell<std::collections::HashMap<u64, PendingDynamicImport>>,
     /// Jobs a host took ownership of through `HostEnqueuePromiseJob`. The
     /// engine keeps each slot's job — and so its captured values — alive until
     /// the host runs it by token; a slot is reused once its job has run, so a
@@ -1420,6 +1441,7 @@ impl AgentRoots {
             live_registry: std::cell::Cell::new(std::ptr::null()),
             execution_context_stack: ContextStack::new(),
             promise_jobs: RefCell::new(VecDeque::new()),
+            pending_dynamic_imports: RefCell::new(std::collections::HashMap::new()),
             host_jobs: RefCell::new(Vec::new()),
             host_job_free: RefCell::new(Vec::new()),
             generic_jobs: RefCell::new(VecDeque::new()),
@@ -1615,6 +1637,7 @@ impl Trace for AgentRoots {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.execution_context_stack.trace(visit);
         self.promise_jobs.trace(visit);
+        self.pending_dynamic_imports.trace(visit);
         self.host_jobs.trace(visit);
         if let Ok(queues) = self.microtask_queues.try_borrow() {
             for queue in queues.iter().flatten() {
@@ -4266,6 +4289,45 @@ impl Agent {
                 result
             },
         ))
+    }
+
+    /// Finish a dynamic import a host answered with
+    /// `DynamicImportAnswer::Pending`: link, evaluate and namespace `module`, and
+    /// settle the import's capability. Run at the top level (not inside an
+    /// engine borrow), so it takes `&mut self`. A token the host never registered
+    /// is a no-op.
+    pub fn finish_dynamic_import(
+        &mut self,
+        token: u64,
+        module: Handle<crate::module::SourceTextModule>,
+    ) -> Result<(), JsError> {
+        let Some(pending) = self
+            .roots
+            .pending_dynamic_imports
+            .borrow_mut()
+            .remove(&token)
+        else {
+            return Ok(());
+        };
+        self.push_bootstrap_context(pending.realm);
+        let result = crate::module::complete_dynamic_import(
+            self,
+            &module,
+            pending.phase,
+            &pending.capability.resolve,
+            &pending.capability.reject,
+        );
+        self.pop_bootstrap_context();
+        if let Err(error) = result {
+            let rejection = crate::promise::error_value(self, &error);
+            crate::function::call(
+                self,
+                &pending.capability.reject,
+                Value::Undefined,
+                &[rejection],
+            )?;
+        }
+        Ok(())
     }
 
     /// Nanoseconds until the earliest queued timeout is due (0 when a job is

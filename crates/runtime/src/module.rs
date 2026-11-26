@@ -3566,7 +3566,24 @@ pub fn dynamic_import(
         hook_phase,
         &attribute_pairs,
     ) {
-        return answer;
+        return match answer {
+            crate::host::DynamicImportAnswer::Handled(result) => result,
+            crate::host::DynamicImportAnswer::Pending(token) => {
+                // The host will provide the module later. Keep the import's
+                // capability and phase so `finish_dynamic_import` can run the
+                // same link/evaluate/namespace the engine's own job would.
+                let realm = agent.current_realm()?;
+                agent.roots.pending_dynamic_imports.borrow_mut().insert(
+                    token,
+                    crate::agent::PendingDynamicImport {
+                        capability: capability.clone(),
+                        phase,
+                        realm,
+                    },
+                );
+                Ok(capability.promise)
+            }
+        };
     }
     // Which attributes a dynamic import *supports* is the host's to decide — V8
     // validates only the argument's shape and hands the pairs over — so the
@@ -3593,49 +3610,8 @@ pub fn dynamic_import(
     // that is also a static dependency of the wave is already evaluated.
     let realm = agent.current_realm()?;
     agent.enqueue_generic_job(Some(realm), move |agent| {
-        let result = (|| -> Result<(), JsError> {
-            let module = host_resolve_imported_module(agent, &specifier_text, &parsed_attributes)?;
-            match phase {
-                ImportPhase::Source => {
-                    // GetModuleSource (proposal ContinueDynamicImport): a module
-                    // with an empty [[ModuleSource]] (a Source Text Module)
-                    // rejects with a SyntaxError; otherwise the promise resolves
-                    // with the Module Source Object.
-                    let source = module_source_object(agent, &module)?;
-                    crate::function::call(agent, &resolve, Value::Undefined, &[source])?;
-                    return Ok(());
-                }
-                ImportPhase::Defer => {
-                    // `import.defer(...)` returns a DeferredModule object (not
-                    // a promise): a thenable whose `.then` resolves with the
-                    // module's deferred namespace after its asynchronous
-                    // transitive dependencies settle — the module itself is
-                    // not evaluated until the namespace is accessed.
-                    module_declaration_instantiation(agent, &module)?;
-                    let deferred_module = deferred_module_object(agent, &module)?;
-                    crate::function::call(agent, &resolve, Value::Undefined, &[deferred_module])?;
-                    return Ok(());
-                }
-                ImportPhase::Import => {}
-            }
-            module_declaration_instantiation(agent, &module)?;
-            let namespace = module_namespace(agent, &module)?;
-            let evaluation = module_evaluation(agent, &module)?;
-            if is_promise_value(agent, &evaluation) {
-                // Top-level await: resolve when the module finishes.
-                let method = crate::context::get_property(
-                    agent,
-                    &evaluation,
-                    &JsString::from_utf8("then"),
-                    evaluation,
-                )?;
-                let then_resolve = make_namespace_resolver(agent, &resolve, &namespace)?;
-                crate::function::call(agent, &method, evaluation, &[then_resolve, reject])?;
-            } else {
-                crate::function::call(agent, &resolve, Value::Undefined, &[namespace])?;
-            }
-            Ok(())
-        })();
+        let result = host_resolve_imported_module(agent, &specifier_text, &parsed_attributes)
+            .and_then(|module| complete_dynamic_import(agent, &module, phase, &resolve, &reject));
         if let Err(error) = result {
             let rejection = crate::promise::error_value(agent, &error);
             crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
@@ -3643,6 +3619,58 @@ pub fn dynamic_import(
         Ok(Value::Undefined)
     });
     Ok(capability.promise)
+}
+
+/// Link, evaluate and namespace a module a dynamic import resolved to, and settle
+/// the import's capability with the namespace (or leave the error for the caller
+/// to reject with). Shared by the engine's own dynamic-import job and by
+/// [`crate::agent::Agent::finish_dynamic_import`], so a host that loads the
+/// module asynchronously gets the same behaviour, including top-level `await`.
+pub(crate) fn complete_dynamic_import(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    phase: ImportPhase,
+    resolve: &Value,
+    reject: &Value,
+) -> Result<(), JsError> {
+    match phase {
+        ImportPhase::Source => {
+            // GetModuleSource (proposal ContinueDynamicImport): a module with an
+            // empty [[ModuleSource]] (a Source Text Module) rejects with a
+            // SyntaxError; otherwise the promise resolves with the Module Source
+            // Object.
+            let source = module_source_object(agent, module)?;
+            crate::function::call(agent, resolve, Value::Undefined, &[source])?;
+            return Ok(());
+        }
+        ImportPhase::Defer => {
+            // `import.defer(...)` returns a DeferredModule object (not a promise):
+            // a thenable whose `.then` resolves with the module's deferred
+            // namespace after its asynchronous transitive dependencies settle.
+            module_declaration_instantiation(agent, module)?;
+            let deferred_module = deferred_module_object(agent, module)?;
+            crate::function::call(agent, resolve, Value::Undefined, &[deferred_module])?;
+            return Ok(());
+        }
+        ImportPhase::Import => {}
+    }
+    module_declaration_instantiation(agent, module)?;
+    let namespace = module_namespace(agent, module)?;
+    let evaluation = module_evaluation(agent, module)?;
+    if is_promise_value(agent, &evaluation) {
+        // Top-level await: resolve when the module finishes.
+        let method = crate::context::get_property(
+            agent,
+            &evaluation,
+            &JsString::from_utf8("then"),
+            evaluation,
+        )?;
+        let then_resolve = make_namespace_resolver(agent, resolve, &namespace)?;
+        crate::function::call(agent, &method, evaluation, &[then_resolve, *reject])?;
+    } else {
+        crate::function::call(agent, resolve, Value::Undefined, &[namespace])?;
+    }
+    Ok(())
 }
 
 fn is_promise_value(agent: &Agent, value: &Value) -> bool {
@@ -4098,6 +4126,51 @@ mod tests {
         assert_eq!(settled(&agent, &promise).unwrap(), js_str("42:d"));
     }
 
+    #[derive(Debug)]
+    struct DefersImport;
+
+    impl crate::host::HostHooks for DefersImport {
+        fn import_module_dynamically(
+            &self,
+            _specifier: &JsString,
+            _referrer_name: Option<&JsString>,
+            _phase: crate::api::ModuleImportPhase,
+            _attributes: &[(JsString, JsString)],
+        ) -> Option<crate::host::DynamicImportAnswer> {
+            Some(crate::host::DynamicImportAnswer::Pending(7))
+        }
+    }
+
+    #[test]
+    fn a_pending_dynamic_import_finishes_with_the_namespace() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.add_module("./dep.js", "export var x = 42;");
+        agent.host_hooks = Some(Box::new(DefersImport));
+        let promise = agent
+            .run_script("import('./dep.js').then(function (ns) { return ns.x; })")
+            .unwrap();
+
+        // The host answers Pending, so the import is still unsettled.
+        agent.run_jobs().unwrap();
+        assert!(
+            settled(&agent, &promise).is_err(),
+            "the import settled before the host finished it"
+        );
+
+        // Resolve the module and finish the import; it resolves with the
+        // namespace and the `.then` runs.
+        let realm = agent.first_realm().unwrap();
+        agent.push_bootstrap_context(realm);
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./dep.js"), &[])
+                .unwrap();
+        agent.pop_bootstrap_context();
+        agent.finish_dynamic_import(7, module).unwrap();
+        agent.run_jobs().unwrap();
+        assert_eq!(settled(&agent, &promise).unwrap(), Value::Number(42.0));
+    }
+
     #[test]
     fn import_meta_is_an_object() {
         let mut evaluated =
@@ -4311,7 +4384,7 @@ mod tests {
             referrer_name: Option<&JsString>,
             phase: crate::api::ModuleImportPhase,
             attributes: &[(JsString, JsString)],
-        ) -> Option<Result<Value, JsError>> {
+        ) -> Option<crate::host::DynamicImportAnswer> {
             assert_eq!(specifier.to_string_lossy(), "./dep.js");
             assert_eq!(
                 referrer_name.map(|name| name.to_string_lossy()).as_deref(),
@@ -4326,9 +4399,9 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [("type".to_string(), "json".to_string())]
             );
-            Some(Ok(Value::String(Handle::new(JsString::from_utf8(
-                "the host's answer",
-            )))))
+            Some(crate::host::DynamicImportAnswer::Handled(Ok(
+                Value::String(Handle::new(JsString::from_utf8("the host's answer"))),
+            )))
         }
     }
 
@@ -4396,16 +4469,16 @@ mod tests {
                 _referrer_name: Option<&JsString>,
                 _phase: crate::api::ModuleImportPhase,
                 attributes: &[(JsString, JsString)],
-            ) -> Option<Result<Value, JsError>> {
+            ) -> Option<crate::host::DynamicImportAnswer> {
                 SEEN.with(|seen| {
                     *seen.borrow_mut() = attributes
                         .iter()
                         .map(|(key, value)| (key.to_string_lossy(), value.to_string_lossy()))
                         .collect();
                 });
-                Some(Ok(Value::String(Handle::new(JsString::from_utf8(
-                    "the host's answer",
-                )))))
+                Some(crate::host::DynamicImportAnswer::Handled(Ok(
+                    Value::String(Handle::new(JsString::from_utf8("the host's answer"))),
+                )))
             }
         }
 
@@ -4483,13 +4556,13 @@ mod tests {
             referrer_name: Option<&JsString>,
             _phase: crate::api::ModuleImportPhase,
             _attributes: &[(JsString, JsString)],
-        ) -> Option<Result<Value, JsError>> {
+        ) -> Option<crate::host::DynamicImportAnswer> {
             SCRIPT_REFERRER.with(|seen| {
                 *seen.borrow_mut() = referrer_name.map(|name| name.to_string_lossy());
             });
-            Some(Ok(Value::String(Handle::new(JsString::from_utf8(
-                "the host's answer",
-            )))))
+            Some(crate::host::DynamicImportAnswer::Handled(Ok(
+                Value::String(Handle::new(JsString::from_utf8("the host's answer"))),
+            )))
         }
     }
 

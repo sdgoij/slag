@@ -2114,7 +2114,7 @@ impl runtime::HostHooks for BridgeHooks {
         referrer_name: Option<&crux::string::JsString>,
         phase: crate::ModuleImportPhase,
         attributes: &[(crux::string::JsString, crux::string::JsString)],
-    ) -> Option<Result<crux::value::Value, crux::error::JsError>> {
+    ) -> Option<runtime::host::DynamicImportAnswer> {
         let engine = api::Isolate::get_current()?;
         // SAFETY: as `wasm_streaming` — the engine hands back the isolate whose
         // agent is running, and that address is the bridge's.
@@ -2163,7 +2163,13 @@ impl runtime::HostHooks for BridgeHooks {
             (None, None) => return None,
         };
         let promise = promise?;
-        Some(Ok(Local::<Value>::from(promise).into_engine().into_value()))
+        Some(runtime::host::DynamicImportAnswer::Handled(Ok(Local::<
+            Value,
+        >::from(
+            promise
+        )
+        .into_engine()
+        .into_value())))
     }
 }
 

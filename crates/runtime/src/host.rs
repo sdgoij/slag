@@ -10,6 +10,19 @@ use crux::string::JsString;
 
 use crate::realm::Realm;
 
+/// What a host answers HostImportModuleDynamically with.
+#[derive(Debug)]
+pub enum DynamicImportAnswer {
+    /// The host owns the import and answers what `import()` resolves to (its
+    /// promise), or the error to reject it with.
+    Handled(Result<crux::value::Value, JsError>),
+    /// The host will finish the import later by calling
+    /// [`crate::agent::Agent::finish_dynamic_import`] with `token`. The engine
+    /// keeps the import's capability and phase until then, and runs the same
+    /// link/evaluate/namespace it would have run in its own job.
+    Pending(u64),
+}
+
 /// Host-defined operations the runtime calls (spec's host-defined abstract
 /// operations). Each method's default implementation is the spec's default.
 ///
@@ -200,7 +213,10 @@ pub trait HostHooks: std::fmt::Debug {
     /// `Ok(promise)` is what the `import()` expression answers. `None` means this
     /// host resolves no dynamic imports and the engine falls back to its own
     /// registry ([`crate::module::host_resolve_imported_module`]), which is the
-    /// path every host that installs no hook keeps.
+    /// path every host that installs no hook keeps. `Some(Pending(token))` means
+    /// the host will load the module asynchronously and finish it later with
+    /// [`crate::agent::Agent::finish_dynamic_import`]; the engine keeps the
+    /// import's capability and runs the link/evaluate/namespace then.
     ///
     /// `attributes` is the validated import-attribute list as the host's own
     /// callback takes it: key text and value, in source order. `phase` is the
@@ -212,7 +228,7 @@ pub trait HostHooks: std::fmt::Debug {
         _referrer_name: Option<&JsString>,
         _phase: crate::api::ModuleImportPhase,
         _attributes: &[(JsString, JsString)],
-    ) -> Option<Result<crux::value::Value, JsError>> {
+    ) -> Option<DynamicImportAnswer> {
         None
     }
 
@@ -407,7 +423,7 @@ pub fn import_module_dynamically(
     referrer_name: Option<&JsString>,
     phase: crate::api::ModuleImportPhase,
     attributes: &[(JsString, JsString)],
-) -> Option<Result<crux::value::Value, JsError>> {
+) -> Option<DynamicImportAnswer> {
     match &agent.host_hooks {
         Some(hooks) => hooks.import_module_dynamically(specifier, referrer_name, phase, attributes),
         None => None,
