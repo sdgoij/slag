@@ -4172,6 +4172,33 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_dynamic_import_rejects_when_the_host_fails() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.host_hooks = Some(Box::new(DefersImport));
+        let promise = agent
+            .run_script(
+                "import('./missing.js').then(
+                    function () { return 'loaded'; },
+                    function () { return 'failed'; },
+                )",
+            )
+            .unwrap();
+
+        agent.run_jobs().unwrap();
+        assert!(
+            settled(&agent, &promise).is_err(),
+            "the import settled before the host finished it"
+        );
+
+        agent
+            .reject_dynamic_import(7, js_str("the host could not fetch it"))
+            .unwrap();
+        agent.run_jobs().unwrap();
+        assert_eq!(settled(&agent, &promise).unwrap(), js_str("failed"));
+    }
+
+    #[test]
     fn import_meta_is_an_object() {
         let mut evaluated =
             evaluate_modules(&[("m.js", "export var t = typeof import.meta;")], "m.js").unwrap();

@@ -4330,6 +4330,31 @@ impl Agent {
         Ok(())
     }
 
+    /// Reject a dynamic import a host answered with
+    /// `DynamicImportAnswer::Pending` when the host could not load the module.
+    /// The import's capability is rejected with `reason` and the token is
+    /// forgotten. Run at the top level (not inside an engine borrow), so it takes
+    /// `&mut self`. A token the host never registered is a no-op.
+    pub fn reject_dynamic_import(&mut self, token: u64, reason: Value) -> Result<(), JsError> {
+        let Some(pending) = self
+            .roots
+            .pending_dynamic_imports
+            .borrow_mut()
+            .remove(&token)
+        else {
+            return Ok(());
+        };
+        self.push_bootstrap_context(pending.realm);
+        let result = crate::function::call(
+            self,
+            &pending.capability.reject,
+            Value::Undefined,
+            &[reason],
+        );
+        self.pop_bootstrap_context();
+        result.map(|_| ())
+    }
+
     /// Nanoseconds until the earliest queued timeout is due (0 when a job is
     /// already due), or `None` when no timeout jobs are queued. Hosts use it
     /// to schedule the drain that lets engine timers progress.
