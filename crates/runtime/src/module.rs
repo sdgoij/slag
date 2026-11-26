@@ -3410,6 +3410,42 @@ fn resolve_export(
     Ok(star_resolution)
 }
 
+/// A resolved export binding in the terms an embedder's ResolveExport asks for.
+/// `NotFound` covers a name that is not exported *or* is ambiguous — the engine
+/// reads both as *undefined* through a namespace, so it does not tell them
+/// apart. A deferred-namespace or source-phase re-export is reported as the
+/// namespace of its module, which is the closest of the embedder's binding
+/// kinds.
+pub enum ResolvedExport {
+    /// The binding lives in the module's environment under this local name.
+    BindingName(Handle<SourceTextModule>, JsString),
+    /// The binding is the module's namespace object.
+    Namespace(Handle<SourceTextModule>),
+    NotFound,
+}
+
+/// ResolveExport for an embedder: the defining module and local binding of an
+/// export name, or that there is none. A host module loader uses this to answer
+/// its own `resolve_export` hook.
+pub fn resolve_export_for_host(
+    agent: &mut Agent,
+    module: &Handle<SourceTextModule>,
+    name: &JsString,
+) -> Result<ResolvedExport, JsError> {
+    let mut resolve_set = Vec::new();
+    Ok(
+        match resolve_export(agent, module, name, &mut resolve_set)? {
+            Some(ResolvedBinding::Local(target, local)) => {
+                ResolvedExport::BindingName(target, local)
+            }
+            Some(ResolvedBinding::Namespace(target))
+            | Some(ResolvedBinding::DeferredNamespace(target))
+            | Some(ResolvedBinding::Source(target)) => ResolvedExport::Namespace(target),
+            None => ResolvedExport::NotFound,
+        },
+    )
+}
+
 /// Read an exported binding through the module environment (the namespace's
 /// [[Get]]). Names that are not exported, or whose export is ambiguous, read
 /// as *undefined* (spec 10.4.6.8).
@@ -4633,5 +4669,37 @@ mod tests {
         assert_eq!(*m.status.borrow(), ModuleStatus::Evaluated);
         let settled = settled(&agent, &m_promise);
         assert!(matches!(settled, Ok(v) if v.is_undefined()));
+    }
+
+    #[test]
+    fn resolve_export_for_host_names_the_local_binding() {
+        let mut evaluated =
+            evaluate_modules(&[("entry", "export const x = 42;")], "entry").unwrap();
+        let module =
+            host_resolve_imported_module(&mut evaluated.agent, &JsString::from_utf8("entry"), &[])
+                .unwrap();
+
+        match resolve_export_for_host(&mut evaluated.agent, &module, &JsString::from_utf8("x"))
+            .unwrap()
+        {
+            ResolvedExport::BindingName(target, local) => {
+                assert!(
+                    Handle::ptr_eq(target, module),
+                    "the binding is in the module"
+                );
+                assert_eq!(local, JsString::from_utf8("x"));
+            }
+            _ => panic!("x did not resolve to a binding name"),
+        }
+
+        assert!(matches!(
+            resolve_export_for_host(
+                &mut evaluated.agent,
+                &module,
+                &JsString::from_utf8("missing"),
+            )
+            .unwrap(),
+            ResolvedExport::NotFound
+        ));
     }
 }
