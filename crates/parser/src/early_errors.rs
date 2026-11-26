@@ -1158,10 +1158,10 @@ fn register_export_name(
         ExportName::Str(value) => {
             // A string export name must be well-formed UTF-16: an unpaired
             // surrogate in an ExportedName is a Syntax Error (spec 16.2.3).
-            if !is_well_formed_utf16(value.as_slice()) {
+            if !is_well_formed_utf16(&value) {
                 return Err(error_at(span, "Export name contains an unpaired surrogate"));
             }
-            register_export_string(seen, value, span)
+            register_export_string(seen, JsString::from_arc(value), span)
         }
     }
 }

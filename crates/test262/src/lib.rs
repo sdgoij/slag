@@ -11198,7 +11198,7 @@ var $DONE = function (error) {
                 && request.attributes.iter().any(|(key, value)| {
                     let key_text = match key {
                         syntax::AttributeKey::Ident(atom) => crux::lookup(*atom),
-                        syntax::AttributeKey::Str(text) => text.clone(),
+                        syntax::AttributeKey::Str(text) => crux::JsString::from_arc(text.clone()),
                     };
                     key_text.to_string_lossy() == "type"
                         && matches!(value.to_string_lossy().as_str(), "text" | "bytes")

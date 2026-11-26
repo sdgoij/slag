@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crux::{AtomId, BigInt, JsString, Span};
+use crux::{AtomId, BigInt, Span};
 
 /// A Script or Module: the body of statements plus the whole source span.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,13 +35,13 @@ pub enum ModuleItem {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportDecl {
     pub span: Span,
-    pub specifier: JsString,
+    pub specifier: Arc<[u16]>,
     /// The specifier's own span — the string literal, not the declaration. A
     /// request's reported offset is this one (see `ModuleRequest`), so an error
     /// about a specifier can point at the specifier.
     pub specifier_span: Span,
     pub entries: Vec<ImportEntry>,
-    pub attributes: Vec<(AttributeKey, JsString)>,
+    pub attributes: ImportAttributes,
     /// The import phase: the plain `import`, or the source (`import source
     /// x from …`) / deferred (`import defer … from …`) forms.
     pub phase: ImportPhase,
@@ -66,16 +66,15 @@ pub enum ImportEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportName {
     Ident(AtomId),
-    Str(JsString),
+    Str(Arc<[u16]>),
 }
 
 /// An `export` declaration (spec 16.2.3).
 ///
 /// The `Declaration(Stmt)` variant is inherently much larger than the others
-/// (a `Stmt` embeds `JsString` literals — 48 bytes since the rope merged into
-/// the string box — plus spans and expression subtrees); boxing the strings
-/// inside `Stmt` would ripple through the parser and every AST consumer for
-/// no runtime win (the AST is transient compiler input).
+/// (a `Stmt` embeds spans and expression subtrees); boxing anything inside it
+/// would ripple through the parser and every AST consumer for no runtime win
+/// (the AST is transient compiler input).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportDecl {
@@ -89,10 +88,10 @@ pub enum ExportDecl {
         specifiers: Vec<ExportSpecifier>,
         /// `export * as ns from …`.
         namespace: Option<ExportName>,
-        specifier: JsString,
+        specifier: Arc<[u16]>,
         /// The specifier's own span, as `ImportDecl`'s.
         specifier_span: Span,
-        attributes: Vec<(AttributeKey, JsString)>,
+        attributes: ImportAttributes,
         span: Span,
     },
     /// `export var …;` / `export function …` / `export class …`.
@@ -123,8 +122,11 @@ pub enum ExportDefault {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeKey {
     Ident(AtomId),
-    Str(JsString),
+    Str(Arc<[u16]>),
 }
+
+/// Import attributes (`with { type: "json" }`): each key with its string value.
+pub type ImportAttributes = Vec<(AttributeKey, Arc<[u16]>)>;
 
 /// A statement node: `span` covers the entire statement (spec ch. 14).
 #[derive(Debug, Clone, PartialEq)]
@@ -952,11 +954,12 @@ mod tests {
     fn a_parsed_program_can_cross_a_thread() {
         // Load-bearing: the AST must hold no GC or `Rc` handle, or a host cannot
         // parse on a compile-pool worker and install the artifact on the thread
-        // that owns the isolate. Literal text is `Arc<[u16]>` for this reason —
-        // and, unlike an interned atom, it is released with the program.
+        // that owns the isolate. Literal and module text is `Arc<[u16]>` for this
+        // reason — and, unlike an interned atom, it is released with the program.
         fn assert_send<T: Send>() {}
         assert_send::<Program>();
         assert_send::<Stmt>();
+        assert_send::<Module>();
     }
 
     #[test]

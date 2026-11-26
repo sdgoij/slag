@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crux::error::{ErrorKind, JsError};
@@ -185,28 +186,21 @@ impl Trace for SourceTextModule {
         self.import_meta.trace(visit);
         self.module_source.trace(visit);
         self.deferred_namespace.trace(visit);
-        // The module source and the module-record strings (specifiers,
-        // import attributes, export names) are JsStrings: a rope's children
-        // are heap edges. `code` is the parsed AST (plain data) — its
-        // strings are parse-produced flats with no heap edges.
+        // The module source and the module-record strings (specifiers, import
+        // attributes, export names) are JsStrings: a rope's children are heap
+        // edges. `code` is the parsed AST (plain data), and the attribute keys
+        // and export names copied out of it are plain too — an owned
+        // `Arc<[u16]>` carries no heap edge to trace.
         self.source.trace(visit);
         self.name.trace(visit);
         for request in &self.requested_modules {
             request.specifier.trace(visit);
-            for (key, value) in &request.attributes {
-                if let AttributeKey::Str(name) = key {
-                    name.trace(visit);
-                }
+            for (_, value) in &request.attributes {
                 value.trace(visit);
             }
         }
-        for (specifier, entry, _) in &self.import_entries {
+        for (specifier, _, _) in &self.import_entries {
             specifier.trace(visit);
-            if let ImportEntry::Named { imported, .. } = entry
-                && let ExportName::Str(name) = imported
-            {
-                name.trace(visit);
-            }
         }
         for entry in self
             .local_export_entries
@@ -214,18 +208,8 @@ impl Trace for SourceTextModule {
             .chain(&self.indirect_export_entries)
             .chain(&self.star_export_entries)
         {
-            if let Some(name) = &entry.export_name
-                && let ExportName::Str(name) = name
-            {
-                name.trace(visit);
-            }
             if let Some(request) = &entry.module_request {
                 request.trace(visit);
-            }
-            if let Some(name) = &entry.import_name
-                && let ExportName::Str(name) = name
-            {
-                name.trace(visit);
             }
         }
     }
@@ -660,8 +644,21 @@ fn module_kind(
 pub(crate) fn key_string(key: &AttributeKey) -> String {
     match key {
         AttributeKey::Ident(atom) => crux::lookup(*atom).to_string_lossy(),
-        AttributeKey::Str(text) => text.to_string_lossy(),
+        AttributeKey::Str(text) => String::from_utf16_lossy(text),
     }
+}
+
+/// A module-record string for text the AST owns. `JsString`'s `Flat` form is
+/// that `Arc`, so this shares the buffer instead of copying it.
+fn js_text(text: &Arc<[u16]>) -> JsString {
+    JsString::from_arc(text.clone())
+}
+
+fn js_attributes(attributes: &[(AttributeKey, Arc<[u16]>)]) -> Vec<(AttributeKey, JsString)> {
+    attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), js_text(value)))
+        .collect()
 }
 
 /// CreateModuleSourceObject (source-phase-imports): an `%AbstractModuleSource%`
@@ -786,11 +783,11 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
         match item {
             ModuleItem::Import(import) => {
                 for entry in &import.entries {
-                    import_entries.push((import.specifier.clone(), entry.clone(), import.phase));
+                    import_entries.push((js_text(&import.specifier), entry.clone(), import.phase));
                 }
                 requested_modules.push(ModuleRequest {
-                    specifier: import.specifier.clone(),
-                    attributes: import.attributes.clone(),
+                    specifier: js_text(&import.specifier),
+                    attributes: js_attributes(&import.attributes),
                     phase: import.phase,
                     span: import.specifier_span,
                 });
@@ -908,7 +905,7 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                         };
                         local_export_entries.push(ExportEntry {
                             export_name: Some(local),
-                            module_request: Some(specifier.clone()),
+                            module_request: Some(js_text(specifier)),
                             import_name: None,
                             local_name: None,
                         });
@@ -916,7 +913,7 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                         // `export * from ...`
                         star_export_entries.push(ExportEntry {
                             export_name: None,
-                            module_request: Some(specifier.clone()),
+                            module_request: Some(js_text(specifier)),
                             import_name: None,
                             local_name: None,
                         });
@@ -930,15 +927,15 @@ fn collect_module_records(code: &Module) -> ModuleRecords {
                             };
                             indirect_export_entries.push(ExportEntry {
                                 export_name: Some(exported),
-                                module_request: Some(specifier.clone()),
+                                module_request: Some(js_text(specifier)),
                                 import_name: Some(local),
                                 local_name: None,
                             });
                         }
                     }
                     requested_modules.push(ModuleRequest {
-                        specifier: specifier.clone(),
-                        attributes: attributes.clone(),
+                        specifier: js_text(specifier),
+                        attributes: js_attributes(attributes),
                         phase: ImportPhase::Import,
                         span: *specifier_span,
                     });
@@ -1167,7 +1164,7 @@ pub fn module_declaration_instantiation(
             } => {
                 let import_name = match imported {
                     ExportName::Ident(id) => crux::lookup(id),
-                    ExportName::Str(text) => text,
+                    ExportName::Str(text) => JsString::from_arc(text.clone()),
                 };
                 (crux::lookup(local), import_name)
             }
@@ -1280,7 +1277,9 @@ pub fn module_declaration_instantiation(
         // A reclassified source/deferred marker resolves to the imported
         // module itself (the ModuleSource / deferred namespace object), not
         // to an export name — no further validation is needed.
-        if import_name == source_marker() || import_name == defer_marker() {
+        if import_name.as_slice() == &source_marker()[..]
+            || import_name.as_slice() == &defer_marker()[..]
+        {
             continue;
         }
         let mut resolve_set = Vec::new();
@@ -3227,15 +3226,21 @@ enum ResolvedBinding {
 /// The sentinel import name of a reclassified source-phase re-export: an
 /// atom that cannot collide with a real identifier (the spec's ~source~
 /// marker).
-fn source_marker() -> JsString {
-    JsString::from_utf8("\u{1}source")
+fn source_marker() -> Arc<[u16]> {
+    static MARKER: std::sync::OnceLock<Arc<[u16]>> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| Arc::from("\u{1}source".encode_utf16().collect::<Vec<u16>>()))
+        .clone()
 }
 
 /// The sentinel import name of a reclassified deferred-namespace re-export
 /// (`import defer * as ns from …; export { ns }`): resolves to the module's
 /// deferred namespace object (import-defer).
-fn defer_marker() -> JsString {
-    JsString::from_utf8("\u{1}defer")
+fn defer_marker() -> Arc<[u16]> {
+    static MARKER: std::sync::OnceLock<Arc<[u16]>> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| Arc::from("\u{1}defer".encode_utf16().collect::<Vec<u16>>()))
+        .clone()
 }
 
 /// ResolveExport (spec 16.2.1.7.2.2): find the defining module and local
@@ -3307,12 +3312,12 @@ fn resolve_export(
             // A reclassified source-phase re-export (`import source x from …;
             // export { x }`) resolves to the imported module's ModuleSource
             // object (spec ResolveExport step: [[ImportName]] is ~source~).
-            if import_name == source_marker() {
+            if import_name.as_slice() == &source_marker()[..] {
                 return Ok(Some(ResolvedBinding::Source(imported)));
             }
             // A reclassified deferred-namespace re-export resolves to the
             // module's deferred namespace object.
-            if import_name == defer_marker() {
+            if import_name.as_slice() == &defer_marker()[..] {
                 return Ok(Some(ResolvedBinding::DeferredNamespace(imported)));
             }
             return resolve_export(agent, &imported, &import_name, resolve_set);
@@ -3451,7 +3456,7 @@ pub fn dynamic_import(
         };
         for (key, value) in attributes {
             attribute_pairs.push((key.clone(), value.clone()));
-            parsed_attributes.push((AttributeKey::Str(key), value));
+            parsed_attributes.push((AttributeKey::Str(Arc::from(key.as_slice())), value));
         }
     }
     // The referrer is the code the `import()` is written in, read **here** rather
@@ -3701,7 +3706,7 @@ fn import_attributes(
 fn export_name_string(name: Option<&ExportName>) -> Result<JsString, JsError> {
     match name {
         Some(ExportName::Ident(id)) => Ok(crux::lookup(*id)),
-        Some(ExportName::Str(text)) => Ok(text.clone()),
+        Some(ExportName::Str(text)) => Ok(JsString::from_arc(text.clone())),
         None => Err(JsError::new(
             ErrorKind::TypeError,
             "export has no name".into(),

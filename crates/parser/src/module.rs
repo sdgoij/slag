@@ -1,5 +1,7 @@
 //! Modules: import and export declarations (spec 16.2).
 
+use std::sync::Arc;
+
 use crux::{AtomId, JsError, JsString, Span, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier};
 use syntax::{
@@ -210,13 +212,13 @@ fn parse_imported_binding(parser: &mut Parser) -> Result<(AtomId, Span), JsError
 
 /// The specifier's text and its own span — the string literal, which is where a
 /// request's reported offset belongs (see `runtime::module::ModuleRequest`).
-fn parse_module_specifier(parser: &mut Parser) -> Result<(JsString, Span), JsError> {
+fn parse_module_specifier(parser: &mut Parser) -> Result<(Arc<[u16]>, Span), JsError> {
     let tok = parser.next()?;
     let span = tok.span;
     let TokenKind::StringLiteral { value, .. } = tok.kind else {
         return Err(parser.unexpected(&tok));
     };
-    Ok((value, span))
+    Ok((Arc::from(value.as_slice()), span))
 }
 
 fn parse_module_export_name(parser: &mut Parser) -> Result<ExportName, JsError> {
@@ -236,7 +238,7 @@ fn parse_module_export_name(parser: &mut Parser) -> Result<ExportName, JsError> 
                 ));
             }
             parser.next()?;
-            Ok(ExportName::Str(value))
+            Ok(ExportName::Str(Arc::from(value.as_slice())))
         }
         _ => Err(parser.unexpected(&tok)),
     }
@@ -259,7 +261,7 @@ fn is_well_formed_utf16(units: &[u16]) -> bool {
 }
 
 /// `with { "type": "json" }` — import attributes (spec 16.2.4).
-fn parse_with_clause(parser: &mut Parser) -> Result<Vec<(AttributeKey, JsString)>, JsError> {
+fn parse_with_clause(parser: &mut Parser) -> Result<syntax::ImportAttributes, JsError> {
     if !parser.eat_contextual("with")? {
         return Ok(Vec::new());
     }
@@ -275,7 +277,7 @@ fn parse_with_clause(parser: &mut Parser) -> Result<Vec<(AttributeKey, JsString)
             }
             TokenKind::StringLiteral { value, .. } => {
                 parser.next()?;
-                AttributeKey::Str(value)
+                AttributeKey::Str(Arc::from(value.as_slice()))
             }
             _ => {
                 let tok = parser.peek()?.clone();
@@ -286,7 +288,7 @@ fn parse_with_clause(parser: &mut Parser) -> Result<Vec<(AttributeKey, JsString)
         // identifier/string forms (spec 16.2.4: WithEntries keys are distinct).
         let key_string = match &key {
             AttributeKey::Ident(atom) => crux::lookup(*atom),
-            AttributeKey::Str(value) => value.clone(),
+            AttributeKey::Str(value) => JsString::from_arc(value.clone()),
         };
         if seen.contains(&key_string) {
             return Err(parser.error_at(key_start, "Duplicate import attribute key"));
@@ -425,9 +427,9 @@ fn parse_export_specifier_list(parser: &mut Parser) -> Result<Vec<ExportSpecifie
     Ok(out)
 }
 
-fn string_value(tok: syntax::Token) -> JsString {
+fn string_value(tok: syntax::Token) -> Arc<[u16]> {
     match tok.kind {
-        TokenKind::StringLiteral { value, .. } => value,
+        TokenKind::StringLiteral { value, .. } => Arc::from(value.as_slice()),
         _ => unreachable!("validated by the caller"),
     }
 }

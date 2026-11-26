@@ -235,12 +235,18 @@ fn parse_function_goal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crux::JsString;
+    use std::sync::Arc;
+
     use syntax::{
         AttributeKey, BinaryOp, ExportDecl, ExportName, ExportSpecifier, Expr, ExprKind,
         ForBinding, ForInit, ImportEntry, Literal, LogicalOp, ModuleItem, StmtKind, UnaryOp,
         VarDeclKind,
     };
+
+    /// An AST string: the parser stores text as plain `Arc<[u16]>`.
+    fn units(text: &str) -> Arc<[u16]> {
+        Arc::from(text.encode_utf16().collect::<Vec<u16>>())
+    }
 
     fn ok(source: &str) -> Program {
         parse_script(source)
@@ -1323,7 +1329,7 @@ mod tests {
         let ModuleItem::Import(imp) = &m.body[0] else {
             panic!("expected an import declaration");
         };
-        assert_eq!(imp.specifier, JsString::from_utf8("m"));
+        assert_eq!(imp.specifier, units("m"));
         assert_eq!(imp.entries.len(), 1);
         assert!(matches!(
             &imp.entries[0],
@@ -1374,7 +1380,7 @@ mod tests {
         assert!(matches!(
             &imp.entries[0],
             ImportEntry::Named { imported: ExportName::Str(s), local, .. }
-                if s == &JsString::from_utf8("str name") && *local == crux::intern_utf8("local")
+                if s == &units("str name") && *local == crux::intern_utf8("local")
         ));
         mod_ok("import { a, b, } from 'm';");
         mod_ok("import d, { a, } from 'm';");
@@ -1391,7 +1397,7 @@ mod tests {
             panic!("expected an import declaration");
         };
         assert!(imp.entries.is_empty());
-        assert_eq!(imp.specifier, JsString::from_utf8("side-effect"));
+        assert_eq!(imp.specifier, units("side-effect"));
         let m = mod_ok("import d from './data.json' with { type: 'json' };");
         let ModuleItem::Import(imp) = &m.body[0] else {
             panic!("expected an import declaration");
@@ -1401,7 +1407,7 @@ mod tests {
             imp.attributes[0].0,
             AttributeKey::Ident(k) if k == crux::intern_utf8("type")
         ));
-        assert_eq!(imp.attributes[0].1, JsString::from_utf8("json"));
+        assert_eq!(imp.attributes[0].1, units("json"));
         mod_ok("import 'm' with { type: 'json' };");
     }
 
