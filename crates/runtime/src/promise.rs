@@ -14,7 +14,7 @@ use crux::string::JsString;
 use crux::value::{Value, ValueKind, is_callable, is_constructor};
 
 use crate::agent::Agent;
-use crate::job::host_make_job_callback;
+use crate::host::make_job_callback;
 
 /// The promise records live on the promise object's own `ObjectKind`
 /// (`ObjectKind::Promise`), so their types are crux's: the collector traces a
@@ -456,12 +456,12 @@ pub fn perform_promise_then(
     let fulfill_reaction = PromiseReaction {
         capability: result_capability.clone(),
         kind: ReactionKind::Fulfill,
-        handler: on_fulfilled.map(host_make_job_callback),
+        handler: on_fulfilled.map(|handler| make_job_callback(agent, handler)),
     };
     let reject_reaction = PromiseReaction {
         capability: result_capability,
         kind: ReactionKind::Reject,
-        handler: on_rejected.map(host_make_job_callback),
+        handler: on_rejected.map(|handler| make_job_callback(agent, handler)),
     };
     let Some(data) = promise_record(promise) else {
         return Err(JsError::new(

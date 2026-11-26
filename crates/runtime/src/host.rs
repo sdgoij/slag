@@ -44,6 +44,16 @@ pub trait HostHooks: std::fmt::Debug {
         Ok(())
     }
 
+    /// HostMakeJobCallback (spec 9.5.2): lets the host attach its own context
+    /// to a JobCallback Record as it is created. The returned word is the
+    /// record's opaque `host_defined` slot: the engine carries it and hands it
+    /// back to [`HostHooks::call_job_callback`], nothing more. `None` keeps the
+    /// engine's own empty record, which is what every host that installs no hook
+    /// gets.
+    fn make_job_callback(&self, _callable: &crux::value::Value) -> Option<usize> {
+        None
+    }
+
     /// HostCallJobCallback (spec 9.5.3): lets the host call a job's callback
     /// itself, given the record, the `this` value and the arguments the engine
     /// would pass. `None` keeps the engine's own call, which is what every host
@@ -219,6 +229,23 @@ pub fn promise_rejection_tracker(
         Some(hooks) => hooks.promise_rejection_tracker(promise, reason, operation),
         None => Ok(()),
     }
+}
+
+/// HostMakeJobCallback dispatch: the agent's hooks if they answer with a host
+/// word, else the engine's own empty record.
+pub fn make_job_callback(
+    agent: &crate::agent::Agent,
+    callable: crux::value::Value,
+) -> crate::job::JobCallback {
+    if let Some(hooks) = &agent.host_hooks
+        && let Some(host_defined) = hooks.make_job_callback(&callable)
+    {
+        return crate::job::JobCallback {
+            callback: callable,
+            host_defined: Some(host_defined),
+        };
+    }
+    crate::job::host_make_job_callback(callable)
 }
 
 /// HostCallJobCallback dispatch: the agent's hooks if they answer, else the
@@ -590,6 +617,57 @@ mod tests {
         let value = call_job_callback(&mut agent, &callback, crux::Value::Undefined, &[])
             .expect("the host answered");
         assert_eq!(value, crux::Value::Number(7.0));
+    }
+
+    #[derive(Debug)]
+    struct TagsJobCallbacks {
+        seen: std::rc::Rc<std::cell::RefCell<Vec<Option<usize>>>>,
+    }
+
+    impl HostHooks for TagsJobCallbacks {
+        fn make_job_callback(&self, callable: &crux::value::Value) -> Option<usize> {
+            Some(match callable.kind() {
+                crux::value::ValueKind::Function(_) => 0xABCD,
+                _ => 0x1234,
+            })
+        }
+
+        fn call_job_callback(
+            &self,
+            job_callback: &crate::job::JobCallback,
+            _this_value: crux::value::Value,
+            _arguments: &[crux::value::Value],
+        ) -> Option<Result<crux::value::Value, JsError>> {
+            self.seen.borrow_mut().push(job_callback.host_defined);
+            Some(Ok(crux::Value::Undefined))
+        }
+    }
+
+    #[test]
+    fn a_host_word_from_make_job_callback_reaches_call_job_callback() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut agent = Agent::new();
+        agent.host_hooks = Some(Box::new(TagsJobCallbacks { seen: seen.clone() }));
+
+        let callable = crux::Value::Function(crux::Function::new(None));
+        let record = make_job_callback(&agent, callable);
+        assert_eq!(
+            record.callback, callable,
+            "the callable is carried unchanged"
+        );
+        assert_eq!(
+            record.host_defined,
+            Some(0xABCD),
+            "the host's word is the record's host-defined slot"
+        );
+
+        call_job_callback(&mut agent, &record, crux::Value::Undefined, &[])
+            .expect("the host answered");
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[Some(0xABCD)],
+            "the word made with the callback reached the call"
+        );
     }
 
     #[derive(Debug)]
