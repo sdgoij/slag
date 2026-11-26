@@ -54,6 +54,22 @@ pub trait HostHooks: std::fmt::Debug {
         None
     }
 
+    /// HostEnqueuePromiseJob (spec 9.5.4): lets the host own the promise-job
+    /// queue. When this answers `true`, every promise job goes to the engine's
+    /// host-job slots instead of the engine's own queue; the engine keeps the
+    /// job and its captures alive and calls
+    /// [`HostHooks::enqueue_promise_job`] with an opaque token, and the host runs
+    /// it with [`crate::agent::Agent::run_host_job`]. The default queues jobs in
+    /// the engine, which drains them itself.
+    fn takes_promise_jobs(&self) -> bool {
+        false
+    }
+
+    /// HostEnqueuePromiseJob's notification: the engine handed the host `token`
+    /// for a job it now owns. The host must run each token at most once; a token
+    /// it never runs leaves the job alive and pending.
+    fn enqueue_promise_job(&self, _realm: Option<&Realm>, _token: u64) {}
+
     /// HostCallJobCallback (spec 9.5.3): lets the host call a job's callback
     /// itself, given the record, the `this` value and the arguments the engine
     /// would pass. `None` keeps the engine's own call, which is what every host
@@ -667,6 +683,70 @@ mod tests {
             seen.borrow().as_slice(),
             &[Some(0xABCD)],
             "the word made with the callback reached the call"
+        );
+    }
+
+    #[derive(Debug)]
+    struct OwnsPromiseJobs {
+        tokens: std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+    }
+
+    impl HostHooks for OwnsPromiseJobs {
+        fn takes_promise_jobs(&self) -> bool {
+            true
+        }
+
+        fn enqueue_promise_job(&self, _realm: Option<&Realm>, token: u64) {
+            self.tokens.borrow_mut().push(token);
+        }
+    }
+
+    #[test]
+    fn a_host_can_own_the_promise_job_queue() {
+        let tokens = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.host_hooks = Some(Box::new(OwnsPromiseJobs {
+            tokens: tokens.clone(),
+        }));
+
+        agent
+            .run_script("var ran = false; Promise.resolve().then(() => { ran = true; });")
+            .unwrap();
+        let handed = tokens.borrow().clone();
+        assert!(
+            !handed.is_empty(),
+            "the host did not receive the reaction job"
+        );
+        assert!(
+            !agent.host_jobs_empty(),
+            "the engine forgot it holds the job"
+        );
+
+        // The engine's own drain does not run it: the host owns the queue.
+        agent.run_jobs().unwrap();
+        assert_eq!(
+            agent.run_script("ran").unwrap(),
+            crux::Value::Boolean(false),
+            "the engine ran a job the host owns"
+        );
+
+        // The host runs each job by the token it was handed.
+        for token in &handed {
+            agent
+                .run_host_job(*token as usize)
+                .expect("the token named no job")
+                .expect("running the host's job failed");
+        }
+        assert_eq!(
+            agent.run_script("ran").unwrap(),
+            crux::Value::Boolean(true),
+            "the job did not run"
+        );
+        assert!(agent.host_jobs_empty(), "the slot was not freed");
+        assert!(
+            agent.run_host_job(handed[0] as usize).is_none(),
+            "a spent token ran a job twice"
         );
     }
 

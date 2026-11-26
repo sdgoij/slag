@@ -617,6 +617,13 @@ pub(crate) struct AgentRoots {
     /// The execution-context stack (spec 9.4); see [`ContextStack`].
     pub(crate) execution_context_stack: ContextStack,
     pub(crate) promise_jobs: RefCell<VecDeque<Job>>,
+    /// Jobs a host took ownership of through `HostEnqueuePromiseJob`. The
+    /// engine keeps each slot's job — and so its captured values — alive until
+    /// the host runs it by token; a slot is reused once its job has run, so a
+    /// long-lived host queue does not accumulate slots.
+    pub(crate) host_jobs: RefCell<Vec<Option<Job>>>,
+    /// Free slots in `host_jobs`, so a run job's slot is reused.
+    pub(crate) host_job_free: RefCell<Vec<usize>>,
     pub(crate) generic_jobs: RefCell<VecDeque<Job>>,
     pub(crate) timeout_jobs: RefCell<VecDeque<(u64, Job)>>,
     /// The host's own microtask queues, one per queue it made
@@ -1413,6 +1420,8 @@ impl AgentRoots {
             live_registry: std::cell::Cell::new(std::ptr::null()),
             execution_context_stack: ContextStack::new(),
             promise_jobs: RefCell::new(VecDeque::new()),
+            host_jobs: RefCell::new(Vec::new()),
+            host_job_free: RefCell::new(Vec::new()),
             generic_jobs: RefCell::new(VecDeque::new()),
             timeout_jobs: RefCell::new(VecDeque::new()),
             microtask_queues: RefCell::new(Vec::new()),
@@ -1569,6 +1578,15 @@ impl AgentRoots {
         for job in promise_jobs.iter().chain(generic_jobs.iter()) {
             regions.push(job.closure_region());
         }
+        // A host that owns the promise queue holds the same opaque closures; the
+        // engine keeps their slots traced so a job the host holds across a
+        // collection is not swept.
+        let Ok(host_jobs) = self.host_jobs.try_borrow() else {
+            return false;
+        };
+        for job in host_jobs.iter().flatten() {
+            regions.push(job.closure_region());
+        }
         for (_, job) in timeout_jobs.iter() {
             regions.push(job.closure_region());
         }
@@ -1597,6 +1615,7 @@ impl Trace for AgentRoots {
     fn trace(&self, visit: &mut dyn FnMut(GcAny)) {
         self.execution_context_stack.trace(visit);
         self.promise_jobs.trace(visit);
+        self.host_jobs.trace(visit);
         if let Ok(queues) = self.microtask_queues.try_borrow() {
             for queue in queues.iter().flatten() {
                 queue.jobs.trace(visit);
@@ -3951,6 +3970,35 @@ impl Agent {
         realm: Option<Handle<Realm>>,
         closure: impl FnOnce(&mut Agent) -> Result<Value, JsError> + 'static,
     ) {
+        // A host that owns the queue gets the job instead. The engine keeps it
+        // alive (traced, and its closure region scanned) until the host runs it
+        // through `run_host_job`, so a job held across a turn or a collection is
+        // not swept.
+        if self
+            .host_hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.takes_promise_jobs())
+        {
+            let job = Job::new(realm, closure);
+            let token = {
+                let mut free = self.roots.host_job_free.borrow_mut();
+                let mut slots = self.roots.host_jobs.borrow_mut();
+                match free.pop() {
+                    Some(slot) => {
+                        slots[slot] = Some(job);
+                        slot
+                    }
+                    None => {
+                        slots.push(Some(job));
+                        slots.len() - 1
+                    }
+                }
+            };
+            if let Some(hooks) = &self.host_hooks {
+                hooks.enqueue_promise_job(realm.as_deref(), token as u64);
+            }
+            return;
+        }
         // A realm the host gave its own queue sends its jobs there, so the host
         // drains them itself. A queue the host released, or an id nothing
         // knows, falls back to the default queue rather than dropping the job.
@@ -4190,6 +4238,34 @@ impl Agent {
         self.roots.promise_jobs.borrow().is_empty()
             && self.roots.generic_jobs.borrow().is_empty()
             && self.roots.timeout_jobs.borrow().is_empty()
+    }
+
+    /// Whether the host still holds a promise job it has not run. Engine-queue
+    /// jobs are not counted here; this answers for the host's own slots.
+    pub fn host_jobs_empty(&self) -> bool {
+        self.roots.host_jobs.borrow().iter().all(Option::is_none)
+    }
+
+    /// Run the promise job a host took with `HostEnqueuePromiseJob`, by the
+    /// token it was handed, and free its slot. `None` means the token names no
+    /// waiting job (already run, or never this agent's). A job runs once.
+    pub fn run_host_job(&mut self, token: usize) -> Option<Result<Value, JsError>> {
+        let job = {
+            let mut slots = self.roots.host_jobs.borrow_mut();
+            slots.get_mut(token)?.take()?
+        };
+        self.roots.host_job_free.borrow_mut().push(token);
+        Some(crux::function::with_agent(
+            self as *mut Agent as *mut (),
+            || {
+                crux::heap::reset_allocation_budget();
+                self.run_host_finalizers();
+                let result = self.run_job(job);
+                // The job drain is a safe quiescent point, as in `run_jobs_inner`.
+                self.maybe_collect();
+                result
+            },
+        ))
     }
 
     /// Nanoseconds until the earliest queued timeout is due (0 when a job is
