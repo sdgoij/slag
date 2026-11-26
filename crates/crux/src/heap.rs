@@ -166,12 +166,34 @@ impl GcAny {
 
     /// Trace the box's outgoing edges.
     ///
-    /// SAFETY: the box must be live (the rooting discipline).
-    pub(crate) unsafe fn trace(self, visit: &mut dyn FnMut(GcAny)) {
+    /// # Safety
+    ///
+    /// The box must be live (the rooting discipline). A host collector that
+    /// owns a box built by `Gc::new_at` calls this from its own trace phase.
+    pub unsafe fn trace(self, visit: &mut dyn FnMut(GcAny)) {
         // SAFETY: the caller guarantees `self.0` is a live box header.
         unsafe {
             let header = &*self.0;
             (header.vtable.trace)(header.data_ptr(self.0), visit);
+        }
+    }
+
+    /// Drop the box's payload, the step the engine's sweep runs when it frees a
+    /// cell: the payload records its death, and its destructor runs when it
+    /// owns anything. A host collector that owns a `Gc::new_at` box calls this
+    /// before it reuses or releases the memory.
+    ///
+    /// # Safety
+    ///
+    /// The box must be live, and it must not be used again afterwards: the
+    /// payload is dropped in place and the header is not cleared, so a second
+    /// call (or any trace after this one) reads a dropped value.
+    pub unsafe fn drop_payload(self) {
+        // SAFETY: the caller guarantees `self.0` is a live box header, and that
+        // nothing reads the payload once it is dropped.
+        unsafe {
+            let header = &*self.0;
+            (header.vtable.drop)(header.data_ptr(self.0));
         }
     }
 
@@ -501,6 +523,50 @@ impl<T: Trace> Gc<T> {
             maybe_stress_collect(gc.as_any());
         }
         gc
+    }
+
+    /// Construct a box at `place` instead of allocating one in the arena.
+    ///
+    /// This is the seam a foreign collector needs: a `GcInterface`-style
+    /// allocator (Ladybird's LibGC, one heap) hands the engine the memory for a
+    /// cell and expects it filled. The header written here is this engine's own,
+    /// so `GCBOX_DATA_OFFSET` (16 bytes) must equal the host collector's cell
+    /// header size for one heap to work without moving every payload.
+    ///
+    /// A box built this way is *not* part of the arena, which is the whole
+    /// point: the engine's sweep never sees it, its minor collection never
+    /// traces it, and the host decides when it dies. What the engine still owes
+    /// the host is the payload's outgoing edges ([`GcAny::trace`]) and its drop
+    /// ([`GcAny::drop_payload`]), both of which run through the box's vtable.
+    ///
+    /// # Safety
+    ///
+    /// `place` must point at `size_of::<GcBox<T>>()` writable bytes aligned to
+    /// `align_of::<GcBox<T>>()`. The memory must outlive every `Gc` derived from
+    /// it, and it must not also be reachable as an arena slot: the host
+    /// allocator owns its lifetime, and nothing here records it for collection.
+    /// `value` must not reveal the handle before this returns (it cannot: no
+    /// handle exists until then).
+    pub unsafe fn new_at(place: NonNull<u8>, value: T) -> Gc<T> {
+        let size = size_of::<GcBox<T>>();
+        let raw = place.as_ptr() as *mut GcBox<T>;
+        // SAFETY: the caller guarantees the writable, aligned, owned memory;
+        // the header is written before the payload, and no handle can see the
+        // box until this returns.
+        unsafe {
+            raw.write(GcBox {
+                header: GcHeader {
+                    flags: Cell::new(FLAG_LIVE),
+                    size: size as u32,
+                    vtable: GcBox::<T>::VTABLE,
+                },
+                data: value,
+            });
+            Gc {
+                ptr: NonNull::new_unchecked(raw),
+                _not_send_sync: std::marker::PhantomData,
+            }
+        }
     }
 
     /// Allocate a box and initialize its payload in place. `init` writes the
