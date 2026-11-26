@@ -642,7 +642,7 @@ fn run_reaction_job(
 ) -> Result<Value, JsError> {
     run_promise_hook(agent, PromiseHookKind::Before, &promise, None)?;
     let handler_result = match &reaction.handler {
-        Some(callback) => crate::job::host_call_job_callback_agent(
+        Some(callback) => crate::host::call_job_callback(
             agent,
             callback,
             Value::Undefined,

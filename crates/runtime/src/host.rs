@@ -44,6 +44,25 @@ pub trait HostHooks: std::fmt::Debug {
         Ok(())
     }
 
+    /// HostCallJobCallback (spec 9.5.3): lets the host call a job's callback
+    /// itself, given the record, the `this` value and the arguments the engine
+    /// would pass. `None` keeps the engine's own call, which is what every host
+    /// that installs no hook gets.
+    fn call_job_callback(
+        &self,
+        _job_callback: &crate::job::JobCallback,
+        _this_value: crux::value::Value,
+        _arguments: &[crux::value::Value],
+    ) -> Option<Result<crux::value::Value, JsError>> {
+        None
+    }
+
+    /// HostEnsureCanAddPrivateElement (spec 7.3.28): lets the host refuse adding
+    /// a private element to `object`. The default permits.
+    fn ensure_can_add_private_element(&self, _object: &crux::value::Value) -> Result<(), JsError> {
+        Ok(())
+    }
+
     /// The host's error-stack formatter, if it installed one
     /// (v8::Isolate::SetPrepareStackTraceCallback): the error and the frames its
     /// trace was captured from go in, and what `.stack` should read comes out.
@@ -198,6 +217,34 @@ pub fn promise_rejection_tracker(
 ) -> Result<(), JsError> {
     match &agent.host_hooks {
         Some(hooks) => hooks.promise_rejection_tracker(promise, reason, operation),
+        None => Ok(()),
+    }
+}
+
+/// HostCallJobCallback dispatch: the agent's hooks if they answer, else the
+/// engine's own call.
+pub fn call_job_callback(
+    agent: &mut crate::agent::Agent,
+    job_callback: &crate::job::JobCallback,
+    this_value: crux::value::Value,
+    arguments: &[crux::value::Value],
+) -> Result<crux::value::Value, JsError> {
+    if let Some(hooks) = &agent.host_hooks
+        && let Some(result) = hooks.call_job_callback(job_callback, this_value, arguments)
+    {
+        return result;
+    }
+    crate::job::host_call_job_callback_agent(agent, job_callback, this_value, arguments)
+}
+
+/// HostEnsureCanAddPrivateElement dispatch: the agent's hooks if present, else
+/// the default (permit).
+pub fn ensure_can_add_private_element(
+    agent: &crate::agent::Agent,
+    object: crux::value::Value,
+) -> Result<(), JsError> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.ensure_can_add_private_element(&object),
         None => Ok(()),
     }
 }
@@ -516,5 +563,62 @@ mod tests {
         );
         assert_eq!(seen[0].line, 1, "the frame sits on the line it threw from");
         assert!(seen[0].column > 0, "and at the site, not at column zero");
+    }
+
+    #[derive(Debug)]
+    struct TakesJobs;
+
+    impl HostHooks for TakesJobs {
+        fn call_job_callback(
+            &self,
+            _job_callback: &crate::job::JobCallback,
+            _this_value: crux::value::Value,
+            _arguments: &[crux::value::Value],
+        ) -> Option<Result<crux::value::Value, JsError>> {
+            Some(Ok(crux::Value::Number(7.0)))
+        }
+    }
+
+    #[test]
+    fn a_host_can_take_over_a_job_callback() {
+        let mut agent = Agent::new();
+        let callback = crate::job::host_make_job_callback(crux::Value::Undefined);
+        // Without a hook the engine's own call runs, and a non-callable fails.
+        assert!(call_job_callback(&mut agent, &callback, crux::Value::Undefined, &[]).is_err());
+
+        agent.host_hooks = Some(Box::new(TakesJobs));
+        let value = call_job_callback(&mut agent, &callback, crux::Value::Undefined, &[])
+            .expect("the host answered");
+        assert_eq!(value, crux::Value::Number(7.0));
+    }
+
+    #[derive(Debug)]
+    struct RefusesPrivateElements;
+
+    impl HostHooks for RefusesPrivateElements {
+        fn ensure_can_add_private_element(
+            &self,
+            _object: &crux::value::Value,
+        ) -> Result<(), JsError> {
+            Err(JsError::new(
+                crux::ErrorKind::TypeError,
+                "no private elements here".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_host_can_refuse_a_private_element() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().unwrap();
+        agent.host_hooks = Some(Box::new(RefusesPrivateElements));
+        let error = agent
+            .run_script("class A { #x = 1; } new A();")
+            .expect_err("the private element was added anyway");
+        assert!(
+            error.message.contains("no private elements here"),
+            "a different error: {}",
+            error.message
+        );
     }
 }

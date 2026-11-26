@@ -5144,6 +5144,7 @@ pub fn initialize_instance_elements(
         if !obj.is_extensible()? {
             return Err(private_add_extensible_error());
         }
+        crate::host::ensure_can_add_private_element(agent, Value::Object(obj))?;
         obj.private_element_add(method.clone())?;
     }
     // Decorator initializers registered by non-static method/get/set
@@ -5195,6 +5196,7 @@ pub fn initialize_instance_elements(
             if !obj.is_extensible()? {
                 return Err(private_add_extensible_error());
             }
+            crate::host::ensure_can_add_private_element(agent, Value::Object(obj))?;
             obj.private_element_add(crux::object::PrivateElement {
                 name_id,
                 kind: crux::object::PrivateElementKind::Field(value),

@@ -1232,6 +1232,11 @@ fn private_element_add(home: &Value, element: crux::object::PrivateElement) -> R
     let Some(obj) = home_object(home) else {
         return Ok(());
     };
+    // HostEnsureCanAddPrivateElement may refuse the element. Outside an agent
+    // window there is no host to ask, so the default permits.
+    if let Ok(agent) = crate::context::current_agent() {
+        crate::host::ensure_can_add_private_element(agent, *home)?;
+    }
     obj.private_element_add(element)
 }
 
