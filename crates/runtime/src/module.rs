@@ -377,11 +377,57 @@ pub fn parse_module(
         }
     };
     let records = collect_module_records(&code);
-    let module = Handle::new(SourceTextModule {
+    Ok(module_record(
         realm,
         code,
-        source: source.clone(),
-        name: name.cloned(),
+        records,
+        source.clone(),
+        name.cloned(),
+        kind,
+    ))
+}
+
+/// Install a JavaScript module the host already parsed, so a run costs no lexing
+/// or parsing. The AST is plain data (its text is owned `Arc<[u16]>`), which is
+/// what lets a compile pool parse on a worker and install here — the record, its
+/// handle, and its strings belong to the realm, so this half stays on the thread
+/// that owns the isolate.
+///
+/// A pre-parsed module is always a JavaScript module: the JSON, text, and bytes
+/// kinds are *synthesized* by the engine from an attribute-selected source, so
+/// there is no host-parsed AST for them.
+pub fn module_from_ast(
+    agent: &mut Agent,
+    name: Option<&JsString>,
+    source: &JsString,
+    code: Module,
+) -> Result<Handle<SourceTextModule>, JsError> {
+    let realm = agent.current_realm()?;
+    crate::expr::bump_template_parse_generation();
+    let records = collect_module_records(&code);
+    Ok(module_record(
+        realm,
+        code,
+        records,
+        source.clone(),
+        name.cloned(),
+        ModuleKind::Js,
+    ))
+}
+
+fn module_record(
+    realm: Handle<Realm>,
+    code: Module,
+    records: ModuleRecords,
+    source: JsString,
+    name: Option<JsString>,
+    kind: ModuleKind,
+) -> Handle<SourceTextModule> {
+    Handle::new(SourceTextModule {
+        realm,
+        code,
+        source,
+        name,
         kind,
         status: RefCell::new(ModuleStatus::Unlinked),
         environment: RefCell::new(None),
@@ -402,8 +448,7 @@ pub fn parse_module(
         async_parents: RefCell::new(Vec::new()),
         pending_async: RefCell::new(0),
         stalled_await: RefCell::new(None),
-    });
-    Ok(module)
+    })
 }
 
 /// A synthetic module's own aspect (spec 16.2.1.5.2 CreateSyntheticModule /
