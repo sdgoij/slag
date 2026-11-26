@@ -5,6 +5,8 @@
 //! parameterized grammar `[Yield, Await, Return, In]` is resolved at parse
 //! time; the tree below is parameter-free.
 
+use std::sync::Arc;
+
 use crux::{AtomId, BigInt, JsString, Span};
 
 /// A Script or Module: the body of statements plus the whole source span.
@@ -397,14 +399,23 @@ pub enum ImportPhase {
 
 /// Literal values (spec 13.2.4). Strings are cooked values; regexps carry the
 /// raw pattern and flags text.
+///
+/// Literal text is an `Arc<[u16]>`, not a `JsString`: a `JsString` is an
+/// `Rc`-backed heap handle, so an AST holding one is `!Send` and cannot cross a
+/// thread. Owning the text instead keeps the AST plain data *and* keeps the
+/// text's lifetime tied to the AST — a name or a literal interned into the
+/// process-wide atom table would outlive every realm that ever parsed it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
     Boolean(bool),
     Number(f64),
     BigInt(BigInt),
-    Str(JsString),
-    RegExp { pattern: JsString, flags: JsString },
+    Str(Arc<[u16]>),
+    RegExp {
+        pattern: Arc<[u16]>,
+        flags: Arc<[u16]>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,8 +642,10 @@ pub struct TemplateLiteral {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemplateElement {
-    pub cooked: Option<JsString>,
-    pub raw: JsString,
+    /// The cooked text, or `None` when the quasi holds an invalid escape
+    /// sequence (a tagged template's TV is then *undefined*).
+    pub cooked: Option<Arc<[u16]>>,
+    pub raw: Arc<[u16]>,
     pub span: Span,
 }
 
@@ -776,6 +789,10 @@ mod tests {
 
     fn id(name: &str) -> AtomId {
         crux::intern_utf8(name)
+    }
+
+    fn units_of(text: &str) -> Arc<[u16]> {
+        Arc::from(text.encode_utf16().collect::<Vec<u16>>())
     }
 
     fn ident_expr(name: &str) -> Expr {
@@ -932,17 +949,28 @@ mod tests {
     }
 
     #[test]
+    fn a_parsed_program_can_cross_a_thread() {
+        // Load-bearing: the AST must hold no GC or `Rc` handle, or a host cannot
+        // parse on a compile-pool worker and install the artifact on the thread
+        // that owns the isolate. Literal text is `Arc<[u16]>` for this reason —
+        // and, unlike an interned atom, it is released with the program.
+        fn assert_send<T: Send>() {}
+        assert_send::<Program>();
+        assert_send::<Stmt>();
+    }
+
+    #[test]
     fn template_literal_has_quasis_and_exprs() {
         let tpl = TemplateLiteral {
             quasis: vec![
                 TemplateElement {
-                    cooked: Some(JsString::from_utf8("a")),
-                    raw: JsString::from_utf8("a"),
+                    cooked: Some(units_of("a")),
+                    raw: units_of("a"),
                     span: span(),
                 },
                 TemplateElement {
-                    cooked: Some(JsString::from_utf8("c")),
-                    raw: JsString::from_utf8("c"),
+                    cooked: Some(units_of("c")),
+                    raw: units_of("c"),
                     span: span(),
                 },
             ],

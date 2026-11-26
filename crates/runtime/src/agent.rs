@@ -8,6 +8,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crux::error::{ErrorKind, JsError};
@@ -951,6 +952,14 @@ pub(crate) struct AgentRoots {
     /// object-literal key occurs once per evaluation, and the name is the same
     /// atom every time.
     pub(crate) atom_string_cells: Box<[crate::ir::AtomStringCell; crate::ir::ATOM_STRING_CELLS]>,
+    /// The boxed string for a literal's text (`Agent::literal_string_value`): a
+    /// literal evaluates to the same string every time, but its text is plain
+    /// data owned by the AST, so there is no atom to key a box by — the key is a
+    /// fingerprint of the text plus a content compare.
+    pub(crate) literal_string_cells: Box<[crate::expr::LiteralStringCell]>,
+    /// The unit count the literal-string cells currently hold, so an entry is
+    /// only cached while the cache's total stays within its budget.
+    pub(crate) literal_string_units: Cell<usize>,
     /// The leaf-inline cache (Cut 34): function id → the record data
     /// `do_call_fast` needs (compiled ir, strictness, closure env), so a hot
     /// leaf call skips the `ecma_functions` table lookup. Boxed per the
@@ -1456,6 +1465,11 @@ impl AgentRoots {
             type_strings: RefCell::new(std::array::from_fn(|_| None)),
             empty_string: std::cell::Cell::new(None),
             atom_string_cells: Box::new(std::array::from_fn(|_| std::cell::Cell::new(None))),
+            literal_string_cells: (0..crate::expr::LITERAL_STRING_CELLS)
+                .map(|_| std::cell::RefCell::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            literal_string_units: Cell::new(0),
             array_element_value_cells: Box::new(std::array::from_fn(|_| Cell::new(None))),
             global_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
             slot_leaf_cells: RefCell::new(Box::new(std::array::from_fn(|_| None))),
@@ -1682,6 +1696,11 @@ impl Trace for AgentRoots {
         }
         for cell in self.atom_string_cells.iter() {
             if let Some((_, value)) = cell.get() {
+                value.trace(visit);
+            }
+        }
+        for cell in self.literal_string_cells.iter() {
+            if let Some((_, _, value)) = cell.borrow().as_ref() {
                 value.trace(visit);
             }
         }
@@ -3804,6 +3823,39 @@ impl Agent {
         }
         let value = Value::String(Handle::new(crux::lookup(atom)));
         cell.set(Some((atom, value)));
+        value
+    }
+
+    /// The boxed value for a string literal's text, cached for the agent.
+    ///
+    /// The text lives in the AST as `Arc<[u16]>` — plain data released with the
+    /// program — not in the atom table, which a long-lived process would
+    /// accumulate forever. The `Arc` also lets the box *share* the text instead
+    /// of copying it, so the only thing a run adds is one GC box.
+    ///
+    /// The probe is a length-independent fingerprint then the `Arc` pointer; the
+    /// cell holds a clone, so a matching pointer cannot be a reused address and
+    /// the content need not be compared. Retention is bounded by a byte budget:
+    /// text that would overflow it is boxed per evaluation (still sharing the
+    /// text, so that path is cheap too).
+    pub(crate) fn literal_string_value(&self, units: &Arc<[u16]>) -> Value {
+        let fingerprint = crate::expr::literal_fingerprint(units);
+        let index = (fingerprint as usize) & (crate::expr::LITERAL_STRING_CELLS - 1);
+        let cell = &self.roots.literal_string_cells[index];
+        if let Some((cached, key, value)) = cell.borrow().as_ref()
+            && *cached == fingerprint
+            && key.as_ptr() == units.as_ptr()
+        {
+            return *value;
+        }
+        let value = Value::String(Handle::new(JsString::from_arc(units.clone())));
+        let held = self.roots.literal_string_units.get();
+        let replaced = cell.borrow().as_ref().map_or(0, |(_, key, _)| key.len());
+        let after = held.saturating_sub(replaced) + units.len();
+        if after * 2 <= crate::expr::LITERAL_CACHE_BUDGET_BYTES {
+            *cell.borrow_mut() = Some((fingerprint, units.clone(), value));
+            self.roots.literal_string_units.set(after);
+        }
         value
     }
 

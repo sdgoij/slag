@@ -181,10 +181,10 @@ pub fn script_is_strict(source: &JsString, program: &Program) -> bool {
         let StmtKind::Expr(expr) = &stmt.kind else {
             return false;
         };
-        let syntax::ast::ExprKind::Literal(syntax::ast::Literal::Str(value)) = &expr.kind else {
+        let syntax::ast::ExprKind::Literal(syntax::ast::Literal::Str(units)) = &expr.kind else {
             return false;
         };
-        if value.to_string_lossy() != "use strict" {
+        if !crate::function::is_use_strict(units) {
             continue;
         }
         let units = source.as_slice();
@@ -194,7 +194,7 @@ pub fn script_is_strict(source: &JsString, program: &Program) -> bool {
         } else {
             return true;
         };
-        if inner == "use strict".encode_utf16().collect::<Vec<u16>>().as_slice() {
+        if crate::function::is_use_strict(inner) {
             return true;
         }
     }

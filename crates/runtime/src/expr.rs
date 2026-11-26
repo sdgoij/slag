@@ -7,6 +7,8 @@
 //! Function/class/arrow expressions, destructuring, and `yield`/`await`
 //! join with Phase 7.
 
+use std::sync::Arc;
+
 use crux::bigint;
 use crux::convert::{ToPrimitiveHint, to_boolean, to_number, to_numeric, to_string};
 use crux::error::{ErrorKind, JsError};
@@ -598,14 +600,58 @@ pub(crate) fn eval_assignment_target(
     Ok(LazyReference::Reference(reference))
 }
 
+/// The literal-string cache's size, and the total text it may hold.
+///
+/// The cells keep a boxed `JsString` for a literal's text, so retention must be
+/// bounded for a long-lived process: 128 slots over a 256 KiB budget means a
+/// program's literals are cached while their total stays under that, and a
+/// literal that would overflow the budget is boxed per evaluation instead (it is
+/// usually evaluated once, so the miss costs nothing). The budget is what keeps
+/// one huge literal from either thrashing the table or being retained forever.
+pub(crate) const LITERAL_STRING_CELLS: usize = 128;
+pub(crate) const LITERAL_CACHE_BUDGET_BYTES: usize = 256 * 1024;
+
+/// One cell of the literal-string cache: the text's fingerprint, the text itself
+/// (the key, and what keeps its pointer unique), and the boxed value it was
+/// filled with.
+///
+/// The key is the `Arc`'s pointer, checked after the fingerprint: while the cell
+/// holds a clone, no other allocation can reuse that address, so a pointer match
+/// proves the same (immutable) text without comparing it — which matters because
+/// a content compare would be proportional to the literal's size, and a large
+/// literal is exactly the kind a repeated evaluation must not re-scan.
+pub(crate) type LiteralStringCell = std::cell::RefCell<Option<(u64, Arc<[u16]>, Value)>>;
+
+/// A length-independent fingerprint of a literal's text: the length and the
+/// first and last two units, avalanched. The cached box is content-compared on a
+/// match, so a collision costs a re-box, never a wrong string.
+pub(crate) fn literal_fingerprint(units: &[u16]) -> u64 {
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+    let head = units.first().copied().unwrap_or(0) as u64
+        | (units.get(1).copied().unwrap_or(0) as u64) << 16;
+    let tail = units.last().copied().unwrap_or(0) as u64
+        | (units.get(units.len().wrapping_sub(2)).copied().unwrap_or(0) as u64) << 16;
+    let mut hash = (units.len() as u64)
+        .wrapping_mul(SEED)
+        .wrapping_add(head.rotate_left(17))
+        .wrapping_add(tail.rotate_left(41));
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(SEED);
+    hash ^ (hash >> 32)
+}
+
 fn eval_literal(agent: &mut Agent, literal: &Literal) -> Result<Value, JsError> {
     match literal {
         Literal::Null => Ok(Value::Null),
         Literal::Boolean(b) => Ok(Value::Boolean(*b)),
         Literal::Number(n) => Ok(Value::Number(*n)),
         Literal::BigInt(n) => Ok(Value::BigInt(Handle::new(n.clone()))),
-        Literal::Str(s) => Ok(Value::String(Handle::new(s.clone()))),
-        Literal::RegExp { pattern, flags } => eval_regexp_literal(agent, pattern, flags),
+        Literal::Str(units) => Ok(agent.literal_string_value(units)),
+        Literal::RegExp { pattern, flags } => eval_regexp_literal(
+            agent,
+            &JsString::from_utf16(pattern),
+            &JsString::from_utf16(flags),
+        ),
     }
 }
 
@@ -2020,11 +2066,9 @@ fn eval_template(
 ) -> Result<Value, JsError> {
     let mut text = String::new();
     for (index, quasi) in template.quasis.iter().enumerate() {
-        let cooked = quasi
-            .cooked
-            .clone()
-            .unwrap_or_else(|| JsString::from_utf8(""));
-        text.push_str(&cooked.to_string_lossy());
+        if let Some(cooked) = &quasi.cooked {
+            text.push_str(&String::from_utf16_lossy(cooked));
+        }
         if let Some(expr) = template.exprs.get(index) {
             let value = eval_expr(agent, expr, strict)?;
             text.push_str(&crate::context::to_string(agent, &value)?.to_string_lossy());
@@ -2100,8 +2144,8 @@ pub(crate) fn get_template_object(
         let key = &index.to_string();
         // A quasi whose TV is undefined (an invalid escape sequence)
         // yields the value *undefined*, not a string (spec 12.2.9.3).
-        let cooked = match quasi.cooked.clone() {
-            Some(cooked) => Value::String(Handle::new(cooked)),
+        let cooked = match &quasi.cooked {
+            Some(units) => agent.literal_string_value(units),
             None => Value::Undefined,
         };
         obj.define_property_key(
@@ -2118,7 +2162,7 @@ pub(crate) fn get_template_object(
         raw.define_property_key(
             &PropertyKey::from_utf8(key),
             &PropertyDescriptor {
-                value: Some(Value::String(Handle::new(quasi.raw.clone()))),
+                value: Some(agent.literal_string_value(&quasi.raw)),
                 writable: Some(false),
                 get: None,
                 set: None,

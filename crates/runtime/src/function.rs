@@ -2663,14 +2663,31 @@ fn body_is_strict(agent: &Agent, body: &Block, span_source: Option<&JsString>) -
         let StmtKind::Expr(expr) = &stmt.kind else {
             return false;
         };
-        let ExprKind::Literal(Literal::Str(value)) = &expr.kind else {
+        let ExprKind::Literal(Literal::Str(units)) = &expr.kind else {
             return false;
         };
-        if directive_is_use_strict(agent, expr, value, span_source) {
+        if directive_is_use_strict(agent, expr, units, span_source) {
             return true;
         }
     }
     false
+}
+
+/// Whether a directive-prologue literal's cooked text is exactly `use strict`.
+pub(crate) fn is_use_strict(units: &[u16]) -> bool {
+    const USE_STRICT: [u16; 10] = [
+        b'u' as u16,
+        b's' as u16,
+        b'e' as u16,
+        b' ' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'r' as u16,
+        b'i' as u16,
+        b'c' as u16,
+        b't' as u16,
+    ];
+    units == &USE_STRICT[..]
 }
 
 /// Whether a directive-prologue literal is a genuine `"use strict"`
@@ -2682,10 +2699,10 @@ fn body_is_strict(agent: &Agent, body: &Block, span_source: Option<&JsString>) -
 fn directive_is_use_strict(
     agent: &Agent,
     expr: &Expr,
-    cooked: &JsString,
+    cooked: &[u16],
     span_source: Option<&JsString>,
 ) -> bool {
-    if cooked.to_string_lossy() != "use strict" {
+    if !is_use_strict(cooked) {
         return false;
     }
     let Some(source) = span_source
@@ -2709,8 +2726,7 @@ fn directive_is_use_strict(
     if span_units.len() < 2 {
         return true;
     }
-    &span_units[1..span_units.len() - 1]
-        == "use strict".encode_utf16().collect::<Vec<u16>>().as_slice()
+    is_use_strict(&span_units[1..span_units.len() - 1])
 }
 
 /// InstantiateOrdinaryFunctionExpression (spec 15.2.5): a named function

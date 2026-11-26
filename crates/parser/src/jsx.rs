@@ -25,7 +25,9 @@
 //! name characters when they abut the preceding identifier (no whitespace),
 //! matching the JSX grammar.
 
-use crux::{AtomId, JsError, JsString, Span, intern_utf8};
+use std::sync::Arc;
+
+use crux::{AtomId, JsError, Span, intern_utf8};
 use syntax::{
     Argument, ArrayElement, ArrayLiteral, CallExpr, Expr, ExprKind, LexGoal, Literal, MemberExpr,
     MemberProperty, ObjectLiteral, ObjectProperty, PropertyName, TokenKind,
@@ -211,7 +213,7 @@ fn parse_attributes(parser: &mut Parser<'_>) -> Result<(Vec<ObjectProperty>, boo
                 };
                 Expr {
                     span: tok.span,
-                    kind: ExprKind::Literal(Literal::Str(value)),
+                    kind: ExprKind::Literal(Literal::Str(Arc::from(value.as_slice()))),
                 }
             } else if parser.at_punct(TokenKind::LeftBrace)? {
                 parser.next()?; // `{`
@@ -278,7 +280,7 @@ fn parse_children(
                 if !cleaned.is_empty() {
                     out.push(Expr {
                         span: Span::new(pos as u32, end as u32),
-                        kind: ExprKind::Literal(Literal::Str(JsString::from_utf16(&cleaned))),
+                        kind: ExprKind::Literal(Literal::Str(Arc::from(&cleaned[..]))),
                     });
                 }
                 let kind = tail[end - pos];
@@ -431,7 +433,7 @@ fn element_tag(name: &JsxName, start: u32, end: u32) -> Expr {
     }
     Expr {
         span: Span::new(start, end),
-        kind: ExprKind::Literal(Literal::Str(JsString::from_utf16(&name.text))),
+        kind: ExprKind::Literal(Literal::Str(Arc::from(&name.text[..]))),
     }
 }
 

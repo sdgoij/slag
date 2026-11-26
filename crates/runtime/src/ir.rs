@@ -22515,13 +22515,15 @@ impl Compiler {
             syntax::ast::Literal::BigInt(value) => {
                 self.emit(Step::Push(Value::BigInt(Handle::new(value.clone()))));
             }
-            syntax::ast::Literal::Str(value) => {
-                self.emit(Step::Push(Value::String(Handle::new(value.clone()))));
+            syntax::ast::Literal::Str(units) => {
+                self.emit(Step::Push(Value::String(Handle::new(
+                    JsString::from_utf16(units),
+                ))));
             }
             syntax::ast::Literal::RegExp { pattern, flags } => {
                 self.emit(Step::RegExpLiteral {
-                    pattern: pattern.clone(),
-                    flags: flags.clone(),
+                    pattern: JsString::from_utf16(pattern),
+                    flags: JsString::from_utf16(flags),
                 });
             }
         }
@@ -24551,12 +24553,8 @@ impl Compiler {
             template
                 .quasis
                 .get(index)
-                .map(|quasi| {
-                    quasi
-                        .cooked
-                        .clone()
-                        .unwrap_or_else(|| JsString::from_utf8(""))
-                })
+                .and_then(|quasi| quasi.cooked.as_deref())
+                .map(JsString::from_utf16)
                 .unwrap_or_else(|| JsString::from_utf8(""))
         };
         if template.exprs.is_empty() {

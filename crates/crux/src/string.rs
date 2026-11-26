@@ -225,6 +225,20 @@ impl JsString {
         JsString::Flat(units.into())
     }
 
+    /// A string over units the caller already holds as an `Arc<[u16]>`.
+    ///
+    /// The `Flat` form is exactly that `Arc`, so a large text is *shared* rather
+    /// than copied — which is what lets an AST that stores literal text as
+    /// `Arc<[u16]>` hand it to the GC heap without duplicating it. A text short
+    /// enough for the inline form still copies, because that form is cheaper than
+    /// the `Arc` it would otherwise share.
+    pub fn from_arc(units: Arc<[u16]>) -> Self {
+        if units.len() <= SMALL_STRING_CAP {
+            return Self::from_utf16(&units);
+        }
+        JsString::Flat(units)
+    }
+
     pub fn from_utf8(text: &str) -> Self {
         // Cut 67's Small form exists so tiny strings avoid a heap buffer, but
         // this constructor still built a `Vec<u16>` FIRST (a malloc/free per

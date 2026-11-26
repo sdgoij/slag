@@ -1,6 +1,8 @@
 //! Expression parsing: the full precedence chain, cover grammar, arrows,
 //! templates, and destructuring targets (spec ch. 13).
 
+use std::sync::Arc;
+
 use crux::{AtomId, JsError, Span, intern, intern_utf8};
 use syntax::keywords::{Keyword, from_identifier, is_future_reserved_word};
 use syntax::{
@@ -964,7 +966,7 @@ fn member_property_from_index(index: Expr) -> MemberProperty {
         ExprKind::Literal(Literal::Str(text)) => text,
         _ => return MemberProperty::Computed(Box::new(index)),
     };
-    let atom = intern(text.as_slice());
+    let atom = intern(text);
     if atom == intern_utf8("length") {
         return MemberProperty::Computed(Box::new(index));
     }
@@ -1386,7 +1388,7 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             parser.next()?;
             Ok(Expr {
                 span: tok.span,
-                kind: ExprKind::Literal(Literal::Str(value)),
+                kind: ExprKind::Literal(Literal::Str(Arc::from(value.as_slice()))),
             })
         }
         TokenKind::RegExpLiteral { pattern, flags } => {
@@ -1400,7 +1402,10 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
             parser.next()?;
             Ok(Expr {
                 span: tok.span,
-                kind: ExprKind::Literal(Literal::RegExp { pattern, flags }),
+                kind: ExprKind::Literal(Literal::RegExp {
+                    pattern: Arc::from(pattern.as_slice()),
+                    flags: Arc::from(flags.as_slice()),
+                }),
             })
         }
         TokenKind::NoSubstitutionTemplate { cooked, raw } => {
@@ -1414,8 +1419,8 @@ fn parse_primary(parser: &mut Parser) -> Result<Expr, JsError> {
                 ));
             }
             let element = TemplateElement {
-                cooked,
-                raw,
+                cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                raw: Arc::from(raw.as_slice()),
                 span: tok.span,
             };
             Ok(Expr {
@@ -1511,8 +1516,8 @@ fn parse_template_rest(
         ));
     }
     let mut quasis = vec![TemplateElement {
-        cooked: head_cooked,
-        raw: head_raw,
+        cooked: head_cooked.map(|text| Arc::from(text.as_slice())),
+        raw: Arc::from(head_raw.as_slice()),
         span: head_span,
     }];
     let mut exprs = Vec::new();
@@ -1529,8 +1534,8 @@ fn parse_template_rest(
                     ));
                 }
                 quasis.push(TemplateElement {
-                    cooked,
-                    raw,
+                    cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                    raw: Arc::from(raw.as_slice()),
                     span: tail.span,
                 });
             }
@@ -1542,8 +1547,8 @@ fn parse_template_rest(
                     ));
                 }
                 quasis.push(TemplateElement {
-                    cooked,
-                    raw,
+                    cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                    raw: Arc::from(raw.as_slice()),
                     span: tail.span,
                 });
                 break;
@@ -1577,8 +1582,8 @@ fn parse_tagged_template(parser: &mut Parser, tag: Expr) -> Result<Expr, JsError
             parser.next()?;
             let quasi = TemplateLiteral {
                 quasis: vec![TemplateElement {
-                    cooked,
-                    raw,
+                    cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                    raw: Arc::from(raw.as_slice()),
                     span: tok.span,
                 }],
                 exprs: Vec::new(),
@@ -1595,8 +1600,8 @@ fn parse_tagged_template(parser: &mut Parser, tag: Expr) -> Result<Expr, JsError
         TokenKind::TemplateHead { cooked, raw } => {
             parser.next()?;
             let mut quasis = vec![TemplateElement {
-                cooked,
-                raw,
+                cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                raw: Arc::from(raw.as_slice()),
                 span: tok.span,
             }];
             let mut exprs = Vec::new();
@@ -1607,15 +1612,15 @@ fn parse_tagged_template(parser: &mut Parser, tag: Expr) -> Result<Expr, JsError
                 match tail.kind {
                     TokenKind::TemplateMiddle { cooked, raw } => {
                         quasis.push(TemplateElement {
-                            cooked,
-                            raw,
+                            cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                            raw: Arc::from(raw.as_slice()),
                             span: tail.span,
                         });
                     }
                     TokenKind::TemplateTail { cooked, raw } => {
                         quasis.push(TemplateElement {
-                            cooked,
-                            raw,
+                            cooked: cooked.map(|text| Arc::from(text.as_slice())),
+                            raw: Arc::from(raw.as_slice()),
                             span: tail.span,
                         });
                         break;
