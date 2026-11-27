@@ -54,6 +54,14 @@ jobs:
         run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The facade's two skins (`ng`, `bellard`) are mutually-exclusive features
+      # no workspace member enables, so the `--workspace` run above compiles
+      # neither: a `HostHooks` impl left behind by a signature change went red
+      # only on the quickjs-artifacts job. Lint each skin on its own.
+      - name: Clippy the QuickJS facade skins
+        run: |
+          cargo clippy --locked -p quickjs --features ng --all-targets -- -D warnings
+          cargo clippy --locked -p quickjs --features bellard --all-targets -- -D warnings
       - name: Clippy the fuzz targets
         run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
@@ -97,6 +105,15 @@ jobs:
         run: cargo test --locked -p runtime --no-default-features --lib
       - name: Check the interpreter-only binary
         run: cargo check --locked -p cli --no-default-features --features jit
+      # The facade's two skins are features no workspace member enables, so the
+      # workspace run above builds neither and their C compat suites (`ng`:
+      # 43 fixtures, `bellard`: 6) never execute. The two are mutually
+      # exclusive (`quickjs` rejects both at once), so each skin gets its own
+      # run.
+      - name: Test the QuickJS facade skins
+        run: |
+          cargo test --locked -p quickjs --features ng
+          cargo test --locked -p quickjs --features bellard
 
   # The quickjs facade ships two mutually-exclusive C skins (`ng`, `bellard`),
   # each producing the same `libquickjs` artifact. Build both and separate the

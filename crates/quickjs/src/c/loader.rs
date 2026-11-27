@@ -128,9 +128,13 @@ impl runtime::host::HostHooks for FacadeHooks {
         referrer_name: Option<&JsString>,
         _phase: runtime::api::ModuleImportPhase,
         attributes: &[(JsString, JsString)],
-    ) -> Option<Result<CruxValue, JsError>> {
+    ) -> Option<runtime::host::DynamicImportAnswer> {
+        // The facade owns the import's promise and settles it from
+        // `JS_FinishDynamicImport`, so it answers `Handled` with that promise
+        // rather than keeping the engine's capability pending.
         self.state
             .import_dynamic(specifier, referrer_name, attributes)
+            .map(runtime::host::DynamicImportAnswer::Handled)
     }
 }
 
@@ -165,11 +169,10 @@ impl LoaderState {
             let attributes = attributes_to_jsvalue(attributes);
             // SAFETY: `ctx` names a live context; `c_name` is NUL-terminated.
             unsafe { loader2(ctx, c_name.as_ptr(), opaque, attributes) }
-        } else if let Some(loader) = loader {
+        } else {
+            let loader = loader?;
             // SAFETY: `ctx` names a live context; `c_name` is NUL-terminated.
             unsafe { loader(ctx, c_name.as_ptr(), opaque) }
-        } else {
-            return None;
         };
 
         Some(resolve_module_def(ctx, module_def, &name))

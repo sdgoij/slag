@@ -36,10 +36,13 @@ fmt-check:
     cargo fmt --all -- --check
     cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
-# Clippy for the workspace and, separately, for the fuzz workspace.
+# Clippy for the workspace, the fuzz workspace, and the facade's two skins (the
+# skins are features no workspace member enables, so `--workspace` skips them).
 clippy:
     cargo clippy --locked --workspace --all-targets -- -D warnings
     cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+    cargo clippy --locked -p quickjs --features ng --all-targets -- -D warnings
+    cargo clippy --locked -p quickjs --features bellard --all-targets -- -D warnings
 
 # Licence, advisory, yanked-crate and source policy, from deny.toml.
 deny:
@@ -61,6 +64,12 @@ test *args:
 test-wasm-free:
     cargo test --locked -p runtime --no-default-features --lib
     cargo check --locked -p cli --no-default-features --features jit
+
+# The facade's two skins, which `--workspace` never enables. They are mutually
+# exclusive, so each one gets its own run.
+test-quickjs:
+    cargo test --locked -p quickjs --features ng
+    cargo test --locked -p quickjs --features bellard
 
 # Release binaries through the tree-keyed cache: `just build -p cli --debug`.
 build *args:

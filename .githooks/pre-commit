@@ -37,6 +37,12 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 echo "pre-commit: clippy --locked fuzz targets"
 cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
+# The facade's skins are features no workspace member enables, so the
+# `--workspace` run above compiles neither of them either.
+echo "pre-commit: clippy the quickjs facade skins"
+cargo clippy --locked -p quickjs --features ng --all-targets -- -D warnings
+cargo clippy --locked -p quickjs --features bellard --all-targets -- -D warnings
+
 # The dependency policy needs a tool cargo does not ship. Skipping it with a
 # warning keeps a fresh clone committable; CI runs it either way.
 if command -v cargo-deny >/dev/null 2>&1; then
