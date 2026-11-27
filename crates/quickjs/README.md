@@ -82,6 +82,6 @@ cargo test  -p quickjs
 cargo test  -p quickjs --features ng
 cargo test  -p quickjs --features bellard
 cargo clippy -p quickjs --all-targets -- -D warnings          # per feature set
-bash tools/check-quickjs-headers.sh     # vendored-header drift
-bash tools/check-quickjs-surface.sh     # C symbol surface ledger
+cargo run -p xtask -- quickjs check-headers                   # vendored-header drift
+cargo run -p xtask -- quickjs check-surface                   # C symbol surface ledger
 ```
