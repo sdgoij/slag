@@ -20,6 +20,25 @@ static void gc_finalizer(JSRuntime *rt, JSValueConst val) {
     gc_count++;
 }
 
+// The collector's conservative scan reads the words of `[sp, high)`, so a word
+// naming the object that survives in a dead callee's frame keeps it alive for
+// that collection and the finalizer never fires. Scrubbing that window is what
+// makes the assertions below mean "unreachable", rather than "unreachable for a
+// collection called from this depth"; the engine's own Rust tests scrub the same
+// window for the same reason (`.notes/host-object-gc.md` §5 measures the trap).
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void scrub_stack(int depth) {
+    volatile unsigned char sink[16384];
+    for (size_t i = 0; i < sizeof(sink); i++)
+        sink[i] = 0xAA;
+    if (depth > 0)
+        scrub_stack(depth - 1);
+}
+
 static void register_gc_class(JSRuntime *rt) {
     gc_id = 0;
     JS_NewClassID(rt, &gc_id);
@@ -130,6 +149,7 @@ static void test_gc_lifetime(void) {
         assert(gc_count == 0);
 
         JS_FreeValue(ctx, obj);
+        scrub_stack(16);
         JS_RunGC(rt);
         JS_Eval(ctx, "1", 1, "test.js", 0);
         assert(gc_count == 1);
@@ -147,6 +167,7 @@ static void test_gc_lifetime(void) {
         JSValue obj = JS_NewObjectClass(ctx, gc_id);
         gc_count = 0;
         JS_FreeValue(ctx, obj);
+        scrub_stack(16);
 
         JS_RunGC(rt);
         JS_Eval(ctx, "1", 1, "test.js", 0);

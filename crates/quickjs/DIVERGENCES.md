@@ -26,6 +26,14 @@ collection and then `run_finalizers`); a following entry such as `JS_Eval`
 also drains them. An embedder must not rely on the finalizer running during
 the `JS_FreeValue` call that drops the last reference.
 
+A collection is not by itself proof that the object was unreachable. Slag's
+collector scans the native stack conservatively, so a word naming the object
+that survives in a dead callee's frame keeps it alive for that collection and
+its finalizer runs on a later one; QuickJS's refcounting frees at the
+`JS_FreeValue` instead. A host that needs a deterministic sweep — a test, most
+likely — writes over the stack region before collecting, which is what
+`c/tests/ng/gc.c` does.
+
 ## `gc_mark` is never called
 
 `JSClassDef.gc_mark` is accepted but never invoked. The facade keeps host-held
