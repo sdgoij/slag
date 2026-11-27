@@ -4310,8 +4310,9 @@ impl JsObject {
 
     /// ValidateAndApplyPropertyDescriptor with the object's [[Extensible]]
     /// (spec 10.1.6.4): the full decision table including data↔accessor
-    /// conversions.
-    fn ordinary_define_own_property(
+    /// conversions. No class dispatch; a host class that defers to the ordinary
+    /// method, and the embedding ABI's ordinary define, call this.
+    pub fn ordinary_define_own_property(
         &self,
         key: &PropertyKey,
         desc: &PropertyDescriptor,
