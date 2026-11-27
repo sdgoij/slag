@@ -21,6 +21,7 @@ use std::process::{Command, ExitCode, Output, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod quickjs;
+mod unicode_tables;
 
 /// The packages this task knows, in the order the key records them.
 const KNOWN_PACKAGES: [&str; 3] = ["cli", "test262", "wasmtest"];
@@ -59,9 +60,12 @@ const USAGE: &str = "\
 usage: cargo run -p xtask -- <task> [options]
 
 tasks:
-  build        cached release binaries: slag, leak, sweep, wasmtest
-  quickjs      the QuickJS C facade: build, link-test, check-headers,
-               check-surface (`cargo run -p xtask -- quickjs --help`)
+  build          cached release binaries: slag, leak, sweep, wasmtest
+  quickjs        the QuickJS C facade: build, link-test, check-headers,
+                 check-surface (`cargo run -p xtask -- quickjs --help`)
+  unicode-tables regenerate crates/unicode/src/derived_regexp_tables.rs
+                 from the pinned test262 submodule (dev-only; the table is
+                 checked in, so a normal build never needs test262)
 
 usage: cargo run -p xtask -- build [options]
 
@@ -208,9 +212,10 @@ fn run(arguments: &[String]) -> Result<(), Error> {
     match arguments.first().map(String::as_str) {
         Some("build") => build(&arguments[1..]),
         Some("quickjs") => quickjs::run(&arguments[1..]),
+        Some("unicode-tables") => unicode_tables::run(&arguments[1..]),
         Some("-h" | "--help") | None => Err(Error::Help),
         Some(other) => Err(Error::Usage(format!(
-            "unknown task {other:?}; the tasks are `build` and `quickjs`"
+            "unknown task {other:?}; the tasks are `build`, `quickjs` and `unicode-tables`"
         ))),
     }
 }
@@ -515,25 +520,12 @@ fn compute_key(root: &Path, profile: &str) -> Result<(String, String), Error> {
     let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
     rustflags.push_str(&env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default());
 
-    let mut submodule = "absent".to_owned();
-    let test262 = root.join("test262");
-    if test262.join(".git").exists() {
-        let head =
-            git_text(&test262, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
-        let status = Command::new("git")
-            .current_dir(&test262)
-            .args(["--no-optional-locks", "status", "--porcelain"])
-            .stdin(Stdio::null())
-            .output();
-        let changes = match status {
-            Ok(output) => hash_stdin(root, &output.stdout)?,
-            Err(_) => hash_stdin(root, b"")?,
-        };
-        submodule = format!("{head} {changes}");
-    }
-
+    // The test262 submodule is deliberately absent from the key: the
+    // property-escape table it feeds is checked in, so no compiled binary
+    // depends on the corpus anymore, and a submodule bump should not
+    // invalidate every cached build.
     let input = format!(
-        "{rustc_info}\nprofile={profile}\npackages={}\nroot={}\nrustflags={rustflags}\nrustc={}\ntarget={}\ntest262={submodule}\n",
+        "{rustc_info}\nprofile={profile}\npackages={}\nroot={}\nrustflags={rustflags}\nrustc={}\ntarget={}\n",
         KNOWN_PACKAGES.join(" "),
         root.display(),
         env::var("RUSTC").unwrap_or_default(),

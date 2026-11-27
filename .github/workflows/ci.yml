@@ -38,12 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      # The pinned submodules are build inputs, not just test data: the
-      # `unicode` build script derives the RegExp property-escape tables from
-      # the test262 corpus at compile time.
+      # The `unicode` property-escape table is checked in
+      # (`cargo run -p xtask -- unicode-tables` regenerates it from the test262
+      # fixtures), so linting needs no submodules.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          submodules: recursive
       # `rust-toolchain.toml` pins the channel and the clippy/rustfmt
       # components; `rustup show` materialises it and logs what was used.
       - name: Install the pinned toolchain
@@ -110,8 +108,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
@@ -370,12 +366,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      # The pinned test262 submodule is a build input, not just test data: the
-      # `unicode` build script derives its tables from the fixtures at compile
-      # time.
+      # The `unicode` property-escape table is checked in, so building the demo
+      # needs no submodules.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
       - name: Add the wasm target
@@ -427,9 +420,8 @@ jobs:
   # the `deno_v8` facade pulls to `crates/v8`, and builds `-p deno`; the archives
   # it produces are attached to the release by `release` below.
   #
-  # It needs the test262 submodule (`unicode`'s build script derives its tables
-  # at compile time), its release tree runs to several GB, and two of Deno's
-  # dependencies build through native tools the Windows build never needs —
+  # Its release tree runs to several GB, and two of Deno's dependencies build
+  # through native tools the Windows build never needs —
   # `libsqlite3-sys` runs bindgen (libclang) and `libz-sys` builds zlib-ng
   # through cmake — so space is reclaimed and those tools installed first.
   deno:
@@ -460,8 +452,6 @@ jobs:
       DENO_NO_UPDATE_CHECK: "1"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          submodules: recursive
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -571,8 +561,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          submodules: recursive
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -678,8 +666,6 @@ jobs:
             ext: tar.gz
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          submodules: recursive
       - name: Install the pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2

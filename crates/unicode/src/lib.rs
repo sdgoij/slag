@@ -9,9 +9,8 @@
 use unicode_normalization::UnicodeNormalization;
 
 #[allow(clippy::unreadable_literal)]
-mod derived_regexp_tables {
-    include!(concat!(env!("OUT_DIR"), "/derived_regexp_tables.rs"));
-}
+#[rustfmt::skip]
+mod derived_regexp_tables;
 pub mod tz;
 // The generated IANA tzdata table carries its own compact layout; rustfmt
 // must never reflow the 180k-line file.

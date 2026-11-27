@@ -1,50 +1,55 @@
-//! Generate `derived_regexp_tables.rs` from the pinned test262 submodule.
+//! Regenerate `crates/unicode/src/derived_regexp_tables.rs` from the pinned
+//! test262 submodule.
+//!
+//! The generated table is checked in, so a normal build never needs test262.
+//! This task is the only thing that does, and it is dev-only: run it after
+//! bumping the test262 submodule, then commit the regenerated file.
 //!
 //! The RegExp property-escapes fixtures encode the exact code point set of
 //! every binary property / general-category value / script the corpus tests
 //! (`buildString({ loneCodePoints: [...], ranges: [[a, b], ...] })`), and the
 //! `strings/` fixtures encode the property-of-strings sets (`matchStrings`).
-//! The fixtures are pinned with the test262 submodule, so generating the
-//! tables from them at compile time means they can never drift from the
-//! corpus. The submodule must be checked out; the build fails with
-//! instructions otherwise, because these tables are load-bearing (grapheme
-//! segmentation and `\p{...}` lookups read them).
+//! Deriving the table from the same fixtures the sweep runs means it can never
+//! drift from the corpus.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Relative to `CARGO_MANIFEST_DIR` (the crate root).
-const FIXTURES_REL: &str = "../../test262/test/built-ins/RegExp/property-escapes/generated";
+use crate::{Error, workspace_root};
 
-fn main() {
-    if let Err(msg) = run() {
-        eprintln!("error: {msg}");
-        std::process::exit(1);
+/// Relative to the repository root.
+const FIXTURES_REL: &str = "test262/test/built-ins/RegExp/property-escapes/generated";
+const OUTPUT_REL: &str = "crates/unicode/src/derived_regexp_tables.rs";
+
+pub(crate) fn run(arguments: &[String]) -> Result<(), Error> {
+    match arguments.first().map(String::as_str) {
+        None => regenerate(),
+        Some("-h" | "--help") => Err(Error::Help),
+        Some(other) => Err(Error::Usage(format!(
+            "unicode-tables takes no arguments, got {other:?}"
+        ))),
     }
 }
 
-fn run() -> Result<(), String> {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
-    let fixtures = manifest.join(FIXTURES_REL);
+fn regenerate() -> Result<(), Error> {
+    let root = workspace_root()?;
+    let fixtures = root.join(FIXTURES_REL);
     let strings = fixtures.join("strings");
 
     if !fixtures.is_dir() || !strings.is_dir() {
-        return Err(format!(
-            "the test262 submodule is not checked out; crates/unicode needs the pinned \
-             RegExp property-escapes fixtures to generate its `\\p{{...}}` tables\n\
+        return Err(Error::Step(format!(
+            "the test262 submodule is not checked out; regenerating the RegExp \
+             property-escape tables needs its fixtures\n\
              expected: {}\n\
-             fix: run `git submodule update --init test262` from the repository root, then rebuild",
+             fix: run `git submodule update --init test262` from the repository root",
             fixtures.display()
-        ));
+        )));
     }
-    println!("cargo:rerun-if-changed={}", fixtures.display());
-    println!("cargo:rerun-if-changed={}", strings.display());
 
     let mut props: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
     for path in js_files(&fixtures)? {
-        let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let src = fs::read_to_string(&path)?;
         let (lone, ranges) = parse_build_string(&src);
         if lone.is_empty() && ranges.is_empty() {
             continue;
@@ -54,23 +59,28 @@ fn run() -> Result<(), String> {
 
     let mut string_sets: BTreeMap<String, Vec<Vec<u32>>> = BTreeMap::new();
     for path in js_files(&strings)? {
-        let src = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let src = fs::read_to_string(&path)?;
         let seqs = parse_match_strings(&src);
         if !seqs.is_empty() {
             string_sets.insert(validated_stem(&path)?, seqs);
         }
     }
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").map_err(|e| e.to_string())?);
-    let out_path = out_dir.join("derived_regexp_tables.rs");
-    fs::write(&out_path, render(&props, &string_sets)).map_err(|e| e.to_string())?;
+    let out_path = root.join(OUTPUT_REL);
+    fs::write(&out_path, render(&props, &string_sets))?;
+    println!(
+        "wrote {} ({} properties, {} string sets)",
+        out_path.display(),
+        props.len(),
+        string_sets.len()
+    );
     Ok(())
 }
 
-fn js_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn js_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "js") {
             out.push(path);
         }
@@ -82,8 +92,8 @@ fn js_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// The fixture's name, validated as safe to splice into a Rust identifier,
 /// a string literal, and a doc comment. The fixtures come from the test262
 /// submodule, so a compromised fixture name must not become generated code.
-fn validated_stem(path: &Path) -> Result<String, String> {
-    let name = file_stem(path);
+fn validated_stem(path: &Path) -> Result<String, Error> {
+    let name = file_stem(path)?;
     let mut chars = name.chars();
     let starts_ok = chars
         .next()
@@ -92,16 +102,18 @@ fn validated_stem(path: &Path) -> Result<String, String> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if !starts_ok || !rest_ok {
-        return Err(format!("fixture name {name:?} is not a safe Rust name"));
+        return Err(Error::Step(format!(
+            "fixture name {name:?} is not a safe Rust name"
+        )));
     }
     Ok(name)
 }
 
-fn file_stem(path: &Path) -> String {
+fn file_stem(path: &Path) -> Result<String, Error> {
     path.file_stem()
         .and_then(|s| s.to_str())
-        .expect("fixture file names are ASCII")
-        .to_string()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Step(format!("fixture file name {path:?} is not valid UTF-8")))
 }
 
 /// Union lone code points and ranges into sorted, coalesced ranges (adjacent
@@ -138,6 +150,9 @@ fn bracket_body<'a>(src: &'a str, needle: &str, open: u8, close: u8) -> Option<&
                 depth += 1;
             }
             b if b == close => {
+                if depth == 0 {
+                    return None;
+                }
                 depth -= 1;
                 if depth == 0 {
                     return Some(&rest[start + 1..i]);
@@ -291,7 +306,7 @@ fn render(
     strings: &BTreeMap<String, Vec<Vec<u32>>>,
 ) -> String {
     let mut lines: Vec<String> = vec![
-        "// Generated by crates/unicode/build.rs from the pinned".into(),
+        "// Generated by `cargo run -p xtask -- unicode-tables` from the pinned".into(),
         "// test262 fixtures (Unicode v17). Do not edit by hand.".into(),
         "//".into(),
         "// The code point set of each `\\p{...}` escape the fixtures test,".into(),

@@ -41,10 +41,10 @@ direction.
 
 The key is `tree hash + config hash`, where the config hashes `rustc -vV`, the
 profile name, the checkout path (binaries embed it in source paths and debug
-info), `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`, `RUSTC`,
-`CARGO_BUILD_TARGET`, and the test262 submodule's HEAD plus a hash of its
-`status --porcelain` (the `unicode` build script reads its fixtures, and
-`git add -A` records only a gitlink for it).
+info), `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`, `RUSTC`, and
+`CARGO_BUILD_TARGET`. The test262 submodule is not part of the key: the
+`unicode` property-escape table it feeds is checked in, so no compiled binary
+depends on the corpus.
 
 Entry: `target/build-cache/<tree:16>-<config:8>/`, override with
 `SLAG_BUILD_CACHE`. `meta.txt` records the full tree and config hashes, the HEAD

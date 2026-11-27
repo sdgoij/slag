@@ -4,9 +4,9 @@
 //! maximize/minimize outputs (e.g. `constructor-non-iana-canon.js` pins the
 //! language aliases, `likely-subtags.js` pins the CLDR 44 likely-subtags
 //! behavior). These tables are the exact entries the corpus exercises —
-//! the fixtures ARE the data spec (the same pattern as
-//! `crates/unicode/build.rs` deriving the `\p{...}` tables from the
-//! pinned fixtures at build time).
+//! the fixtures ARE the data spec (the same pattern as the `\p{...}`
+//! property-escape tables derived from the pinned fixtures by
+//! `cargo run -p xtask -- unicode-tables`).
 
 /// CLDR languageAlias entries the corpus pins (supplementalMetadata.xml):
 /// `(from_type, to_replacement)`. The `from` type uses the underscore-joined

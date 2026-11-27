@@ -72,18 +72,20 @@ embedding API, and drop-in JavaScriptCore C-API bindings.
 Run it in the browser: the [live demo](https://sdgoij.github.io/slag/)
 compiles the same engine to WebAssembly.
 
-Requires a stable Rust toolchain (edition 2024) and the pinned `test262`
-submodule — the `unicode` build script derives the RegExp property-escape
-tables from the corpus fixtures at compile time and fails with
-instructions if the submodule is missing.
+Requires a stable Rust toolchain (edition 2024). The engine builds without
+any submodule checked out; the pinned `test262` corpus is needed only to run
+the conformance sweep. The RegExp property-escape tables are checked in
+(`crates/unicode/src/derived_regexp_tables.rs`) and regenerated from the
+fixtures with `cargo run -p xtask -- unicode-tables`.
 
 ```sh
-git submodule update --init          # the pinned test262 corpus
 cargo run -p xtask -- build         # cached release build: slag, sweep, wasmtest
 cargo build --release               # or a plain, uncached cargo build
 target/release/slag --version
 target/release/slag script.js [args...]   # run a script
 target/release/slag                       # REPL
+
+git submodule update --init test262       # optional: the conformance corpus
 ```
 
 `cargo run -p xtask -- build` keys a cache under `target/build-cache` on the
@@ -282,8 +284,9 @@ its `LICENSE` and `NOTICE`, to a release.
 
 The pinned `test262` submodule is the regression net: the sweep runner
 (`cargo run --release -p test262 --bin sweep`) runs any area in parallel,
-timeout-guarded batches, and the `unicode` build script derives the
-property-escape tables from the same fixtures. CI sweeps all four areas on
+timeout-guarded batches, and the `unicode` property-escape tables are
+generated from the same fixtures (`cargo run -p xtask -- unicode-tables`; the
+result is checked in). CI sweeps all four areas on
 Linux and Windows and fails on a `fail`, `crash` **or** `hang` — at a 30s
 batch deadline with a 60s per-fixture recheck rather than the 15s local
 methodology, since the runner VMs are slower than the machine below and the
