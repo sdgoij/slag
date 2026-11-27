@@ -2769,6 +2769,13 @@ impl JsObject {
         }
     }
 
+    /// OrdinaryGetPrototypeOf (spec 10.1.2.1): the prototype the shape records,
+    /// with no class dispatch. A host class that defers to the ordinary method
+    /// calls this.
+    pub fn ordinary_get_prototype_of(&self) -> Result<Option<Handle<JsObject>>, JsError> {
+        Ok(self.prototype.get())
+    }
+
     /// OrdinarySetPrototypeOf (spec 10.1.2.2): no cycles, and no prototype
     /// change once non-extensible.
     pub fn set_prototype_of(&self, proto: Option<Handle<JsObject>>) -> Result<bool, JsError> {
@@ -2825,6 +2832,20 @@ impl JsObject {
         bump_epoch();
         self.bump_generation();
         Ok(true)
+    }
+
+    /// Sets the [[Prototype]] the shape records without running
+    /// [[SetPrototypeOf]] (a built-in installing a prototype before exposure).
+    /// No cycle or extensibility check; the caller owns that contract. Marking
+    /// and cache invalidation match [`set_prototype_of`]'s tail.
+    pub fn set_prototype(&self, prototype: Option<Handle<JsObject>>) {
+        mark_prototype(prototype.as_ref());
+        if let Some(prototype) = prototype {
+            crate::heap::write_barrier_handle(self, prototype);
+        }
+        self.prototype.set(prototype);
+        bump_epoch();
+        self.bump_generation();
     }
 
     /// Mark this object as an immutable prototype exotic object (spec
@@ -6482,6 +6503,27 @@ mod tests {
         for id in 0..32 {
             assert_ne!(identity_hash(id), identity_hash(id + 1));
         }
+    }
+
+    #[test]
+    fn set_prototype_and_ordinary_get_prototype_of_round_trip_the_shape() {
+        let prototype = JsObject::ordinary_object_create(None);
+        let object = JsObject::ordinary_object_create(None);
+        assert!(
+            object.ordinary_get_prototype_of().unwrap().is_none(),
+            "a fresh object has no prototype"
+        );
+        object.set_prototype(Some(prototype));
+        let current = object
+            .ordinary_get_prototype_of()
+            .unwrap()
+            .expect("a prototype");
+        assert!(Handle::ptr_eq(current, prototype));
+        object.set_prototype(None);
+        assert!(
+            object.ordinary_get_prototype_of().unwrap().is_none(),
+            "a direct set did not clear the prototype"
+        );
     }
 
     #[test]
