@@ -855,9 +855,35 @@ pub(crate) fn construct_handler_for(name: &str) -> Option<crate::function::Built
     }
 }
 
-/// Object.prototype.hasOwnProperty (spec 20.1.3.4): [[HasOwnProperty]] on
-/// the ToObject'd receiver, with the deferred-namespace and live-binding
-/// handling for module namespace objects.
+/// HasOwnProperty(O, P) (spec 7.3.13) with the deferred-namespace, function
+/// prototype, and module-namespace live-binding handling. `pub` so the
+/// embedding ABI reuses the same path as `Object.prototype.hasOwnProperty`.
+pub fn has_own_property(
+    agent: &mut Agent,
+    object: &Handle<JsObject>,
+    key: &PropertyKey,
+) -> Result<bool, JsError> {
+    // A deferred namespace evaluates on a non-symbol-like own-key check
+    // (import-defer).
+    crate::module::ensure_deferred_namespace_evaluation_key(agent, object, key)?;
+    // A function's pending `prototype` is an own property.
+    crate::function::maybe_materialize_deferred_own(agent, object, key)?;
+    if matches!(object.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
+        // [[GetOwnProperty]] reads the live binding: an uninitialized export
+        // throws a ReferenceError (spec 9.4.6.4 step 4).
+        return match object.get_own_property_key(key)? {
+            Some(property) => {
+                namespace_live_descriptor(agent, object, key, &property)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        };
+    }
+    object.has_own_property_key(key)
+}
+
+/// Object.prototype.hasOwnProperty (spec 20.1.3.4): HasOwnProperty on the
+/// ToObject'd receiver.
 fn prototype_has_own_property(
     agent: &mut Agent,
     this: &Value,
@@ -867,24 +893,7 @@ fn prototype_has_own_property(
     let object = to_object(agent, this)?;
     let obj = as_object(&object)
         .ok_or_else(|| JsError::new(ErrorKind::TypeError, "value is not an object".into()))?;
-    // A deferred namespace's [[HasProperty]] triggers its module's
-    // evaluation for non-symbol-like keys (import-defer).
-    crate::module::ensure_deferred_namespace_evaluation_key(agent, &obj, &key)?;
-    crate::function::maybe_materialize_deferred_own(agent, &obj, &key)?;
-    let present = if matches!(obj.kind, crux::object::ObjectKind::ModuleNamespace(_)) {
-        // [[HasProperty]] reads the descriptor, whose value comes
-        // from the live binding: an uninitialized export throws a
-        // ReferenceError (spec 9.4.6.4 step 4).
-        match obj.get_own_property_key(&key)? {
-            Some(prop) => {
-                namespace_live_descriptor(agent, &obj, &key, &prop)?;
-                true
-            }
-            None => false,
-        }
-    } else {
-        obj.has_own_property_key(&key)?
-    };
+    let present = has_own_property(agent, &obj, &key)?;
     Ok(Value::Boolean(present))
 }
 
@@ -1730,6 +1739,26 @@ mod tests {
 
     fn str(value: &str) -> Value {
         Value::String(Handle::new(JsString::from_utf8(value)))
+    }
+
+    /// `has_own_property` (the shared HasOwnProperty path the embedding ABI
+    /// reuses) sees own but not inherited keys, a function's pending
+    /// `prototype`, and a proxy's `getOwnPropertyDescriptor` trap.
+    #[test]
+    fn has_own_property_matches_the_own_key_rules() {
+        let observed = run("function f() {}\
+             var proto = { inherited: 1 };\
+             var o = Object.create(proto); o.own = 2;\
+             var proxy = new Proxy({}, { getOwnPropertyDescriptor: function (t, k) {\
+                 return k === 'ghost' ? { value: 1, configurable: true } : undefined; } });\
+             JSON.stringify([\
+               Object.prototype.hasOwnProperty.call(o, 'own'),\
+               Object.prototype.hasOwnProperty.call(o, 'inherited'),\
+               Object.prototype.hasOwnProperty.call(f, 'prototype'),\
+               Object.prototype.hasOwnProperty.call(proxy, 'ghost'),\
+               Object.prototype.hasOwnProperty.call(proxy, 'missing')])")
+        .unwrap();
+        assert_eq!(observed, str("[true,false,true,true,false]"));
     }
 
     /// `Object.keys` serves a plain object's keys from a generation-checked
