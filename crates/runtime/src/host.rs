@@ -192,13 +192,18 @@ pub trait HostHooks: std::fmt::Debug {
     /// it belongs to; the host sets on it what its own `import.meta` should
     /// carry (`deno_core`'s callback puts `url`, `main` and `resolve` there).
     ///
+    /// Both arguments are the embed types, so a host fills the object with
+    /// [`crate::embed::JsObject::set`] (and [`crate::embed::JsModule::as_api_module`]
+    /// for the V8-shaped handle) rather than having to reach an unexported
+    /// property setter on a raw value.
+    ///
     /// Called once per module record, on the first read of `import.meta` in it.
     /// The default does nothing, so a host that installed no callback leaves the
     /// empty object the engine made.
     fn initialize_import_meta_object(
         &self,
-        _module: &crate::api::Module,
-        _meta: &crux::value::Value,
+        _module: &crate::embed::JsModule,
+        _meta: &crate::embed::JsObject,
     ) -> Result<(), JsError> {
         Ok(())
     }
@@ -428,8 +433,8 @@ pub fn allow_wasm_code_generation(
 /// sees.
 pub fn initialize_import_meta_object(
     agent: &crate::agent::Agent,
-    module: &crate::api::Module,
-    meta: &crux::value::Value,
+    module: &crate::embed::JsModule,
+    meta: &crate::embed::JsObject,
 ) -> Result<(), JsError> {
     match &agent.host_hooks {
         Some(hooks) => hooks.initialize_import_meta_object(module, meta),

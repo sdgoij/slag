@@ -3772,7 +3772,8 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
     if let Some(meta) = *module.import_meta.borrow() {
         return Ok(meta);
     }
-    let meta = Value::Object(JsObject::ordinary_object_create(proto));
+    let object = JsObject::ordinary_object_create(proto);
+    let meta = Value::Object(object);
     // The host fills the object before it is cached, once per module record
     // (spec 16.2.1.8's HostInitializeImportMetaObject, which V8 spells
     // `SetHostInitializeImportMetaObjectCallback`): `deno_core`'s callback is
@@ -3780,8 +3781,8 @@ pub fn import_meta(agent: &mut Agent) -> Result<Value, JsError> {
     // none leaves what the engine made.
     crate::host::initialize_import_meta_object(
         agent,
-        &crate::api::Module::from_handle(module),
-        &meta,
+        &crate::embed::JsModule::new(module),
+        &crate::embed::JsObject::from(object),
     )?;
     crux::heap::write_barrier(&*module, meta);
     module.import_meta.replace(Some(meta));
@@ -4248,29 +4249,19 @@ mod tests {
     impl crate::host::HostHooks for FillsImportMeta {
         fn initialize_import_meta_object(
             &self,
-            module: &crate::api::Module,
-            meta: &Value,
+            module: &crate::embed::JsModule,
+            meta: &crate::embed::JsObject,
         ) -> Result<(), JsError> {
             IMPORT_META_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             IMPORT_META_MODULE.store(
-                crux::handle::Handle::as_ptr(module.handle()) as u64,
+                crux::handle::Handle::as_ptr(module.as_api_module().handle()) as u64,
                 std::sync::atomic::Ordering::SeqCst,
             );
-            let object = crate::context::as_object(meta).ok_or_else(|| {
-                JsError::new(ErrorKind::TypeError, "import.meta is not an object".into())
-            })?;
-            object.define_property(
-                &JsString::from_utf8("url"),
-                &crux::property::PropertyDescriptor {
-                    value: Some(Value::String(Handle::new(JsString::from_utf8(
-                        "file:///filled-by-the-host.js",
-                    )))),
-                    writable: Some(true),
-                    enumerable: Some(true),
-                    configurable: Some(true),
-                    get: None,
-                    set: None,
-                },
+            // The embed type is settable directly: no unexported property setter
+            // on a raw value is needed to fill `import.meta`.
+            meta.set(
+                "url",
+                crate::embed::JsValue::string("file:///filled-by-the-host.js"),
             )?;
             Ok(())
         }

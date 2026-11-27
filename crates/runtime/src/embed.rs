@@ -2213,6 +2213,32 @@ impl Context {
         Ok(JsModule::new(module))
     }
 
+    /// Register `bytes` as the module a resolution of `specifier` finds, with
+    /// `kind` selecting how the engine reads them. This is the supported form of
+    /// `Agent::add_module`: a host that loads modules from its own store
+    /// registers them here, then lets the engine resolve, parse, and cache them
+    /// (see [`crate::host::HostHooks::resolve_imported_specifier`] for mapping a
+    /// specifier to this key).
+    ///
+    /// A request that carries import attributes still selects its own kind
+    /// (`with { type: "json" }`); `kind` is the fallback for a request with
+    /// none.
+    pub fn add_module_source(&mut self, specifier: &str, bytes: &[u8], kind: ModuleSourceKind) {
+        let kind = match kind {
+            ModuleSourceKind::Js => crate::module::ModuleKind::Js,
+            ModuleSourceKind::Json => crate::module::ModuleKind::Json,
+            ModuleSourceKind::Text => crate::module::ModuleKind::Text,
+            ModuleSourceKind::Bytes => crate::module::ModuleKind::Bytes,
+        };
+        self.agent.roots.host_modules.borrow_mut().insert(
+            JsString::from_utf8(specifier),
+            crate::module::HostModuleSource {
+                bytes: bytes.to_vec(),
+                kind,
+            },
+        );
+    }
+
     /// Name `module` for later resolutions of `specifier`, which is what
     /// `Module::InstantiateModule`'s host callback does with what it returns.
     pub fn register_module(&mut self, specifier: &str, module: &JsModule) -> Result<(), JsError> {
@@ -4145,6 +4171,20 @@ pub struct TemplateInstance {
     pub allow_construction: bool,
 }
 
+/// How [`Context::add_module_source`] reads the bytes it is given, which is how
+/// the engine will later parse the module a specifier resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleSourceKind {
+    /// JavaScript source, parsed as a module.
+    Js,
+    /// JSON, exposed as `export default <value>` after the source is validated.
+    Json,
+    /// UTF-8 text, exposed as `export default "<text>"`.
+    Text,
+    /// Raw bytes, exposed as an immutable `Uint8Array` default export.
+    Bytes,
+}
+
 /// A module record (`v8::Module`). The record is not a language value, so this
 /// box holds a pin: a host handle over the record has nothing else rooting it.
 pub struct JsModule {
@@ -4153,11 +4193,29 @@ pub struct JsModule {
 }
 
 impl JsModule {
-    fn new(module: Handle<SourceTextModule>) -> Self {
+    pub(crate) fn new(module: Handle<SourceTextModule>) -> Self {
         Self {
             _pin: crux::heap::pin_handle(module),
             module,
         }
+    }
+
+    /// This module as the V8-shaped [`api::Module`](crate::api::Module) handle,
+    /// which is the type a [`HostHooks`](crate::host::HostHooks) callback hands
+    /// back.
+    pub fn as_api_module(&self) -> crate::api::Module {
+        crate::api::Module::from_handle(self.module)
+    }
+
+    /// The modules in this module's graph still suspended on a top-level await
+    /// that will not settle (`Module::GetStalledTopLevelAwaitMessage`'s
+    /// question, without the message). A host reports these before exiting to
+    /// explain why a program is still pending.
+    pub fn stalled_top_level_await_modules(&self) -> Vec<JsModule> {
+        crate::module::stalled_top_level_await_modules(&self.module)
+            .into_iter()
+            .map(JsModule::new)
+            .collect()
     }
 
     /// Whether this is a source text module (`Module::IsSourceTextModule`).
@@ -4819,6 +4877,63 @@ mod tests {
         context.set_global("ns", namespace).unwrap();
         assert_eq!(context.eval("ns.doubled").unwrap().as_number(), Some(84.0));
         assert!(main.identity_hash() != 0);
+    }
+
+    #[test]
+    fn add_module_source_registers_a_module_the_engine_resolves() {
+        let mut context = Context::new().unwrap();
+        context.add_module_source("greeting", b"hello", ModuleSourceKind::Text);
+        context.add_module_source("data", br#"{"n": 7}"#, ModuleSourceKind::Json);
+        let main = context
+            .compile_module(
+                "main",
+                Some("main.js"),
+                "import greeting from 'greeting';\n\
+                 import data from 'data';\n\
+                 export const text = greeting;\n\
+                 export const n = data.n;",
+            )
+            .unwrap();
+        context.instantiate_module(&main).unwrap();
+        context.evaluate_module(&main).unwrap();
+        let namespace = context
+            .module_namespace(&main, ModuleNamespacePhase::Evaluation)
+            .unwrap();
+        context.set_global("ns", namespace).unwrap();
+        assert_eq!(
+            context.eval("ns.text").unwrap().as_string().as_deref(),
+            Some("hello"),
+            "the text module's default export is the registered bytes"
+        );
+        assert_eq!(
+            context.eval("ns.n").unwrap().as_number(),
+            Some(7.0),
+            "the json module's default export is the parsed value"
+        );
+    }
+
+    #[test]
+    fn a_modules_stalled_top_level_await_is_reported() {
+        let mut context = Context::new().unwrap();
+        let done = context
+            .compile_module("done", Some("done.js"), "export const x = 1;")
+            .unwrap();
+        context.instantiate_module(&done).unwrap();
+        context.evaluate_module(&done).unwrap();
+        assert!(done.stalled_top_level_await_modules().is_empty());
+
+        let waiting = context
+            .compile_module(
+                "waiting",
+                Some("waiting.js"),
+                "await new Promise(() => {});",
+            )
+            .unwrap();
+        context.instantiate_module(&waiting).unwrap();
+        context.evaluate_module(&waiting).unwrap();
+        let stalled = waiting.stalled_top_level_await_modules();
+        assert_eq!(stalled.len(), 1);
+        assert!(stalled[0].as_api_module() == waiting.as_api_module());
     }
 
     #[test]

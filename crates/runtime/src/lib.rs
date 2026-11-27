@@ -48,7 +48,7 @@ pub mod workers;
 
 pub use agent::{Agent, evaluate};
 pub use context::{ExecutionContext, Reference, ReferenceBase};
-pub use embed::{Context, HostCallbacks, JsObject, JsValue};
+pub use embed::{Context, HostCallbacks, JsModule, JsObject, JsValue, ModuleSourceKind};
 pub use env::{EnvRecord, EnvRef};
 pub use host::HostHooks;
 pub use realm::{Intrinsics, Realm};

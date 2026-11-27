@@ -2065,8 +2065,8 @@ impl runtime::HostHooks for BridgeHooks {
 
     fn initialize_import_meta_object(
         &self,
-        module: &api::Module,
-        meta: &crux::value::Value,
+        module: &runtime::embed::JsModule,
+        meta: &runtime::embed::JsObject,
     ) -> Result<(), crux::error::JsError> {
         let Some(engine) = api::Isolate::get_current() else {
             return Ok(());
@@ -2091,7 +2091,7 @@ impl runtime::HostHooks for BridgeHooks {
         // crate we stand in for invokes this callback; the callback itself is
         // handed the context handle rather than a scope.
         crate::callback_scope!(unsafe _scope, context_local);
-        let meta = Local::<Value>::from_engine(api::Local::from(*meta));
+        let meta = Local::<Value>::from_engine(api::Local::from(meta.as_value().into_value()));
         let Ok(meta) = Local::<Object>::try_from(meta) else {
             // The engine makes this object itself, so anything else is a bridge
             // bug and saying so beats handing the host something it cannot use.
@@ -2104,7 +2104,13 @@ impl runtime::HostHooks for BridgeHooks {
         // the crate we stand in for declares it `unsafe extern "C"` because it
         // receives handles rather than because it may do anything the host's own
         // code could not.
-        unsafe { callback(context_local, Local::from_module(*module), meta) };
+        unsafe {
+            callback(
+                context_local,
+                Local::from_module(module.as_api_module()),
+                meta,
+            )
+        };
         Ok(())
     }
 
