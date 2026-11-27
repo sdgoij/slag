@@ -14,6 +14,7 @@
 //! ```
 
 pub use crux::error::{ErrorKind, JsError};
+pub use crux::string::JsString;
 pub use runtime::HostHooks;
 pub use runtime::dump;
 pub use runtime::embed::{
@@ -60,6 +61,17 @@ pub use runtime::jit::{JitStats, jit_stats};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The types a host must name to call the embed API or implement a hook are
+    /// reachable from this crate alone: `JsString` appears in the module and hook
+    /// signatures, and `ModuleSourceKind` is an argument to
+    /// `Context::add_module_source`.
+    #[test]
+    fn the_public_signatures_types_are_reachable_from_the_facade() {
+        let specifier: JsString = JsString::from_utf8("m.js");
+        assert_eq!(specifier.to_string_lossy(), "m.js");
+        assert_eq!(ModuleSourceKind::Js, ModuleSourceKind::Js);
+    }
 
     #[test]
     fn eval_works_through_the_facade() {
