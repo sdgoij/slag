@@ -232,6 +232,29 @@ pub trait HostHooks: std::fmt::Debug {
         None
     }
 
+    /// HostResolveImportedModule's name resolution (spec 16.6.1.1.2 step 1): the
+    /// key `specifier`, written in `referrer`, names in this host's module
+    /// registry, or `None` for "resolve nothing, use the specifier as written".
+    ///
+    /// `referrer` is the name the engine has for the importing module — the name
+    /// a host gave the module it compiled, or the key a host-registered source
+    /// was parsed under. It is `None` only for a module the engine has no name
+    /// for (one compiled without one, or the top-level entry).
+    ///
+    /// This maps names only: it cannot fail and cannot synthesize a module. The
+    /// engine looks the answer up in the agent's registered sources (the tests
+    /// and CLI register them with `Agent::add_module`) and the realm's cache,
+    /// so a host that hands the engine a directory tree registers the tree under
+    /// the keys this answers. A host that supplies the module record itself
+    /// installs [`HostHooks::resolve_imported_module`] instead.
+    fn resolve_imported_specifier(
+        &self,
+        _specifier: &JsString,
+        _referrer: Option<&JsString>,
+    ) -> Option<JsString> {
+        None
+    }
+
     /// HostResolveImportedModule (spec 16.2.1.6.1.2.1 step 8): resolve a static
     /// import's specifier through the host's own loader. `Some(Ok(module))`
     /// names the resolved module; `Some(Err(e))` is a resolution failure;
@@ -426,6 +449,20 @@ pub fn import_module_dynamically(
 ) -> Option<DynamicImportAnswer> {
     match &agent.host_hooks {
         Some(hooks) => hooks.import_module_dynamically(specifier, referrer_name, phase, attributes),
+        None => None,
+    }
+}
+
+/// The static-import name-resolution dispatch (see
+/// [`HostHooks::resolve_imported_specifier`]): the agent's hooks if they map
+/// names, else `None` — the specifier is the key.
+pub fn resolve_imported_specifier(
+    agent: &crate::agent::Agent,
+    specifier: &JsString,
+    referrer: Option<&JsString>,
+) -> Option<JsString> {
+    match &agent.host_hooks {
+        Some(hooks) => hooks.resolve_imported_specifier(specifier, referrer),
         None => None,
     }
 }

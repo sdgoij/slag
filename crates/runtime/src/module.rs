@@ -768,13 +768,25 @@ pub(crate) fn module_source_object(
 /// HostResolveImportedModule (spec 16.6.1.1.2): the agent's registered module
 /// map, cached in the realm's [[LoadedModules]]. `attributes` are the import
 /// attributes of the requesting import (they select the module kind).
+///
+/// `referrer` is the name of the module the import is written in, which a host
+/// resolver ([`crate::host::HostHooks::resolve_imported_specifier`]) maps the
+/// specifier against to get the key the registry and the cache use. A host that
+/// installed no resolver — or answered `None` — keeps the specifier as the key.
 pub fn host_resolve_imported_module(
     agent: &mut Agent,
     specifier: &JsString,
+    referrer: Option<&JsString>,
     attributes: &[(AttributeKey, JsString)],
 ) -> Result<Handle<SourceTextModule>, JsError> {
     let realm = agent.current_realm()?;
-    if let Some(module) = realm.loaded_modules.borrow().get(specifier) {
+    // Name resolution (HostResolveImportedModule step 1) happens before the
+    // cache, the host loader, and the registry: every lookup below uses the key
+    // the resolver answered. A module a host also registered under the raw
+    // specifier is only reachable when the resolver declines.
+    let resolved = crate::host::resolve_imported_specifier(agent, specifier, referrer);
+    let key = resolved.as_ref().unwrap_or(specifier);
+    if let Some(module) = realm.loaded_modules.borrow().get(key) {
         return Ok(*module);
     }
     // A host loader (HostResolveImportedModule) wins over the engine's own
@@ -783,37 +795,36 @@ pub fn host_resolve_imported_module(
         .iter()
         .map(|(key, value)| (JsString::from_utf8(&key_string(key)), value.clone()))
         .collect();
-    if let Some(resolved) = crate::host::resolve_imported_module(agent, specifier, &attributes_view)
-    {
-        let module = resolved?;
+    if let Some(loaded) = crate::host::resolve_imported_module(agent, key, &attributes_view) {
+        let module = loaded?;
         let handle = module.handle();
         crux::heap::write_barrier_handle(&*realm, handle);
         realm
             .loaded_modules
             .borrow_mut()
-            .insert(specifier.clone(), handle);
+            .insert(key.clone(), handle);
         return Ok(handle);
     }
     let source = agent
         .roots
         .host_modules
         .borrow()
-        .get(specifier)
+        .get(key)
         .cloned()
         .ok_or_else(|| {
             JsError::new(
                 ErrorKind::TypeError,
-                format!("Cannot find module {}", specifier.to_string_lossy()),
+                format!("Cannot find module {}", key.to_string_lossy()),
             )
         })?;
     let text = String::from_utf8_lossy(&source.bytes).into_owned();
     let source_text = JsString::from_utf8(&text);
-    let module = parse_module(agent, specifier, Some(specifier), &source_text, attributes)?;
+    let module = parse_module(agent, key, Some(key), &source_text, attributes)?;
     crux::heap::write_barrier_handle(&*realm, module);
     realm
         .loaded_modules
         .borrow_mut()
-        .insert(specifier.clone(), module);
+        .insert(key.clone(), module);
     Ok(module)
 }
 
@@ -1143,8 +1154,12 @@ pub fn module_declaration_instantiation(
     let requested = module.requested_modules.clone();
     let mut resolved: Vec<Handle<SourceTextModule>> = Vec::with_capacity(requested.len());
     for request in &requested {
-        let imported =
-            host_resolve_imported_module(agent, &request.specifier, &request.attributes)?;
+        let imported = host_resolve_imported_module(
+            agent,
+            &request.specifier,
+            module.name.as_ref(),
+            &request.attributes,
+        )?;
         resolved.push(imported);
     }
     for imported in &resolved {
@@ -1157,7 +1172,7 @@ pub fn module_declaration_instantiation(
     // (lazily evaluated on access).
     let imports = module.import_entries.clone();
     for (specifier, entry, phase) in imports {
-        let imported = host_resolve_imported_module(agent, &specifier, &[])?;
+        let imported = host_resolve_imported_module(agent, &specifier, module.name.as_ref(), &[])?;
         module_declaration_instantiation(agent, &imported)?;
         match phase {
             ImportPhase::Source => {
@@ -1283,7 +1298,8 @@ pub fn module_declaration_instantiation(
         if let Some(module_request) = &export.module_request {
             // `export * as ns from ...`: bind the imported module's namespace
             // (spec 16.2.2.4 step 28) at instantiation time.
-            let imported = host_resolve_imported_module(agent, module_request, &[])?;
+            let imported =
+                host_resolve_imported_module(agent, module_request, module.name.as_ref(), &[])?;
             module_declaration_instantiation(agent, &imported)?;
             let namespace = module_namespace(agent, &imported)?;
             let name = export_name_string(export.export_name.as_ref())?;
@@ -1310,7 +1326,7 @@ pub fn module_declaration_instantiation(
         let specifier = export.module_request.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "indirect export has no module".into())
         })?;
-        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+        let imported = host_resolve_imported_module(agent, specifier, module.name.as_ref(), &[])?;
         module_declaration_instantiation(agent, &imported)?;
         // A namespace re-export (`import * as ns; export { ns }`) has no
         // import name: the binding is the imported module's namespace.
@@ -1702,7 +1718,8 @@ pub fn module_evaluation(
         for request in dependencies {
             let specifier = request.specifier;
             let phase = request.phase;
-            let imported = host_resolve_imported_module(agent, &specifier, &[])?;
+            let imported =
+                host_resolve_imported_module(agent, &specifier, module.name.as_ref(), &[])?;
             if phase == ImportPhase::Defer {
                 let async_deps =
                     gather_async_transitive_dependencies(agent, &imported, &mut Vec::new())?;
@@ -2723,7 +2740,8 @@ fn module_sync_ready(
     }
     let requested = module.requested_modules.clone();
     for request in &requested {
-        let imported = host_resolve_imported_module(agent, &request.specifier, &[])?;
+        let imported =
+            host_resolve_imported_module(agent, &request.specifier, module.name.as_ref(), &[])?;
         if !module_sync_ready(agent, &imported, seen)? {
             return Ok(false);
         }
@@ -3199,7 +3217,8 @@ fn gather_async_transitive_dependencies(
     }
     let requested = module.requested_modules.clone();
     for request in &requested {
-        let imported = host_resolve_imported_module(agent, &request.specifier, &[])?;
+        let imported =
+            host_resolve_imported_module(agent, &request.specifier, module.name.as_ref(), &[])?;
         let additional = gather_async_transitive_dependencies(agent, &imported, seen)?;
         for m in additional {
             if !result.iter().any(|existing| Handle::ptr_eq(*existing, m)) {
@@ -3246,7 +3265,7 @@ fn collect_exported_names(
         let specifier = export.module_request.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "star export has no module".into())
         })?;
-        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+        let imported = host_resolve_imported_module(agent, specifier, module.name.as_ref(), &[])?;
         collect_exported_names(agent, &imported, stack, out)?;
     }
     stack.pop();
@@ -3333,7 +3352,8 @@ fn resolve_export(
             let specifier = export.module_request.as_ref().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "local export has no module".into())
             })?;
-            let imported = host_resolve_imported_module(agent, specifier, &[])?;
+            let imported =
+                host_resolve_imported_module(agent, specifier, module.name.as_ref(), &[])?;
             return Ok(Some(ResolvedBinding::Namespace(imported)));
         }
     }
@@ -3346,7 +3366,8 @@ fn resolve_export(
             let specifier = export.module_request.as_ref().ok_or_else(|| {
                 JsError::new(ErrorKind::TypeError, "indirect export has no module".into())
             })?;
-            let imported = host_resolve_imported_module(agent, specifier, &[])?;
+            let imported =
+                host_resolve_imported_module(agent, specifier, module.name.as_ref(), &[])?;
             // An `import * as ns; export { ns }` re-export has no import name:
             // the binding is the imported module's namespace itself (spec
             // 16.2.1.7.1 step 10.1.ii.2.b).
@@ -3377,7 +3398,7 @@ fn resolve_export(
         let specifier = export.module_request.as_ref().ok_or_else(|| {
             JsError::new(ErrorKind::TypeError, "star export has no module".into())
         })?;
-        let imported = host_resolve_imported_module(agent, specifier, &[])?;
+        let imported = host_resolve_imported_module(agent, specifier, module.name.as_ref(), &[])?;
         let Some(resolution) = resolve_export(agent, &imported, name, resolve_set)? else {
             continue;
         };
@@ -3610,8 +3631,13 @@ pub fn dynamic_import(
     // that is also a static dependency of the wave is already evaluated.
     let realm = agent.current_realm()?;
     agent.enqueue_generic_job(Some(realm), move |agent| {
-        let result = host_resolve_imported_module(agent, &specifier_text, &parsed_attributes)
-            .and_then(|module| complete_dynamic_import(agent, &module, phase, &resolve, &reject));
+        let result = host_resolve_imported_module(
+            agent,
+            &specifier_text,
+            referrer_name.as_ref(),
+            &parsed_attributes,
+        )
+        .and_then(|module| complete_dynamic_import(agent, &module, phase, &resolve, &reject));
         if let Err(error) = result {
             let rejection = crate::promise::error_value(agent, &error);
             crate::function::call(agent, &reject, Value::Undefined, &[rejection])?;
@@ -3845,7 +3871,8 @@ mod tests {
         for (specifier, source) in modules {
             agent.add_module(specifier, source);
         }
-        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8(entry), &[])?;
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8(entry), None, &[])?;
         module_declaration_instantiation(&mut agent, &module)?;
         module_evaluation(&mut agent, &module)?;
         agent.run_jobs()?;
@@ -4087,7 +4114,8 @@ mod tests {
             "import data from './data.json' with { type: 'json' }; export var a = data.a; export var len = data.b.length;",
         );
         let module =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), &[]).unwrap();
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), None, &[])
+                .unwrap();
         module_declaration_instantiation(&mut agent, &module).unwrap();
         module_evaluation(&mut agent, &module).unwrap();
         agent.run_jobs().unwrap();
@@ -4163,7 +4191,7 @@ mod tests {
         let realm = agent.first_realm().unwrap();
         agent.push_bootstrap_context(realm);
         let module =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./dep.js"), &[])
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./dep.js"), None, &[])
                 .unwrap();
         agent.pop_bootstrap_context();
         agent.finish_dynamic_import(7, module).unwrap();
@@ -4262,8 +4290,9 @@ mod tests {
             "m.js",
             "export var url = import.meta.url; export var same = import.meta === import.meta;",
         );
-        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), &[])
-            .expect("the module");
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), None, &[])
+                .expect("the module");
         module_declaration_instantiation(&mut agent, &module).expect("instantiate");
         module_evaluation(&mut agent, &module).expect("evaluate");
         agent.run_jobs().expect("jobs");
@@ -4312,7 +4341,7 @@ mod tests {
             "function boom() { throw new Error('boom'); }\nboom();",
         );
         let module =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("throws.js"), &[])
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("throws.js"), None, &[])
                 .expect("the module");
         module_declaration_instantiation(&mut agent, &module).expect("instantiate");
 
@@ -4366,9 +4395,13 @@ mod tests {
             "file:///m.js",
             "function boom() { throw new Error('boom'); }\nboom();",
         );
-        let module =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("file:///m.js"), &[])
-                .expect("the module");
+        let module = host_resolve_imported_module(
+            &mut agent,
+            &JsString::from_utf8("file:///m.js"),
+            None,
+            &[],
+        )
+        .expect("the module");
         module_declaration_instantiation(&mut agent, &module).expect("instantiate");
         let promise = module_evaluation(&mut agent, &module).expect("evaluate");
         let error = settled(&agent, &promise).expect("the module's promise settles");
@@ -4446,8 +4479,9 @@ mod tests {
             "m.js",
             "export var seen = await import('./dep.js', { with: { type: 'json' } });",
         );
-        let module = host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), &[])
-            .expect("the module");
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("m.js"), None, &[])
+                .expect("the module");
         module_declaration_instantiation(&mut agent, &module).expect("instantiate");
         module_evaluation(&mut agent, &module).expect("evaluate");
         agent.run_jobs().expect("jobs");
@@ -4722,8 +4756,9 @@ mod tests {
         agent.add_module("./c.js", "import './a.js'; await Promise.resolve(0);");
         agent.add_module("./a.js", "import './b.js'; await Promise.resolve(0);");
         agent.add_module("./x.js", "import './a.js'; await Promise.resolve(0);");
-        let main = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./main.js"), &[])
-            .unwrap();
+        let main =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./main.js"), None, &[])
+                .unwrap();
         module_declaration_instantiation(&mut agent, &main).unwrap();
         let main_promise = module_evaluation(&mut agent, &main).unwrap();
         agent.run_jobs().unwrap();
@@ -4739,8 +4774,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(message, js_str("async error in B"));
-        let c =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./c.js"), &[]).unwrap();
+        let c = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./c.js"), None, &[])
+            .unwrap();
         let c_promise = module_evaluation(&mut agent, &c).unwrap();
         agent.run_jobs().unwrap();
         let c_error = match settled(&agent, &c_promise) {
@@ -4758,13 +4793,13 @@ mod tests {
         agent.initialize_host_defined_realm().unwrap();
         agent.add_module("./m.js", "import './b.js'; export var done = 1;");
         agent.add_module("./b.js", "await Promise.resolve(0); export var x = 1;");
-        let m =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./m.js"), &[]).unwrap();
+        let m = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./m.js"), None, &[])
+            .unwrap();
         module_declaration_instantiation(&mut agent, &m).unwrap();
         let m_promise = module_evaluation(&mut agent, &m).unwrap();
         agent.run_jobs().unwrap();
-        let b =
-            host_resolve_imported_module(&mut agent, &JsString::from_utf8("./b.js"), &[]).unwrap();
+        let b = host_resolve_imported_module(&mut agent, &JsString::from_utf8("./b.js"), None, &[])
+            .unwrap();
         assert_eq!(*b.status.borrow(), ModuleStatus::Evaluated);
         assert_eq!(*m.status.borrow(), ModuleStatus::Evaluated);
         let settled = settled(&agent, &m_promise);
@@ -4775,9 +4810,13 @@ mod tests {
     fn resolve_export_for_host_names_the_local_binding() {
         let mut evaluated =
             evaluate_modules(&[("entry", "export const x = 42;")], "entry").unwrap();
-        let module =
-            host_resolve_imported_module(&mut evaluated.agent, &JsString::from_utf8("entry"), &[])
-                .unwrap();
+        let module = host_resolve_imported_module(
+            &mut evaluated.agent,
+            &JsString::from_utf8("entry"),
+            None,
+            &[],
+        )
+        .unwrap();
 
         match resolve_export_for_host(&mut evaluated.agent, &module, &JsString::from_utf8("x"))
             .unwrap()
@@ -4801,5 +4840,246 @@ mod tests {
             .unwrap(),
             ResolvedExport::NotFound
         ));
+    }
+
+    /// A host resolver that reads a relative specifier against the referrer's
+    /// directory — the rule every JavaScript environment applies to `./x` and
+    /// `../x`. Modules stay registered under their resolved, root-relative
+    /// keys, and the engine's registry serves them by that key.
+    #[derive(Debug)]
+    struct ResolvesRelative;
+
+    fn resolve_relative(referrer: &str, specifier: &str) -> Option<String> {
+        if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+            return None;
+        }
+        let mut parts: Vec<&str> = referrer.split('/').collect();
+        parts.pop();
+        for segment in specifier.split('/') {
+            match segment {
+                "." | "" => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        Some(parts.join("/"))
+    }
+
+    impl crate::host::HostHooks for ResolvesRelative {
+        fn resolve_imported_specifier(
+            &self,
+            specifier: &JsString,
+            referrer: Option<&JsString>,
+        ) -> Option<JsString> {
+            let referrer = referrer?;
+            resolve_relative(&referrer.to_string_lossy(), &specifier.to_string_lossy())
+                .map(|key| JsString::from_utf8(&key))
+        }
+    }
+
+    fn evaluate_modules_with_hooks(
+        modules: &[(&str, &str)],
+        entry: &str,
+        hooks: Box<dyn crate::host::HostHooks>,
+    ) -> Result<Evaluated, JsError> {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm()?;
+        agent.host_hooks = Some(hooks);
+        for (specifier, source) in modules {
+            agent.add_module(specifier, source);
+        }
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8(entry), None, &[])?;
+        module_declaration_instantiation(&mut agent, &module)?;
+        module_evaluation(&mut agent, &module)?;
+        agent.run_jobs()?;
+        let namespace = module_namespace(&mut agent, &module)?;
+        Ok(Evaluated { agent, namespace })
+    }
+
+    /// A specifier is resolved against the importing module's own name: `./b.js`
+    /// written in `lib/a.js` is `lib/b.js`, which is what gets read.
+    #[test]
+    fn a_resolver_resolves_relative_to_the_referrer() {
+        let mut evaluated = evaluate_modules_with_hooks(
+            &[
+                (
+                    "lib/a.js",
+                    "import { value } from './b.js'; export const seen = value;",
+                ),
+                ("lib/b.js", "export const value = 7;"),
+            ],
+            "lib/a.js",
+            Box::new(ResolvesRelative),
+        )
+        .expect("the graph evaluates");
+        assert_eq!(
+            namespace_read(&mut evaluated, "seen").expect("seen"),
+            Value::Number(7.0),
+            "the importer read the module its specifier resolved to"
+        );
+    }
+
+    /// Two importers that resolve to the same key share one module record: the
+    /// body runs once, and the realm's cache has one entry under the resolved
+    /// key — never one under the raw `./b.js` spelling.
+    #[test]
+    fn two_importers_share_one_record() {
+        let mut evaluated = evaluate_modules_with_hooks(
+            &[
+                (
+                    "main.js",
+                    "import { aValue, aCount } from './lib/a.js';\n\
+                     import { cValue, cCount } from './lib/c.js';\n\
+                     export { aValue, aCount, cValue, cCount };",
+                ),
+                (
+                    "lib/a.js",
+                    "import { value } from './b.js';\n\
+                     export const aValue = value;\n\
+                     export const aCount = globalThis.bCount;",
+                ),
+                (
+                    "lib/c.js",
+                    "import { value } from './b.js';\n\
+                     export const cValue = value;\n\
+                     export const cCount = globalThis.bCount;",
+                ),
+                (
+                    "lib/b.js",
+                    "globalThis.bCount = (globalThis.bCount || 0) + 1;\n\
+                     export const value = 42;",
+                ),
+            ],
+            "main.js",
+            Box::new(ResolvesRelative),
+        )
+        .expect("the graph evaluates");
+
+        {
+            let realm = evaluated.agent.first_realm().expect("a realm");
+            let loaded = realm.loaded_modules.borrow();
+            assert!(
+                loaded.contains_key(&JsString::from_utf8("lib/b.js")),
+                "the shared module is cached under the resolved key"
+            );
+            assert!(
+                !loaded.contains_key(&JsString::from_utf8("./b.js")),
+                "nothing is cached under the raw spelling"
+            );
+        }
+        assert_eq!(
+            namespace_read(&mut evaluated, "aValue").expect("aValue"),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            namespace_read(&mut evaluated, "cValue").expect("cValue"),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            namespace_read(&mut evaluated, "aCount").expect("aCount"),
+            Value::Number(1.0),
+            "`lib/b.js` evaluated once"
+        );
+        assert_eq!(
+            namespace_read(&mut evaluated, "cCount").expect("cCount"),
+            Value::Number(1.0),
+            "and the second importer saw the same single evaluation"
+        );
+    }
+
+    /// A key the resolver answers but the host never registered is the engine's
+    /// ordinary missing-module error, and it names the key the host should have
+    /// provided.
+    #[test]
+    fn an_unresolved_key_is_a_missing_module() {
+        let error = evaluate_modules_with_hooks(
+            &[("lib/a.js", "import './missing.js';")],
+            "lib/a.js",
+            Box::new(ResolvesRelative),
+        )
+        .err()
+        .expect("the import resolves to an unregistered key");
+        assert!(
+            error.message.contains("lib/missing.js"),
+            "the error names the resolved key: {}",
+            error.message
+        );
+    }
+
+    /// With no resolver the specifier is the key, which is the behaviour every
+    /// host that installs no hook keeps.
+    #[test]
+    fn without_a_hook_the_specifier_is_the_key() {
+        let mut evaluated = evaluate_modules(
+            &[
+                (
+                    "a.js",
+                    "import { value } from './b.js'; export const seen = value;",
+                ),
+                ("./b.js", "export const value = 9;"),
+            ],
+            "a.js",
+        )
+        .expect("the graph evaluates");
+        assert_eq!(
+            namespace_read(&mut evaluated, "seen").expect("seen"),
+            Value::Number(9.0),
+            "the raw `./b.js` specifier is the registry key"
+        );
+    }
+
+    /// A dynamic `import()` the host declines goes through the engine's own
+    /// registry, which resolves it with the same resolver — the referrer of the
+    /// `import()` site is threaded through the fallback too.
+    #[test]
+    fn a_dynamic_import_uses_the_same_resolver() {
+        let mut evaluated = evaluate_modules_with_hooks(
+            &[
+                (
+                    "lib/a.js",
+                    "export const seen = (await import('./b.js')).default;",
+                ),
+                ("lib/b.js", "export default 5;"),
+            ],
+            "lib/a.js",
+            Box::new(ResolvesRelative),
+        )
+        .expect("the graph evaluates");
+        assert_eq!(
+            namespace_read(&mut evaluated, "seen").expect("seen"),
+            Value::Number(5.0),
+            "the dynamic import resolved `./b.js` against `lib/a.js`"
+        );
+    }
+
+    /// A module resolved to `lib/b.js` is compiled and named under that key, not
+    /// the `./b.js` its importer wrote — the name a stack frame reports.
+    #[test]
+    fn the_name_is_the_resolved_key() {
+        let mut agent = Agent::new();
+        agent.initialize_host_defined_realm().expect("a realm");
+        agent.host_hooks = Some(Box::new(ResolvesRelative));
+        agent.add_module("lib/a.js", "import './b.js';");
+        agent.add_module("lib/b.js", "export const x = 1;");
+        let module =
+            host_resolve_imported_module(&mut agent, &JsString::from_utf8("lib/a.js"), None, &[])
+                .expect("the entry");
+        module_declaration_instantiation(&mut agent, &module).expect("instantiate");
+
+        let realm = agent.first_realm().expect("a realm");
+        let b = realm
+            .loaded_modules
+            .borrow()
+            .get(&JsString::from_utf8("lib/b.js"))
+            .copied()
+            .expect("lib/b.js is the key");
+        assert_eq!(
+            b.name.as_ref().map(|name| name.to_string_lossy()),
+            Some("lib/b.js".to_string()),
+            "the module record's name is the resolved key"
+        );
     }
 }

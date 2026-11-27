@@ -11182,6 +11182,7 @@ var $DONE = function (error) {
         let entry = runtime::module::host_resolve_imported_module(
             &mut agent,
             &JsString::from_utf8(entry_key),
+            None,
             &[],
         )
         .map_err(|e| e.message)?;
