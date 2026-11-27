@@ -15,6 +15,8 @@
 
 pub use crux::error::{ErrorKind, JsError};
 pub use crux::string::JsString;
+pub use crux::value::Value;
+pub use crux::{BigInt, SourceLocation};
 pub use runtime::HostHooks;
 pub use runtime::dump;
 pub use runtime::embed::{
@@ -63,14 +65,17 @@ mod tests {
     use super::*;
 
     /// The types a host must name to call the embed API or implement a hook are
-    /// reachable from this crate alone: `JsString` appears in the module and hook
-    /// signatures, and `ModuleSourceKind` is an argument to
-    /// `Context::add_module_source`.
+    /// reachable from this crate alone: `JsString`, `Value`, `BigInt` and
+    /// `SourceLocation` appear in the module, value and hook signatures, and
+    /// `ModuleSourceKind` is an argument to `Context::add_module_source`.
     #[test]
     fn the_public_signatures_types_are_reachable_from_the_facade() {
         let specifier: JsString = JsString::from_utf8("m.js");
         assert_eq!(specifier.to_string_lossy(), "m.js");
         assert_eq!(ModuleSourceKind::Js, ModuleSourceKind::Js);
+        let _: Option<Value> = None;
+        let _: Option<BigInt> = None;
+        let _: Option<SourceLocation> = None;
     }
 
     #[test]

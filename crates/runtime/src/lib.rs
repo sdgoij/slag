@@ -48,8 +48,11 @@ pub mod workers;
 
 pub use agent::{Agent, evaluate};
 pub use context::{ExecutionContext, Reference, ReferenceBase};
-/// A string value, which the embed and host-hook signatures name.
+/// The `crux` types the embed and host-hook signatures name: a string, a
+/// value, a BigInt, and a source location.
 pub use crux::string::JsString;
+pub use crux::value::Value;
+pub use crux::{BigInt, SourceLocation};
 pub use embed::{Context, HostCallbacks, JsModule, JsObject, JsValue, ModuleSourceKind};
 pub use env::{EnvRecord, EnvRef};
 pub use host::HostHooks;
