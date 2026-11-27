@@ -14,7 +14,9 @@
 //! ```
 
 pub use crux::error::{ErrorKind, JsError};
+pub use crux::heap::GcObserver;
 pub use crux::string::JsString;
+pub use crux::typed_array::SharedBuffer;
 pub use crux::value::Value;
 pub use crux::{BigInt, SourceLocation};
 pub use runtime::HostHooks;
@@ -76,6 +78,8 @@ mod tests {
         let _: Option<Value> = None;
         let _: Option<BigInt> = None;
         let _: Option<SourceLocation> = None;
+        let _: Option<Box<dyn GcObserver>> = None;
+        let _: Option<SharedBuffer> = None;
     }
 
     #[test]
