@@ -1017,7 +1017,7 @@ impl Context {
         let callbacks = Rc::new(RefCell::new(HostCallbacks::default()));
         agent.host_hooks = Some(Box::new(RejectionHooks {
             callbacks: callbacks.clone(),
-            inner: None,
+            inner: Box::new(NoHooks),
         }));
         let mut context = Context {
             agent,
@@ -1046,7 +1046,7 @@ impl Context {
     pub fn set_host_hooks(&mut self, hooks: Box<dyn HostHooks>) {
         let rejection = RejectionHooks {
             callbacks: self.callbacks.clone(),
-            inner: Some(hooks),
+            inner: hooks,
         };
         self.agent.host_hooks = Some(Box::new(rejection));
     }
@@ -3814,10 +3814,15 @@ fn timer_job(
 }
 
 /// Host hooks that route promise rejections to the callbacks while
-/// delegating everything else to an optional inner implementation.
+/// delegating every other operation to the host's own implementation.
+///
+/// This wrapper sits between the agent and the host's hooks, so a method it
+/// does not forward is a method a host installing hooks with
+/// [`Context::set_host_hooks`] can never reach — silently, because the trait's
+/// default answers instead. New `HostHooks` methods must be forwarded here too.
 struct RejectionHooks {
     callbacks: Rc<RefCell<HostCallbacks>>,
-    inner: Option<Box<dyn HostHooks>>,
+    inner: Box<dyn HostHooks>,
 }
 
 impl fmt::Debug for RejectionHooks {
@@ -3825,6 +3830,12 @@ impl fmt::Debug for RejectionHooks {
         f.debug_struct("RejectionHooks").finish_non_exhaustive()
     }
 }
+
+/// The defaults of [`HostHooks`], used before a host installs its own hooks.
+#[derive(Debug)]
+struct NoHooks;
+
+impl HostHooks for NoHooks {}
 
 impl HostHooks for RejectionHooks {
     fn ensure_can_compile_strings(
@@ -3834,42 +3845,114 @@ impl HostHooks for RejectionHooks {
         body_string: &JsString,
         direct: bool,
     ) -> Result<(), JsError> {
-        match &self.inner {
-            Some(inner) => {
-                inner.ensure_can_compile_strings(callee_realm, param_strings, body_string, direct)
-            }
-            None => Ok(()),
-        }
+        self.inner
+            .ensure_can_compile_strings(callee_realm, param_strings, body_string, direct)
     }
 
     fn promise_rejection_tracker(
         &self,
-        _promise: &Value,
+        promise: &Value,
         reason: Option<&Value>,
-        _operation: bool,
+        operation: bool,
     ) -> Result<(), JsError> {
         if let Some(callback) = &self.callbacks.borrow().promise_rejection {
             let text = reason.map(describe_value).unwrap_or_default();
             callback(&text);
         }
-        match &self.inner {
-            Some(inner) => inner.promise_rejection_tracker(_promise, reason, _operation),
-            None => Ok(()),
-        }
+        self.inner
+            .promise_rejection_tracker(promise, reason, operation)
     }
 
-    fn create_worker(
+    fn make_job_callback(&self, callable: &Value) -> Option<usize> {
+        self.inner.make_job_callback(callable)
+    }
+
+    fn takes_promise_jobs(&self) -> bool {
+        self.inner.takes_promise_jobs()
+    }
+
+    fn enqueue_promise_job(&self, realm: Option<&Realm>, token: u64) {
+        self.inner.enqueue_promise_job(realm, token)
+    }
+
+    fn call_job_callback(
         &self,
-        source: &str,
-        shared: &[crux::typed_array::SharedBuffer],
+        job_callback: &crate::job::JobCallback,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> Option<Result<Value, JsError>> {
+        self.inner
+            .call_job_callback(job_callback, this_value, arguments)
+    }
+
+    fn ensure_can_add_private_element(&self, object: &Value) -> Result<(), JsError> {
+        self.inner.ensure_can_add_private_element(object)
+    }
+
+    fn prepare_stack_trace(
+        &self,
+        error: &Value,
+        frames: &[crate::api::StackFrame],
+    ) -> Result<Option<Value>, JsError> {
+        self.inner.prepare_stack_trace(error, frames)
+    }
+
+    fn create_worker(&self, source: &str, shared: &[SharedBuffer]) -> Result<(), JsError> {
+        self.inner.create_worker(source, shared)
+    }
+
+    #[cfg(feature = "wasm")]
+    fn allow_wasm_code_generation(&self, context: &crate::api::Context) -> bool {
+        self.inner.allow_wasm_code_generation(context)
+    }
+
+    #[cfg(feature = "wasm")]
+    fn has_wasm_streaming_callback(&self) -> bool {
+        self.inner.has_wasm_streaming_callback()
+    }
+
+    #[cfg(feature = "wasm")]
+    fn wasm_streaming(
+        &self,
+        source: &Value,
+        streaming: &crate::api::WasmStreaming,
     ) -> Result<(), JsError> {
-        match &self.inner {
-            Some(inner) => inner.create_worker(source, shared),
-            None => Err(JsError::new(
-                ErrorKind::TypeError,
-                "HostCreateWorker is not implemented by this host".into(),
-            )),
-        }
+        self.inner.wasm_streaming(source, streaming)
+    }
+
+    fn initialize_import_meta_object(
+        &self,
+        module: &JsModule,
+        meta: &JsObject,
+    ) -> Result<(), JsError> {
+        self.inner.initialize_import_meta_object(module, meta)
+    }
+
+    fn import_module_dynamically(
+        &self,
+        specifier: &JsString,
+        referrer_name: Option<&JsString>,
+        phase: crate::api::ModuleImportPhase,
+        attributes: &[(JsString, JsString)],
+    ) -> Option<crate::host::DynamicImportAnswer> {
+        self.inner
+            .import_module_dynamically(specifier, referrer_name, phase, attributes)
+    }
+
+    fn resolve_imported_specifier(
+        &self,
+        specifier: &JsString,
+        referrer: Option<&JsString>,
+    ) -> Option<JsString> {
+        self.inner.resolve_imported_specifier(specifier, referrer)
+    }
+
+    fn resolve_imported_module(
+        &self,
+        specifier: &JsString,
+        attributes: &[(JsString, JsString)],
+    ) -> Option<Result<crate::api::Module, JsError>> {
+        self.inner.resolve_imported_module(specifier, attributes)
     }
 }
 
@@ -4909,6 +4992,74 @@ mod tests {
             context.eval("ns.n").unwrap().as_number(),
             Some(7.0),
             "the json module's default export is the parsed value"
+        );
+    }
+
+    #[test]
+    fn set_host_hooks_forwards_the_static_import_resolver() {
+        #[derive(Debug)]
+        struct Specifiers;
+
+        impl HostHooks for Specifiers {
+            fn resolve_imported_specifier(
+                &self,
+                specifier: &JsString,
+                referrer: Option<&JsString>,
+            ) -> Option<JsString> {
+                let referrer = referrer?.to_string_lossy();
+                let specifier = specifier.to_string_lossy();
+                if !specifier.starts_with('.') {
+                    return None;
+                }
+                let mut parts: Vec<&str> = match referrer.rsplit_once('/') {
+                    Some((dir, _)) if !dir.is_empty() => dir.split('/').collect(),
+                    _ => Vec::new(),
+                };
+                for segment in specifier.split('/') {
+                    match segment {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop()?;
+                        }
+                        other => parts.push(other),
+                    }
+                }
+                Some(JsString::from_utf8(&parts.join("/")))
+            }
+        }
+
+        let mut context = Context::new().unwrap();
+        // Installed the documented way: the wrapper between the agent and these
+        // hooks must forward the resolver, or every relative import below is
+        // looked up as written and instantiation fails.
+        context.set_host_hooks(Box::new(Specifiers));
+        context.add_module_source(
+            "lib/a.js",
+            b"export { value } from './b.js';",
+            ModuleSourceKind::Js,
+        );
+        context.add_module_source(
+            "lib/b.js",
+            b"export const value = 42;",
+            ModuleSourceKind::Js,
+        );
+        let main = context
+            .compile_module(
+                "entry.js",
+                Some("entry.js"),
+                "import { value } from './lib/a.js';\nexport const answer = value;",
+            )
+            .unwrap();
+        context.instantiate_module(&main).unwrap();
+        context.evaluate_module(&main).unwrap();
+        let namespace = context
+            .module_namespace(&main, ModuleNamespacePhase::Evaluation)
+            .unwrap();
+        context.set_global("ns", namespace).unwrap();
+        assert_eq!(
+            context.eval("ns.answer").unwrap().as_number(),
+            Some(42.0),
+            "each specifier resolves from the file that wrote it"
         );
     }
 
